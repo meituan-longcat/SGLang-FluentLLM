@@ -124,14 +124,19 @@ class EagleDraftOutput:
     """
 
     last_verified_ids: torch.Tensor
-    token_list: torch.Tensor
+    token_list: Optional[torch.Tensor, List]
 
     def filter_batch(self, keep_indices: torch.Tensor):
         # 1. chunked prefill
         # 2. retract
         # 3. Check finished when updating running and getting new
         self.last_verified_ids = self.last_verified_ids[keep_indices]
-        self.token_list = self.token_list[keep_indices, :]
+        if isinstance(self.token_list, torch.Tensor):
+            self.token_list = self.token_list[keep_indices, :]
+        elif isinstance(self.token_list, list):
+            self.token_list = [s[keep_indices] for s in self.token_list]
+        else:
+            raise RuntimeError(f"Not supported token_list type, {self.token_list=}")
 
     def merge_batch(self, spec_info):
         if spec_info.last_verified_ids is None:
@@ -144,7 +149,16 @@ class EagleDraftOutput:
         self.last_verified_ids = torch.cat(
             [self.last_verified_ids, spec_info.last_verified_ids]
         )
-        self.token_list = torch.cat([self.token_list, spec_info.token_list], dim=0)
+        if isinstance(self.token_list, torch.Tensor):
+            self.token_list = torch.cat([self.token_list, spec_info.token_list], dim=0)
+        elif isinstance(self.token_list, list):
+            self.token_list = [
+                torch.cat([s1, s2], axis=0)
+                for s1, s2 in zip(self.token_list, spec_info.token_list)
+            ]
+        else:
+            raise RuntimeError(f"Not supported token_list type, {self.token_list=}")
+
 
 @dataclasses.dataclass
 class EagleVerifyInput:

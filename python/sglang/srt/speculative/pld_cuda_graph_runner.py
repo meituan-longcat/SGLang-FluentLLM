@@ -345,14 +345,14 @@ class PLDCudaGraphRunner:
                 )
 
             new_verified_id = self.pld_worker.preprocess_for_draft_after_decode(
-                forward_batch, accept_length, accept_index, target_predict
+                forward_batch, accept_length, accept_index, target_predict, with_draft_model=False
             )
             output_ids = target_predict[accept_index]
 
             req_pool_indices = forward_batch.req_pool_indices
             self.target_worker.model_runner.req_to_token_pool.verified_lens[req_pool_indices] += accept_length
 
-            _scores_list, token_list, _parents_list = self.pld_worker.propose_with_ngram_kernel(
+            token_list = self.pld_worker.propose(
                 forward_batch, target_predict, accept_length
             )
 
