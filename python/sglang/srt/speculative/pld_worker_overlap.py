@@ -77,7 +77,6 @@ def resolve_future_input(
         # return stacked_tokens
         for i in range(spec_steps):
             token_list[i][:] = stacked_tokens[i]
-    # score_list and parents_list are already constant values, no need to update
 
 
 class PLDWorkerOverlapped:
@@ -142,27 +141,6 @@ class PLDWorkerOverlapped:
             )
             for _ in range(self.draft_token_num - 1)
         ]
-
-        # Static parents list for PLD
-        parents_list = []
-        for i in range(self.draft_token_num - 1):
-            if i == 0:
-                parents_list.append(
-                    torch.arange(
-                        -1, 1, dtype=torch.long, device=self.device
-                    )
-                    .unsqueeze(0)
-                    .repeat(future_map_size, 1)
-                )
-            else:
-                parents_list.append(
-                    torch.tensor(
-                        [i for _ in range(future_map_size)],
-                        device=self.device,
-                        dtype=torch.long,
-                    ).unsqueeze(1)
-                )
-        self.parent_list_static = parents_list
 
         self.forward_stream = torch.get_device_module(self.device).Stream()
         self.parent_process = psutil.Process().parent()
