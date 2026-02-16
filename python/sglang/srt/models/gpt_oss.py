@@ -45,6 +45,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -82,42 +83,50 @@ def routing_function(hidden_states, gating_output, topk, renormalize):
 class GptOssSparseMoeBlock(nn.Module):
     def __init__(
         self,
-        layer_id: int,
         config: GptOssConfig,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        layer_index: int = -1,
         prefix: str = "",
     ):
         super().__init__()
-        self.layer_id = layer_id
+        self.layer_index = layer_index
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.hidden_size = hidden_size
         self.activation = config.hidden_act
         self.activation_alpha = getattr(config, "hidden_act_alpha", 1.702)
         self.swiglu_limit = config.swiglu_limit
+        self.num_experts = num_experts + global_server_args_dict["ep_num_redundant_experts"]
+        self.quant_config = quant_config
         if self.tp_size > config.num_local_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_local_experts}."
             )
 
-        MoEImpl = (
-            DeepLayer
-            if global_server_args_dict["enable_deep_ep"]
-            else MoELayer if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        )
-        self.experts = MoEImpl(
-            num_experts=config.num_local_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
-            top_k=config.num_experts_per_tok,
+        self.experts = MoELayer(
+            top_k=top_k,
+            num_experts=self.num_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            layer_id=layer_id,
-            quant_config=quant_config,
+            quant_config=self.quant_config,
+            layer_index=self.layer_index,
             prefix=add_prefix("experts", prefix),
-            custom_routing_function=routing_function,
             activation="swiglu",
             activation_alpha=self.activation_alpha,
             swiglu_limit=self.swiglu_limit,
-            with_bias=True,
+            with_bias=True
+        )
+
+        self.topk = TopK(
+            top_k=top_k,
+            custom_routing_function=routing_function,
+            output_format=TopKOutputFormat.STANDARD,
+            topk_indices_dtype=torch.int64 if global_server_args_dict["enable_deep_ep"] else torch.int32
         )
 
         self.router = ReplicatedLinear(
@@ -137,10 +146,14 @@ class GptOssSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
+        if hidden_states.shape[0] > 0:
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         routed_expert_output = self.experts(
             hidden_states=hidden_states,
-            router_logits=router_logits,
+            topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         )
@@ -331,10 +344,14 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         self.mlp = GptOssSparseMoeBlock(
-            layer_id=layer_id,
             config=config,
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
             quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            layer_index=layer_id,
+            prefix=add_prefix(f"mlp", prefix)
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
