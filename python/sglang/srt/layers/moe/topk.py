@@ -215,129 +215,6 @@ def biased_grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
-def select_experts(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    top_k: int,
-    use_grouped_topk: bool,
-    renormalize: bool,
-    topk_group: Optional[int] = None,
-    num_expert_group: Optional[int] = None,
-    num_fused_shared_experts: int = 0,
-    custom_routing_function: Optional[Callable] = None,
-    correction_bias: Optional[torch.Tensor] = None,
-    torch_native: bool = False,
-    routed_scaling_factor: Optional[float] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
-    num_experts: Optional[int] = None,
-    ep_num_redundant_experts: Optional[int] = None,
-):
-    from sglang.srt.managers import expert_location_dispatch
-    router_logits, correction_bias = (
-        expert_location_dispatch.transform_select_experts_inputs(
-            router_logits=router_logits,
-            correction_bias=correction_bias,
-            info=expert_location_dispatch_info,
-        )
-    )
-
-    routed_scaling_factor_applied = False
-    # DeepSeek V2/V3/R1 uses biased_grouped_top
-    if use_grouped_topk:
-        assert topk_group is not None
-        assert num_expert_group is not None
-        if correction_bias is None:
-            topk_weights, topk_ids = grouped_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-            )
-        else:
-            if not _USE_EPS_TOPK_SIGMOID:
-                topk_weights, topk_ids = biased_grouped_topk(
-                    hidden_states=hidden_states,
-                    gating_output=router_logits,
-                    correction_bias=correction_bias,
-                    topk=top_k,
-                    renormalize=renormalize,
-                    num_expert_group=num_expert_group,
-                    topk_group=topk_group,
-                    expert_location_dispatch_info=expert_location_dispatch_info,
-                )
-            else:
-                assert routed_scaling_factor is not None
-
-                assert router_logits.dim() == 2
-                num_tokens = router_logits.shape[0]
-                num_routed_experts = router_logits.shape[1]
-
-                topk_weights = torch.empty((num_tokens, top_k), dtype=torch.float, device="cuda")
-                topk_ids = torch.empty((num_tokens, top_k), dtype=torch.int32, device="cuda")
-                _EPS_TOPK_SIGMOID(
-                    router_logits,
-                    correction_bias.data,
-                    topk_weights,
-                    topk_ids,
-                    num_tokens,
-                    num_routed_experts,
-                    num_expert_group,
-                    topk_group,
-                    top_k,
-                    routed_scaling_factor,
-                )
-                routed_scaling_factor_applied = True
-    elif torch_native and custom_routing_function is None:
-        assert expert_location_dispatch_info is None
-        topk_weights, topk_ids = fused_topk_native(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=top_k,
-            renormalize=renormalize,
-        )
-    elif correction_bias is not None:
-        topk_weights, topk_ids = fused_topk_bias(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            correction_bias=correction_bias.data,
-            topk=top_k,
-            renormalize=renormalize,
-            num_experts=num_experts,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-            ep_num_redundant_experts=ep_num_redundant_experts,
-        )
-    elif custom_routing_function is None:
-        assert expert_location_dispatch_info is None
-        topk_weights, topk_ids = fused_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=top_k,
-            renormalize=renormalize,
-        )
-    else:
-        assert expert_location_dispatch_info is None
-        topk_weights, topk_ids = custom_routing_function(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            topk=top_k,
-            renormalize=renormalize,
-        )
-
-    if not routed_scaling_factor_applied and routed_scaling_factor is not None:
-        topk_weights *= routed_scaling_factor
-        routed_scaling_factor_applied = True
-
-    # TODO: need to make num_expert a required arg to avoid performance issue after torch
-    # compile, but for now it is not compiled so it's fine.
-    from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids, num_experts=num_experts)
-
-    return topk_weights, topk_ids
-
-
 class TopKOutputFormat(Enum):
     STANDARD = auto()
     BYPASSED = auto()
@@ -713,9 +590,6 @@ def grouped_topk_gpu(
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
-
-
-
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
