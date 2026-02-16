@@ -27,6 +27,8 @@ class AttentionType(Enum):
 
     # Decoder attention between previous layer Q/K/V
     DECODER = "decoder"
+    # Encoder attention between previous layer Q/K/V
+    ENCODER_ONLY = "encoder_only"
 
 
 class RadixAttention(nn.Module):

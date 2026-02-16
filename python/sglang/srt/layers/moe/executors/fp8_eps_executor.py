@@ -55,8 +55,8 @@ class FP8EPSExecutor(EPSMixin):
         )
         self.gate_up_gemm((input_fp8, input_scale), (layer.w13_weight, layer.w13_weight_scale_inv), gate_up_output, exclusive_sum)
 
-        if getattr(layer, "gate_up_bias", None):
-            add_bias_to_segments(gate_up_output, layer.gate_up_bias, exclusive_sum)
+        if getattr(layer, "w13_weight_bias", None) is not None:
+            add_bias_to_segments(gate_up_output, layer.w13_weight_bias, exclusive_sum)
 
         if self.activation == "silu":
             down_input = silu(gate_up_output, exclusive_sum, num_tokens_hint)
@@ -76,7 +76,7 @@ class FP8EPSExecutor(EPSMixin):
             down_input, down_input_fp8, down_input_scale, exclusive_sum, num_groups, max_shape_m, max_shape_m_padded, inter_size_x2 // 2
         )
         self.down_gemm((down_input_fp8, down_input_scale), (layer.w2_weight, layer.w2_weight_scale_inv), output, exclusive_sum)
-        if getattr(layer, "down_bias", None):
-            add_bias_to_segments(output, layer.down_bias, exclusive_sum)
+        if getattr(layer, "w2_weight_bias", None) is not None:
+            add_bias_to_segments(output, layer.w2_weight_bias, exclusive_sum)
 
         return output

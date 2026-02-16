@@ -33,8 +33,8 @@ class EPSExecutor(EPSMixin):
         num_tokens_hint: int,
     ) -> torch.Tensor:
         gate_up_output = self.gate_up_gemm.run(input, layer.w13_weight, None, exclusive_sum, num_tokens_hint)
-        if getattr(layer, "gate_up_bias", None):
-            add_bias_to_segments(gate_up_output, layer.gate_up_bias, exclusive_sum)
+        if getattr(layer, "w13_weight_bias", None) is not None:
+            add_bias_to_segments(gate_up_output, layer.w13_weight_bias, exclusive_sum)
 
         if self.activation == "silu":
             down_input = silu(gate_up_output, exclusive_sum, num_tokens_hint)
@@ -47,7 +47,7 @@ class EPSExecutor(EPSMixin):
         #     print(f"{down_input[:2]=}")
         output = self.down_gemm.run(down_input, layer.w2_weight, None, exclusive_sum, num_tokens_hint)
 
-        if getattr(layer, "down_bias", None):
-            add_bias_to_segments(output, layer.down_bias, exclusive_sum)
+        if getattr(layer, "w2_weight_bias", None) is not None:
+            add_bias_to_segments(output, layer.w2_weight_bias, exclusive_sum)
 
         return output
