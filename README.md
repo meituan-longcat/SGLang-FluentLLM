@@ -19,6 +19,7 @@ On the kernels side, we are open-sourcing:
 
 - [FlashMLA SwapAB](https://github.com/meituan-longcat/FlashMLA/tree/feature/swapAB) optimizations
 - [FlashMLA FP8 KVCache + FP8 Compute](https://github.com/meituan-longcat/FlashMLA/tree/feature/ckv_fp8_per_token) optimizations
+  - This optimization is detailed in the paper [**SnapMLA: Efficient Long-Context MLA Decoding via Hardware-Aware FP8 Quantized Pipelining**](https://arxiv.org/pdf/2602.10718).
 - [DeepGemm SwapAB Offset + PDL](https://github.com/meituan-longcat/DeepGEMM/tree/feature/swap_ab) optimizations
 - Communication–computation fused kernels optimizations in [FlashInfer](https://github.com/meituan-longcat/flashinfer/tree/feature/longcat_main)
 
