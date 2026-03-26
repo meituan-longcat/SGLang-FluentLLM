@@ -23,7 +23,8 @@ import threading
 import time
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Dict
+
 import numpy as np
 import torch # type: ignore
 
@@ -135,7 +136,7 @@ class PrefillBootstrapQueue:
         kv_args.offsets = offsets
 
         # Define req -> input ids buffer
-        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens, kv_args.other_output_offset_idx = (
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -340,12 +341,15 @@ class SchedulerDisaggregationPrefillMixin:
     def launch_send_async(self: Scheduler, batch: ScheduleBatch):
         with self.kv_transfer_manager.add_batch(is_idle=batch.forward_mode.is_idle()):
             output_buffer_indices: List[int] = []
+            logits_output_indices: List[int] = []
             output_top_logprobs_indices: List[Tuple[int, int]] = []
             output_token_logprobs_indices: List[Tuple[int, int]] = []
             for idx, req in enumerate(batch.reqs):
                 last_chunk = self.chunked_req is None or req.rid != self.chunked_req.rid
                 self.add_send_task(req, last_chunk=last_chunk, batch_complete=False)
                 output_buffer_indices.append(req.metadata_buffer_index)
+                #TODO @xiaobin check logits_output_indices last chunk
+                logits_output_indices.append(idx)
                 if req.top_logprobs_num > 0:
                     output_token_logprobs_indices.append(
                         (idx, req.metadata_buffer_index)
@@ -359,6 +363,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_metadata_buffers.set_buf_by_batch(
                     output_ids=output_ids,
                     output_buffer_indices=output_buffer_indices,
+                    logits_output_indices=logits_output_indices,
                     logits_output=logits_output,
                     output_token_logprobs_indices=output_token_logprobs_indices,
                     output_top_logprobs_indices=output_top_logprobs_indices,

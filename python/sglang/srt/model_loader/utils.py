@@ -43,6 +43,7 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
 
     if model_config.enable_tbo or model_config.enable_sbo:
         architectures = [f"{arch}Overlap" if "NextN" not in arch else arch for arch in architectures]
+    architectures = getattr(model_config.hf_config, "omni_architectures", architectures)
     return ModelRegistry.resolve_model_cls(architectures)
 
 

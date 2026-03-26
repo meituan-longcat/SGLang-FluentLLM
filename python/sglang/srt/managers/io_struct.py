@@ -127,6 +127,7 @@ class GenerateReqInput:
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[int], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+    data_parallel_rank: Optional[Union[List[int], int]] = None
 
     def normalize_batch_and_arguments(self):
         if (
@@ -338,6 +339,9 @@ class GenerateReqInput:
             bootstrap_room=(
                 self.bootstrap_room[i] if self.bootstrap_room is not None else None
             ),
+            data_parallel_rank=(
+                self.data_parallel_rank[i] if self.data_parallel_rank is not None else None
+            ),
         )
 
 
@@ -383,6 +387,7 @@ class TokenizedGenerateReqInput:
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
+    data_parallel_rank: Optional[int] = None
 
     input_multi_ids: List[List[int]] = None
     input_extra_infos: Optional[List[Dict]] = None
@@ -468,6 +473,13 @@ class TokenizedEmbeddingReqInput:
     # Time at object instantiated
     created_time: float
 
+@dataclass
+class EmbeddingLookupReqInput:
+    # The request id
+    rid: str
+    # The input token ids
+    input_ids_list: List[List[int]]
+    aux_info: Dict
 
 @dataclass
 class BatchTokenIDOut:
@@ -581,6 +593,12 @@ class BatchEmbeddingOut:
     # Token counts
     prompt_tokens: List[int]
 
+
+@dataclass
+class EmbeddingLookupReqOutput:
+    # The request id
+    rid: str
+    output_dict: Dict[str, Any]
 
 @dataclass
 class FlushCacheReqInput:

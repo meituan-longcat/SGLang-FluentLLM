@@ -7,7 +7,7 @@ import threading
 import warnings
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple, Dict, Union
 
 import numpy as np
 import requests
@@ -243,9 +243,12 @@ def prepare_abort(req: Req, error_message: str, status_code = None, err_type = N
         req.input_token_ids_logprobs_val = []
         req.input_token_ids_logprobs_idx = []
 
-
 class MetadataBuffers:
-    def __init__(self, size: int, max_top_logprobs_num: int = 128, device: str = "cpu"):
+    def __init__(self, size: int, max_top_logprobs_num: int = 128, device: str = "cpu", 
+                 transfer_hidden_states_max_size: int = 0,
+                 hidden_states_dtype: torch.dtype = torch.bfloat16,
+                 hidden_states_dim: int = 0,
+        ):
         # TODO: abort top_logprobs_num > 128 in PD
 
         # We transfer the metadata of first output token to decode
@@ -264,6 +267,14 @@ class MetadataBuffers:
         self.output_top_logprobs_idx = torch.zeros(
             (size, max_top_logprobs_num), dtype=torch.int32, device=device
         )
+        self.hidden_states = None
+        self.hidden_states_dim = hidden_states_dim
+        self.transfer_hidden_states_max_size = transfer_hidden_states_max_size
+        if transfer_hidden_states_max_size:
+            assert hidden_states_dim > 0, f"hidden_states_dim for {transfer_hidden_states_max_size=} error:{hidden_states_dim}"
+            self.hidden_states = torch.zeros(
+                (size, transfer_hidden_states_max_size, hidden_states_dim), dtype=hidden_states_dtype, device=device
+            )
         self.cached_tokens = torch.zeros((size, 1), dtype=torch.int32, device=device)
 
     def get_buf_infos(self):
@@ -291,7 +302,12 @@ class MetadataBuffers:
             self.output_top_logprobs_idx[0].nbytes,
             self.cached_tokens[0].nbytes,
         ]
-        return ptrs, data_lens, item_lens
+        output_offset_idx = len(item_lens)
+        if self.hidden_states is not None:
+            ptrs.append(self.hidden_states.data_ptr())
+            data_lens.append(self.hidden_states.nbytes)
+            item_lens.append(self.hidden_states[0].nbytes)
+        return ptrs, data_lens, item_lens, output_offset_idx
 
     def get_buf(self, idx: int):
         return (
@@ -300,6 +316,7 @@ class MetadataBuffers:
             self.output_token_logprobs_idx[idx],
             self.output_top_logprobs_val[idx],
             self.output_top_logprobs_idx[idx],
+            self.hidden_states[idx] if self.hidden_states is not None else None,
             self.cached_tokens[idx],
         )
 
@@ -307,12 +324,21 @@ class MetadataBuffers:
         self,
         output_ids: torch.Tensor,
         output_buffer_indices: List[int],
+        logits_output_indices: List[Union[int, Tuple[int, int]]],
         logits_output: LogitsProcessorOutput,
         output_token_logprobs_indices: Optional[List[Tuple[int, int]]] = None,
         output_top_logprobs_indices: Optional[List[Tuple[int], int]] = None,
         cached_tokens: Optional[torch.Tensor] = None,
     ):
-        self.output_ids[torch.tensor(output_buffer_indices).to(self.device, non_blocking=True), 0] = output_ids
+        output_indices = torch.tensor(output_buffer_indices).to(self.device, non_blocking=True)
+        self.output_ids[output_indices, 0] = output_ids
+        if self.transfer_hidden_states_max_size == 1:
+            logits_indices = torch.tensor(logits_output_indices).to(self.device, non_blocking=True)
+            self.hidden_states[output_indices, 0] = logits_output.hidden_states.view(-1, self.hidden_states_dim)[logits_indices]
+        elif self.transfer_hidden_states_max_size > 1:
+            for o_idx, (i_start, i_end) in zip(output_indices, logits_output_indices):
+                min_input_len = min(self.transfer_hidden_states_max_size, i_end-i_start)
+                self.hidden_states[o_idx][:min_input_len] = logits_output.hidden_states.view(-1, self.hidden_states_dim)[i_start:i_end][:min_input_len]
         if cached_tokens is not None:
             self.cached_tokens[torch.tensor(output_buffer_indices).to(self.device, non_blocking=True), 0] = cached_tokens
 

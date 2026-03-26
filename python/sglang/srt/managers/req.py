@@ -212,6 +212,7 @@ class Req:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        data_parallel_rank: Optional[int] = None,
         origin_input_multi_ids: Optional[List[List[int]]] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         created_time: Optional[float] = None,
@@ -238,6 +239,7 @@ class Req:
         self.session_id = session_id
         self.input_embeds = input_embeds
         self.input_extra_infos = input_extra_infos
+        self.state_info_dict = {}
 
         # for oe init
         self.oe_init = None
@@ -389,6 +391,7 @@ class Req:
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.data_parallel_rank: Optional[int] = data_parallel_rank
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         # the start index of the sent kv cache
@@ -407,6 +410,7 @@ class Req:
         self.accept_draft_tokens: Optional[float] = None
 
         self.output_extra_info: Dict[str, Any] = {}
+        self.output_cache_dict = {}
 
     def set_tokenizer(self, tokenizer):
         """Assign tokenizer and cache ids needed by check_finished()."""
@@ -421,6 +425,17 @@ class Req:
         self._additional_stop_token_ids_cached = (
             set(int(x) for x in extra) if extra else None
         )
+
+    def get_group_specs(self):
+        if not self.input_extra_infos:
+            return None, None, None
+        group_name = self.input_extra_infos[0].get("group_name", None)
+        if group_name is not None and self.input_extra_infos[0].get("group_size") is None:
+            group_size = 1
+        else:
+            group_size = self.input_extra_infos[0].get("group_size")
+        group_extra_info = self.input_extra_infos[0].get("group_extra_info", {})
+        return group_name, group_size, group_extra_info
 
     @property
     def seqlen(self):
@@ -462,7 +477,7 @@ class Req:
         self.draft_fill_ids.extend(self.fill_ids[1:])
         self.draft_fill_ids += [-1]
         if tree_cache is not None:
-            match_result = tree_cache.match_prefix(key=self.adjust_max_prefix_ids())
+            match_result = tree_cache.match_prefix(key=self.adjust_max_prefix_ids(), req=self)
             (self.prefix_page_ids, self.prefix_len, self.last_node, self.last_host_node, self.host_hit_length) = (
                 match_result.device_indices, match_result.device_prefix_length, match_result.last_device_node, match_result.last_host_node, match_result.host_hit_length
             )

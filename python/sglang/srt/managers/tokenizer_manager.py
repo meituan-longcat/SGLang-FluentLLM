@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+import traceback
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
@@ -76,6 +77,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    EmbeddingLookupReqInput,
+    EmbeddingLookupReqOutput,
     SetSchedulerMaxRunningRequestsInput,
     GetLoadReqInput,
     WatchLoadUpdateReq,
@@ -245,6 +248,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 metrics_reporters=server_args.metrics_reporters,
             )
 
+        self.embedding_lookup_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
+
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (
@@ -260,6 +265,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
+                ),
+                (
+                    EmbeddingLookupReqOutput,
+                    self.embedding_lookup_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
             ]
@@ -418,6 +427,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=obj.bootstrap_room,
+                data_parallel_rank=obj.data_parallel_rank,
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
@@ -596,6 +606,27 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         del self.rid_to_state[rid]
         req = AbortReq(rid)
         self.send_to_scheduler.send_pyobj(req)
+
+    async def embedding_lookup(self, rid: str, text_list: List[List[str]] = None, input_ids_list: List[List[int]] = None, aux_info: Dict = None):
+        self.auto_create_handle_loop()
+        if text_list is not None:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept text prompts. Please provide input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
+                )
+            if input_ids_list is None:
+                input_ids_list = []
+            for input_text in text_list:
+                input_ids = self.tokenizer.encode(input_text)
+                input_ids_list.append(input_ids)
+        get_emb_req = EmbeddingLookupReqInput(rid=rid, input_ids_list=input_ids_list, aux_info=aux_info)
+        try:
+            res: List[EmbeddingLookupReqOutput] = await self.embedding_lookup_communicator(get_emb_req)
+            return res[0].output_dict
+        except:
+            raise RuntimeError(traceback.format_exc())
 
     async def update_weights_from_disk(
         self,

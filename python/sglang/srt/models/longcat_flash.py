@@ -644,6 +644,8 @@ class FLASHModel(nn.Module):
                 over_embedding_k=config.oe_split_num,
                 over_embedding_n=config.oe_neighbor_num,
                 oe_ignore_tokens=config.oe_ignore_tokens,
+                oe_m_padding_size=config.oe_m_padding_size,
+                num_embeddings_text=config.vocab_size_text,
             )
         else:
             self.enable_over_embedding = False
@@ -700,7 +702,10 @@ class FLASHModel(nn.Module):
             else:
                 hidden_states = self.embed_tokens(input_ids)
         else:
-            hidden_states = input_embeds.type_as(self.embed_tokens.weight)
+            if self.enable_over_embedding:
+                hidden_states = input_embeds.type_as(self.over_embedding.word_embeder.weight)
+            else:
+                hidden_states = input_embeds.type_as(self.embed_tokens.weight)
         tp_num_tokens = hidden_states.shape[0]
         forward_batch.tp_num_tokens = tp_num_tokens
         residual = None

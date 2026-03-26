@@ -213,7 +213,7 @@ class Qwen3DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,
-            attention_bias=config.attention_bias,
+            attention_bias=config.attention_qkv_bias,
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen3MLP(

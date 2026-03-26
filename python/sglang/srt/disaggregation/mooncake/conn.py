@@ -340,6 +340,16 @@ class MooncakeKVManager(BaseKVManager):
             dst_addrs.append(decode_aux_addr)
             lengths.append(aux_item_len)
 
+        for idx in range(self.kv_args.other_output_offset_idx, len(self.kv_args.aux_item_lens)):
+            aux_item_len = self.kv_args.aux_item_lens[idx]
+            prefill_aux_addr = (
+                self.kv_args.aux_data_ptrs[idx] + prefill_aux_index * aux_item_len
+            )
+            decode_aux_addr = dst_aux_ptrs[idx] + dst_aux_index * aux_item_len
+            src_addrs.append(prefill_aux_addr)
+            dst_addrs.append(decode_aux_addr)
+            lengths.append(aux_item_len)
+
         if not src_addrs:
             return 0
 
@@ -441,7 +451,7 @@ class MooncakeKVManager(BaseKVManager):
 
                         if kv_chunk.is_last:
                             # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
+                            rets = self.send_aux(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_aux_index,
                                 self.decode_kv_args_table[
@@ -449,7 +459,7 @@ class MooncakeKVManager(BaseKVManager):
                                 ].dst_aux_ptrs,
                                 req.dst_aux_index,
                             )
-                            polls.append(True if ret == 0 else False)
+                            polls.append(True if all([ret == 0 for ret in rets]) else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
@@ -870,7 +880,6 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
         dst_aux_ptrs: list[int],
         dst_aux_index: int,
     ):
-        # Submit transfer for all aux buffers (output_ids, logprobs, cached_tokens, etc.)
         batch_ids = []
         for aux_data_ptr, aux_item_len, dst_aux_ptr in zip(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_item_lens, dst_aux_ptrs
@@ -881,8 +890,17 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                 mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
             )
             batch_ids.append(bid)
-        # Return the last batch_id for compatibility (or could return list)
-        return batch_ids[-1] if batch_ids else -1
+        for idx in range(self.kv_args.other_output_offset_idx, len(self.kv_args.aux_item_lens)):
+            aux_item_len = self.kv_args.aux_item_lens[idx]
+            prefill_aux_addr = (
+                self.kv_args.aux_data_ptrs[idx] + prefill_aux_index * aux_item_len
+            )
+            decode_aux_addr = dst_aux_ptrs[idx] + dst_aux_index * aux_item_len
+            submit_bid = self.engine.transfer_submit_write(
+                mooncake_session_id, prefill_aux_addr, decode_aux_addr, aux_item_len
+            )
+            batch_ids.append(submit_bid)
+        return batch_ids
 
     def submit_layer_cache(
         self,
@@ -1065,13 +1083,13 @@ class MooncakeAsyncKVManager(MooncakeKVManager):
                     task.aux_step = None  # reset to None to mark aux has been submitted
                     if kv_chunk.is_last:
                         for req in task.write_requests:
-                            aux_bid = self.submit_aux(
+                            aux_bids = self.submit_aux(
                                 req.trans_info.mooncake_session_id,
                                 kv_chunk.prefill_aux_index,
                                 self.decode_kv_args_table[req.trans_info.mooncake_session_id].dst_aux_ptrs,
                                 req.trans_info.dst_aux_index
                             )
-                            req.submit_bids.append(aux_bid)
+                            req.submit_bids.extend(aux_bids)
 
                 if task.next_layer_id == self.layer_num and task.aux_step is None:
                     complete_tasks.append(task)

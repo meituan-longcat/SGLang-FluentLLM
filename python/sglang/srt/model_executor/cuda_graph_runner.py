@@ -398,6 +398,10 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             all_decode_or_idle=True
         )
+        self.model_runner.init_request_cache_capture(
+            forward_batch,
+            [self.num_tokens_per_bs] * bs,
+        )
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -435,6 +439,8 @@ class CudaGraphRunner:
 
         torch.cuda.synchronize()
         self.model_runner.tp_group.barrier()
+
+        self.model_runner.capture_sample_one_bs(logits=out[0], out_hidden=out[1], bs=bs)
 
         global_graph_memory_pool = graph.pool()
         return graph, out
@@ -500,6 +506,15 @@ class CudaGraphRunner:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
         if hasattr(forward_batch.spec_info, "hidden_states"):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
+
+        self.model_runner.init_request_cache_replay(
+            forward_batch,
+            bs,
+            raw_bs, 
+            [seq_len - self.num_tokens_per_bs for seq_len in self.seq_lens_cpu[:raw_bs].tolist()] + [0] * (bs - raw_bs), 
+            [self.num_tokens_per_bs] * raw_bs + [1] * (bs - raw_bs), 
+            forward_batch.reqs + [None] * (bs - raw_bs),
+        )
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(

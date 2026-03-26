@@ -160,7 +160,8 @@ class DecodePreallocQueue:
         kv_args.offsets = offsets
         kv_args.target_layer_num = target_layer_num
         kv_args.draft_layer_num = draft_layer_num
-        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+
+        kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens, kv_args.other_output_offset_idx = (
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -536,7 +537,7 @@ class DecodePreallocQueue:
         """
         self.tree_cache.dec_lock_ref(req.last_node)
         req.last_node = None
-        match_result = self.tree_cache.match_prefix(input_ids)
+        match_result = self.tree_cache.match_prefix(input_ids, req=req)
         (matched_prefix_pages, prefix_len, matched_last_node) = (
             match_result.device_indices, match_result.device_prefix_length, match_result.last_device_node)
         # Lock the matched prefix to prevent eviction
@@ -582,6 +583,8 @@ class DecodePreallocQueue:
             new_tokens_needed = total_len
 
         alloced_len = self.req_to_token_pool.alloced_lens[req.req_pool_idx].item()
+        if prefix_len > alloced_len:
+            alloced_len = prefix_len
         # Allocate memory for new tokens
         if new_tokens_needed > 0:
 
@@ -671,10 +674,18 @@ class DecodeTransferQueue:
                     output_token_logprobs_idx,
                     output_top_logprobs_val,
                     output_top_logprobs_idx,
+                    hidden_states,
                     cached_tokens,
                 ) = self.metadata_buffers.get_buf(idx)
+
+                next_token_ids = self.scheduler.tp_worker.model_runner.forward_postprocess_for_pd_decode(
+                    decode_req.req,
+                    output_id,
+                    hidden_states,
+                )
+                decode_req.req.output_ids.append(next_token_ids[0].item())
+
                 decode_req.req.cached_tokens = cached_tokens[0].item()
-                decode_req.req.output_ids.append(output_id[0].item())
 
                 if decode_req.req.return_logprob:
                     decode_req.req.output_token_logprobs_val.append(

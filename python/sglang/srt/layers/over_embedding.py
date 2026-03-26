@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from typing import List
 from torch import nn
 from torch.nn import Parameter
 
@@ -122,14 +123,19 @@ class FusedOverEmbedding(torch.nn.Module):
                  over_embedding_m: int,
                  over_embedding_k: int,
                  over_embedding_n: int,
-                 oe_ignore_tokens: int):
+                 oe_ignore_tokens: int,
+                 oe_m_padding_size: int = 1,
+                 num_embeddings_text: int = None):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.over_embedding_m = over_embedding_m
         self.over_embedding_k = over_embedding_k
         self.over_embedding_n = over_embedding_n
+        self.oe_m_padding_size =oe_m_padding_size
         self.oe_ignore_tokens = torch.tensor(oe_ignore_tokens)
+        if num_embeddings_text is None:
+            num_embeddings_text = num_embeddings
 
         # Initialize regular vocabulary [vocab_size, hidden_dim]
         self.word_embeder = VocabParallelEmbedding(
@@ -148,7 +154,8 @@ class FusedOverEmbedding(torch.nn.Module):
                                                           device=device)
         for i in range(self.n_grams):
             m = int(over_embedding_m + i * 2 + 1)
-            self.exclusive_oe_embeder_size_sums[i + 1] = self.exclusive_oe_embeder_size_sums[i] + m
+            padded_m = m + (self.oe_m_padding_size - m % self.oe_m_padding_size) % self.oe_m_padding_size
+            self.exclusive_oe_embeder_size_sums[i + 1] = self.exclusive_oe_embeder_size_sums[i] + padded_m
 
         max_num_global_tokens = global_server_args_dict["chunked_prefill_size"] * get_tensor_model_parallel_world_size()
         self.oe_embeder = OEPEmbedding(
@@ -174,7 +181,7 @@ class FusedOverEmbedding(torch.nn.Module):
                 mod = self.over_embedding_m + 2 * ((n - 2) * self.over_embedding_k + k) + 1
                 self.oe_mods[n-2][k] = mod
                 for delta in range(self.over_embedding_n):
-                    self.oe_weights[n-2][k][delta] = pow(num_embeddings, delta, mod)
+                    self.oe_weights[n-2][k][delta] = pow(num_embeddings_text, delta, mod) # 在多模场景下，num_embeddings_text可能不等于num_embeddings
         self.oe_n_gram_ids = torch.zeros([global_server_args_dict['chunked_prefill_size'], self.n_grams], dtype=torch.int32, device=device)
         self.exclusive_req_len_sums = torch.zeros(global_server_args_dict['max_running_requests'] + 1, dtype=torch.int32, device=device)
 
@@ -235,6 +242,7 @@ class FusedOverEmbedding(torch.nn.Module):
                 # After training side removes the logic that excludes the 0th token from n-gram id calculation during draft prefill, this logic can be removed
                 forward_batch.oe_token_table[forward_batch.req_pool_indices, 0] = -forward_batch.oe_token_table[forward_batch.req_pool_indices, 0]
             torch.cumsum(forward_batch.oe_req_lens, dim=0, dtype=torch.int32, out=self.exclusive_req_len_sums[1:1+forward_batch.batch_size])
+            # print(f"{forward_batch.oe_token_table[forward_batch.req_pool_indices,forward_batch.oe_column_starts-5:forward_batch.oe_column_starts+1]=}")
             compute_n_gram_ids_v2(
                 oe_n=self.over_embedding_n,
                 oe_k=self.over_embedding_k,
@@ -251,14 +259,20 @@ class FusedOverEmbedding(torch.nn.Module):
             if is_draft and forward_batch.forward_mode == ForwardMode.EXTEND:
                 forward_batch.oe_token_table[forward_batch.req_pool_indices, 0] = -forward_batch.oe_token_table[forward_batch.req_pool_indices, 0]
 
+        num_global_tokens, max_num_tokens_per_gpu = forward_batch.get_num_tokens(input_ids.shape[0])
+
+        mean_hidden_states = self.compute_hidden_states(input_ids, self.oe_n_gram_ids[:len(input_ids)], num_global_tokens)
+        return mean_hidden_states
+    
+    def compute_hidden_states(self, input_ids: torch.Tensor, oe_n_gram_ids: torch.Tensor, num_global_tokens: int):
         # [13, seq_len, hidden_dim]
         all_hidden_states = torch.empty([self.n_grams + 1, len(input_ids), self.embedding_dim], dtype=self.oe_projection.dtype, device=input_ids.device)
         all_hidden_states[0] = self.word_embeder(input_ids)
         # oe_hidden_states: [12, seq_len, hidden_dim / 12]
-        num_global_tokens, max_num_tokens_per_gpu = forward_batch.get_num_tokens(input_ids.shape[0])
-        oe_hidden_states = self.oe_embeder(self.oe_n_gram_ids[:len(input_ids)], num_global_tokens)
+        oe_hidden_states = self.oe_embeder(oe_n_gram_ids, num_global_tokens)
         torch.bmm(oe_hidden_states, self.oe_projection, out=all_hidden_states[1:])
         # Add a word embedding path
         mean_hidden_states = all_hidden_states.mean(dim=0)
         # results = torch.where(oe_ignore_input_ids_flags.unsqueeze(1), all_hidden_states[0], mean_hidden_states)
         return mean_hidden_states
+    

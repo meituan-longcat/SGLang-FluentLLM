@@ -150,7 +150,8 @@ class SchedulerPostProcessMixin:
                     req.check_finished()
 
                     if req.finished():
-                        if not self.enable_overlap or isinstance(req.finished_reason, FINISH_ABORT):
+                        if not self.enable_overlap or (self.server_args.request_cache_size <= 0 \
+                                and isinstance(req.finished_reason, FINISH_ABORT)):
                             self.tree_cache.cache_finished_req(req)
                         elif self.cur_batch is not None and self.cur_batch.forward_mode == ForwardMode.EXTEND:
                             # If prefill ends immediately and there's no delayed token, release resources here

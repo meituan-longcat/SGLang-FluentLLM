@@ -92,6 +92,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    EmbeddingLookupReqInput,
+    EmbeddingLookupReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
     ClearHiCacheReqInput,
@@ -102,7 +104,9 @@ from sglang.srt.managers.req import (
     Req,
     RequestStage,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch, collect_group_specs
+from collections import defaultdict
+
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -589,6 +593,7 @@ class Scheduler(
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
+                (EmbeddingLookupReqInput, self.handle_embedding_lookup),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
                 (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
@@ -698,8 +703,11 @@ class Scheduler(
             req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            self.disagg_metadata_buffers = MetadataBuffers(buffer_size)
-
+            self.disagg_metadata_buffers = MetadataBuffers(buffer_size,
+                                            transfer_hidden_states_max_size=self.server_args.disaggregation_transfer_hidden_states_max_size,
+                                            hidden_states_dim=self.model_config.hidden_size,
+                                            hidden_states_dtype=self.model_config.dtype,
+                                        )
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
@@ -749,6 +757,9 @@ class Scheduler(
                 device=(
                     f"cuda:{self.gpu_id}" if self.enable_layerwise_transfer else "cpu"
                 ),
+                transfer_hidden_states_max_size=self.server_args.disaggregation_transfer_hidden_states_max_size,
+                hidden_states_dim=self.model_config.hidden_size,
+                hidden_states_dtype=self.model_config.dtype,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1000,12 +1011,23 @@ class Scheduler(
             output = self._request_dispatcher(recv_req)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+    
+    def handle_embedding_lookup(
+        self,
+        recv_req: EmbeddingLookupReqInput,
+    ):
+        output_dict = self.tp_worker.model_runner.embedding_lookup(recv_req.rid, recv_req.input_ids_list, recv_req.aux_info)
+        # if self.attn_tp_rank == 0:
+        res = EmbeddingLookupReqOutput(rid=recv_req.rid, output_dict=output_dict)
+        self.send_to_tokenizer.send_pyobj(res)
 
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
         # Create a new request
+
+        self.tp_worker.model_runner.patch_req_info(recv_req)
         if (
             recv_req.session_params is None
             or recv_req.session_params.id is None
@@ -1019,6 +1041,12 @@ class Scheduler(
                 if "multi_ids" in global_server_args_dict["mm_mode"]:
                     fake_input_multi_ids = [[999992]] * seq_length
                     recv_req.input_multi_ids = fake_input_multi_ids
+            if "multi_ids" in global_server_args_dict["mm_mode"] and recv_req.input_multi_ids is None:
+                print(f"{recv_req.input_ids=}")
+                seq_length = len(recv_req.input_ids)
+                # TODO: 8 is the default multi_ids length
+                fake_input_multi_ids = [[999992] * 8] * seq_length
+                recv_req.input_multi_ids = fake_input_multi_ids
 
             # Handle custom logit processor passed to the request
             custom_logit_processor = recv_req.custom_logit_processor
@@ -1054,6 +1082,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                data_parallel_rank=recv_req.data_parallel_rank,
                 origin_input_multi_ids=recv_req.input_multi_ids,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
@@ -1277,6 +1306,7 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+            ret.filter_batch()
         else:
             # Run decode
             if self.running_batch is None:
@@ -1331,6 +1361,34 @@ class Scheduler(
                 oe_req_lens=torch.tensor(request_lengths, dtype=torch.int32, device=device),
             )
 
+    def _group_first_iterator(self, l):
+        group_sizes = collect_group_specs(l)
+        group_reqs = defaultdict(list)
+        non_group_reqs = []
+
+        for req in l:
+            g_name, group_size, _ = req.get_group_specs()
+            if g_name is not None:
+                if g_name in group_sizes:
+                    if group_sizes[g_name] != group_size:
+                        logger.warning(
+                            f"Group '{g_name}' has inconsistent group_size: "
+                            f"expected {group_sizes[g_name]}, got {group_size}"
+                        )
+                group_reqs[g_name].append(req)
+            else:
+                non_group_reqs.append(req)
+
+        for g_name, g_reqs in group_reqs.items():
+            expected_size = group_sizes[g_name]
+            if len(g_reqs) == expected_size:
+                logger.info(f"_group_first_iterator: Group '{g_name}' is ready, yielding {len(g_reqs)} requests")
+                yield from g_reqs
+            else:
+                logger.warning(f"_group_first_iterator: Group '{g_name}' is not ready, {g_reqs=}")
+
+        yield from non_group_reqs
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
@@ -1372,7 +1430,8 @@ class Scheduler(
 
         dequeue_durations: List[float] = []
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+
+        for req in self._group_first_iterator(self.waiting_queue):
             if self.req_to_token_pool.available_size() <= 0:
                 self.batch_is_full = True
                 break
@@ -1571,7 +1630,7 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
-                logits_output, next_token_ids, next_token_multi_ids = self.tp_worker.forward_batch_generation(
+                logits_output, next_token_ids, next_token_multi_ids, _ = self.tp_worker.forward_batch_generation(
                     model_worker_batch
                 )
                 if not self.enable_overlap:

@@ -113,13 +113,28 @@ class DataParallelController:
         self.context_length = None
         self.server_args = server_args
         self.port_args = port_args
+
+        if server_args.dp_spmd_mode:
+            assert server_args.load_balance_method == "round_robin", f"Only support round_robin for dp spmd mode"
+
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
 
+        if server_args.dp_size == 1:
+            self.dp_rank_range = range(0,1)
+        else:
+            dp_ranks_per_node = server_args.dp_size // server_args.nnodes
+            self.dp_rank_range = range(
+                dp_ranks_per_node * server_args.node_rank,
+                dp_ranks_per_node * (server_args.node_rank + 1),
+            )
+        
+        self.local_dp_size = len(self.dp_rank_range) if server_args.dp_spmd_mode else server_args.dp_size
+        logger.info(f"{self.local_dp_size=}")
         # Init inter-process communication
-        self.context = zmq.Context(1 + server_args.dp_size)
-        if server_args.node_rank == 0:
+        self.context = zmq.Context(1 + self.local_dp_size)
+        if server_args.node_rank == 0 or server_args.dp_spmd_mode:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -139,7 +154,7 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.workers = [None] * server_args.dp_size
+        self.workers = [None] * self.local_dp_size
 
         dp_port_args = self.launch_dp_schedulers(server_args, port_args)
 
@@ -198,7 +213,7 @@ class DataParallelController:
         # But we need to avoid conflict with TokenizerManager's port (base_scheduler_port).
         # So we start from base_scheduler_port + 1 for dp_rank=0.
         
-        for dp_rank in range(server_args.dp_size):
+        for dp_rank in range(self.local_dp_size):
             # Create port_args for each dp_rank by adjusting scheduler_input_port
             # This avoids calling PortArgs.init_new which might use default port
             # Use base_scheduler_port + 1 + dp_rank to avoid conflict with TokenizerManager
@@ -216,7 +231,7 @@ class DataParallelController:
             
             # Bind to scheduler_input_ipc_name BEFORE starting scheduler threads
             # This ensures the port is available when scheduler tries to connect
-            if server_args.node_rank == 0:
+            if server_args.node_rank == 0 or server_args.dp_spmd_mode:
                 self.workers[dp_rank] = get_zmq_socket(
                     self.context,
                     zmq.PUSH,
@@ -224,19 +239,11 @@ class DataParallelController:
                     True,  # bind
                 )
 
-        if server_args.dp_size == 1:
-            dp_rank_range = range(0,1)
-        else:
-            dp_ranks_per_node = server_args.dp_size // server_args.nnodes
-            dp_rank_range = range(
-                dp_ranks_per_node * server_args.node_rank,
-                dp_ranks_per_node * (server_args.node_rank + 1),
-            )
-        for dp_rank in dp_rank_range:
+        for local_dp_rank, dp_rank in enumerate(self.dp_rank_range):
             # Create a thread for each worker
             thread = threading.Thread(
                 target=self.launch_tensor_parallel_group,
-                args=(server_args, dp_port_args[dp_rank], base_gpu_id, dp_rank),
+                args=(server_args, dp_port_args[local_dp_rank], base_gpu_id, dp_rank),
             )
             threads.append(thread)
             base_gpu_id += server_args.attn_tp_size * server_args.gpu_id_step
@@ -300,7 +307,9 @@ class DataParallelController:
         self.context_length = scheduler_info[0]["context_length"]
 
     def round_robin_scheduler(self, req: Req):
-        if self.server_args.disaggregation_mode == "null":
+        if req.data_parallel_rank is not None:
+            self.workers[req.data_parallel_rank % len(self.workers)].send_pyobj(req)
+        elif self.server_args.disaggregation_mode == "null":
             self.workers[self.round_robin_counter].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers
@@ -352,7 +361,7 @@ def run_data_parallel_controller_process(
                 "context_length": controller.context_length
             }
         )
-        if server_args.node_rank == 0:
+        if server_args.node_rank == 0 or server_args.dp_spmd_mode:
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()

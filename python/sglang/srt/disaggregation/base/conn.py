@@ -17,6 +17,7 @@ class KVArgs:
     aux_data_ptrs: list[int]
     aux_data_lens: list[int]
     aux_item_lens: list[int]
+    other_output_offset_idx: int
     ib_device: str
     gpu_id: int
     target_layer_num: int

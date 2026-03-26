@@ -578,7 +578,7 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    elif config.architectures[0] in ["LongcatCausalLM"]:
+    elif config.architectures[0] in ["LongcatCausalLM","LongcatNextForCausalLM"]:
         E = config.n_routed_experts
         topk = config.moe_topk
         intermediate_size = config.expert_ffn_hidden_size

@@ -132,5 +132,12 @@ class MooncakeTransferEngine:
         status = self.engine.transfer_check_status(batch_id)
         return status
 
+    def transfer_sync_read(
+        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
+    ) -> int:
+        return self.engine.transfer_sync_read(
+            session_id, buffer, peer_buffer_address, length
+        )
+
     def get_session_id(self):
         return self.session_id

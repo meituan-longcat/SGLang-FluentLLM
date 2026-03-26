@@ -363,6 +363,10 @@ class ForwardBatch:
             ret._compute_mrope_positions(model_runner, batch)
 
         ret.set_out_cache_loc()
+
+        if hasattr(batch, "request_cache_input"):
+            input_dict = batch.request_cache_input
+            setattr(ret, f"request_cache_input", input_dict)
         return ret
 
     def get_out_cache_loc_kernel_wrapper(self, bs, out_cache_loc):

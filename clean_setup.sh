@@ -16,7 +16,7 @@ cd 3rdparty/eps
 pip3 install -v . --no-build-isolation
 cd -
 
-pip3 install build nvidia-nvshmem-cu12 apache-tvm-ffi==0.1.5 nvidia-cudnn-frontend==1.16.0 nvidia-cutlass-dsl==4.3.2 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+pip3 install build nvidia-nvshmem-cu12==3.5.21 apache-tvm-ffi==0.1.5 nvidia-cudnn-frontend==1.16.0 nvidia-cutlass-dsl==4.3.2 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 echo "install flashinfer"
 pip3 uninstall -y flashinfer-python flashinfer-jit-cache

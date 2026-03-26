@@ -148,7 +148,7 @@ def get_config(
     except json.JSONDecodeError:
         raise RuntimeError(f"Failed to decode JSON from config file in {model}. Please ensure the file is valid JSON.")
     # Zero computation expert
-    if config["architectures"] in [["LongcatCausalLM"], ["LongcatFlashForCausalLM"], ["LongcatFlashNgramForCausalLM"]]:
+    if config["architectures"] in [["LongcatCausalLM"], ["LongcatFlashForCausalLM"], ["LongcatFlashNgramForCausalLM"],["LongcatNextForCausalLM"]]:
         config["model_type"] = "flash"
 
     if config.get("model_type", "llama") in _CONFIG_REGISTRY:
@@ -173,7 +173,7 @@ def get_config(
             config.quantization_config["ignored_layers"] = config.quantization_config["modules_to_not_convert"]
             del config.quantization_config["modules_to_not_convert"]
 
-    if config.architectures in [["LongcatCausalLM"], ["LongcatFlashForCausalLM"], ["LongcatFlashNgramForCausalLM"]]:
+    if config.architectures in [["LongcatCausalLM"], ["LongcatFlashForCausalLM"], ["LongcatFlashNgramForCausalLM"],["LongcatNextForCausalLM"]]:
         config.architectures = ["FLASHForCausalLM"]
 
     # Adapt to the case where mtp and base model are placed together

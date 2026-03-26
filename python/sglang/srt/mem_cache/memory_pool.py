@@ -53,8 +53,8 @@ logger = get_colorful_logger(__name__)
 
 GB = 1024 * 1024 * 1024
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
-    if isinstance(t, list):
+def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor], tuple]):
+    if isinstance(t, (list, tuple)):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
 
@@ -690,6 +690,20 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
+
+        kv_size = sum(get_tensor_size_bytes(buf) for buf in all_buffers)
+        
+        logger.info(f"KV Cache is allocated. KV size: {kv_size / GB:.2f} GB.")
+        if self.quant_method == "per_token_head":
+            # kv_buffer contains tuples of 3 tensors
+            first_buffer = self.kv_buffer[0]
+            device_info = first_buffer[0].device
+            shape_info = f"({first_buffer[0].shape}, {first_buffer[1].shape}, {first_buffer[2].shape})"
+        else:
+            # kv_buffer contains single tensors
+            device_info = self.kv_buffer[-1].device
+            shape_info = self.kv_buffer[0].shape
+        logger.info(f"MLATokenToKVPool: {len(self.kv_buffer)=} device={device_info} shape={shape_info} {self.size=} {self.page_size=} {self.kv_cache_dim=} {self.store_dtype=}")
 
     def _get_page_size_bytes(self):
         if self.quant_method ==  "per_token_head":

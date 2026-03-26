@@ -72,6 +72,64 @@ logger = get_colorful_logger(__name__)
 bid = 0
 
 
+def collect_group_specs(requests):
+    from collections import defaultdict
+    group_sizes = {}
+    for req in requests:
+        group_name, group_size, _ = req.get_group_specs()
+        if group_name is None:
+            continue
+        if group_name in group_sizes:
+            if group_sizes[group_name] != group_size:
+                logger.warning(
+                    f"Group '{group_name}' has inconsistent group_size: "
+                    f"expected {group_sizes[group_name]}, got {group_size}"
+                )
+        else:
+            group_sizes[group_name] = group_size
+    return group_sizes
+
+
+def filter_incomplete_groups(reqs, keep_indices):
+    from collections import defaultdict
+
+    if not keep_indices:
+        return keep_indices
+
+    group_counts = defaultdict(int)
+    group_sizes = {}
+
+    for idx in keep_indices:
+        group_name, group_size, _ = reqs[idx].get_group_specs()
+        if group_name is None:
+            continue
+        group_counts[group_name] += 1
+        if group_name in group_sizes:
+            if group_sizes[group_name] != group_size:
+                logger.warning(
+                    f"Group '{group_name}' has inconsistent group_size: "
+                    f"expected {group_sizes[group_name]}, got {group_size}"
+                )
+        else:
+            group_sizes[group_name] = group_size
+
+    incomplete_groups = {
+        name for name, count in group_counts.items()
+        if count != group_sizes[name]
+    }
+
+    if not incomplete_groups:
+        return keep_indices
+
+    logger.warning(f"Incomplete Filter Found: {incomplete_groups=}, {reqs=}")
+    filtered = []
+    for idx in keep_indices:
+        group_name, _, _ = reqs[idx].get_group_specs()
+        if group_name is None or group_name not in incomplete_groups:
+            filtered.append(idx)
+    return filtered
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -104,7 +162,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     oe_info: Optional[OverEmbeddingInfo] = None
     draft_input_ids: torch.Tensor = None  # shape: [b], int32
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
-    input_extra_infos: Optional[List[Dict]] = None
     req_pool_indices: torch.Tensor = None  # shape: [b], int32
 
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -801,6 +858,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if not self.reqs[i].finished()
                 and self.reqs[i] is not chunked_req_to_exclude
             ]
+
+            keep_indices = filter_incomplete_groups(self.reqs, keep_indices)
 
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests

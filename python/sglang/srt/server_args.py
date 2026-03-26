@@ -123,6 +123,7 @@ class ServerArgs:
 
     # Data parallelism
     dp_size: int = 1
+    dp_spmd_mode: bool = False
     load_balance_method: str = "shortest_queue"
     load_watch_interval: float = 0.02
 
@@ -250,6 +251,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: Optional[str] = None
     disaggregation_layerwise_interval: int = 1
+    disaggregation_transfer_hidden_states_max_size: int = 0
     pdlb_url: Optional[str] = None
 
     # For tool server
@@ -263,6 +265,11 @@ class ServerArgs:
     npu_enable_mlp_matmul: bool = False
     npu_enable_opt_rope: bool = False
 
+    request_max_input_len: int = 0
+    request_max_output_len: int = 0
+    request_cache_size: int = 0
+    request_cache_config: str = "{}"
+    
     # For flashinfer reduce norm fusion
     flashinfer_comm_max_num_tokens: int = 64
 
@@ -730,6 +737,11 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--dp-spmd-mode",
+            action="store_true",
+            help="Whether to use spmd mode for dp.",
         )
         parser.add_argument(
             "--revision",
@@ -1653,6 +1665,12 @@ class ServerArgs:
             help="The interval of layerwise transfer for disaggregation. Default is 1.",
         )
         parser.add_argument(
+            "--disaggregation-transfer-hidden-states-max-size",
+            type=int,
+            default=ServerArgs.disaggregation_transfer_hidden_states_max_size,
+            help="Transfer hidden_states max size for disaggregation. Default is 0.",
+        )
+        parser.add_argument(
             "--pdlb-url",
             type=str,
             default=None,
@@ -1682,6 +1700,30 @@ class ServerArgs:
             "--npu-enable-opt-rope",
             action="store_true",
             help="[NPU] enable optimization on rope",
+        )
+        parser.add_argument(
+            "--request-max-input-len",
+            type=int,
+            default=0,
+            help="request_max_input_len. Default is 0.",
+        )
+        parser.add_argument(
+            "--request-max-output-len",
+            type=int,
+            default=0,
+            help="request_max_output_len. Default is 0.",
+        )
+        parser.add_argument(
+            "--request-cache-size",
+            type=int,
+            help="request_cache_size. Default is 0.",
+            default=0,
+        )
+        parser.add_argument(
+            "--request-cache-config",
+            type=str,
+            default=ServerArgs.request_cache_config,
+            help='request_cache_config json format',
         )
 
     @classmethod
@@ -1764,10 +1806,10 @@ class PortArgs:
                 port -= 43
 
         # DP attention. Use TCP + port to handle both single-node and multi-node.
-        if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+        if server_args.dp_spmd_mode or (server_args.nnodes == 1 and server_args.dist_init_addr is None):
             # Only use default port fallback when dp_size == 1
             # For dp_size > 1, we need explicit dist_init_addr to avoid port conflicts
-            if server_args.dp_size > 1:
+            if not server_args.dp_spmd_mode and server_args.dp_size > 1:
                 raise ValueError(
                     f"When dp_size > 1 (dp_size={server_args.dp_size}), you must provide --dist-init-addr. "
                     f"Example: --dist-init-addr 127.0.0.1:4000"

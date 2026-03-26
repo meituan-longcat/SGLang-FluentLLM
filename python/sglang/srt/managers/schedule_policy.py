@@ -146,7 +146,7 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.adjust_max_prefix_ids()
 
-            match_result = self.tree_cache.match_prefix(key=prefix_ids)
+            match_result = self.tree_cache.match_prefix(key=prefix_ids, req=r)
 
             (r.prefix_page_ids, r.prefix_len,r.last_node) = (
                 match_result.device_indices, match_result.device_prefix_length, match_result.last_device_node
@@ -159,7 +159,7 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # Use prefix_len (token count) instead of len(prefix_page_ids) (page count)
             if len(r.prefix_page_ids) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                match_result = self.waiting_queue_radix_tree.match_prefix(key=prefix_ids)
+                match_result = self.waiting_queue_radix_tree.match_prefix(key=prefix_ids, req=r)
 
                 in_batch_matching_prefixes = match_result.device_indices
 

@@ -36,6 +36,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_compiler_backend
 from sglang.utils import get_exception_traceback
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = get_colorful_logger(__name__)
 
@@ -167,11 +168,13 @@ class TpModelWorkerClient:
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
+            self.model_runner.resolve_future_input_cache(model_worker_batch)
+                
             resolve_future_token_ids(input_ids,
                                      self.future_token_ids_map)
 
             # Run forward
-            logits_output, next_token_ids, next_token_multi_ids = self.worker.forward_batch_generation(
+            logits_output, next_token_ids, next_token_multi_ids, output_tensor_dict = self.worker.forward_batch_generation(
                 model_worker_batch, model_worker_batch.launch_done
             )
 
@@ -180,6 +183,8 @@ class TpModelWorkerClient:
             self.future_token_ids_map[
                 future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
             ] = next_token_ids
+
+            self.model_runner.save_output_cache(model_worker_batch.reqs, output_tensor_dict)
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
@@ -198,16 +203,24 @@ class TpModelWorkerClient:
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             if next_token_multi_ids is not None:
                 next_token_multi_ids = next_token_multi_ids.to("cpu", non_blocking=True)
+            if output_tensor_dict is not None:
+                new_output_tensor_dict = {}
+                for key, value in output_tensor_dict.items():
+                    new_output_tensor_dict[key] = value.to("cpu", non_blocking=True)
+                output_tensor_dict = new_output_tensor_dict
             copy_done.record()
 
-            self.output_queue.put((copy_done, logits_output, next_token_ids, next_token_multi_ids))
+            tmp_forward_batch = self.model_runner.init_new_for_preprocess(model_worker_batch)
+            self.output_queue.put((copy_done, logits_output, next_token_ids, next_token_multi_ids, output_tensor_dict, tmp_forward_batch))
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
-        copy_done, logits_output, next_token_ids, next_token_multi_ids = self.output_queue.get()
+        copy_done, logits_output, next_token_ids, next_token_multi_ids, output_tensor_dict, tmp_forward_batch = self.output_queue.get()
 
         if launch_done is not None:
             launch_done.wait()
         copy_done.synchronize()
+
+        self.model_runner.write_to_request_cache_overlap(tmp_forward_batch, next_token_ids, output_tensor_dict)
 
         if logits_output.next_token_logprobs is not None:
             logits_output.next_token_logprobs = (
@@ -233,6 +246,8 @@ class TpModelWorkerClient:
         # A cuda stream sync here to avoid the cuda illegal memory access error.
         self.scheduler_stream.synchronize()
 
+        self.model_runner.read_from_request_cache_overlap(model_worker_batch)
+
         # Push a new batch to the queue
         self.input_queue.put((model_worker_batch, self.future_token_ids_ct))
 
@@ -248,7 +263,7 @@ class TpModelWorkerClient:
         self.future_token_ids_ct = (
             self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
-        return None, future_next_token_ids, None
+        return None, future_next_token_ids, None, None
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)

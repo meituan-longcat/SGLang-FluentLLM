@@ -233,7 +233,8 @@ class Engine(EngineBase):
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
-            bootstrap_room=bootstrap_room
+            bootstrap_room=bootstrap_room,
+            data_parallel_rank=data_parallel_rank,
         )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -282,6 +283,7 @@ class Engine(EngineBase):
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
+        data_parallel_rank: Optional[int] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
@@ -315,6 +317,7 @@ class Engine(EngineBase):
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            data_parallel_rank=data_parallel_rank,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -330,6 +333,9 @@ class Engine(EngineBase):
             return wrapped_output_generator(generator)
         else:
             return await generator.__anext__()
+
+    async def embedding_lookup(self, rid: str, text_list: List[List[str]] = None, input_ids_list: List[List[int]] = None, aux_info: Dict = None):
+        return await self.tokenizer_manager.embedding_lookup(rid, text_list, input_ids_list, aux_info)
 
     def encode(
         self,
@@ -762,7 +768,7 @@ def _launch_subprocesses(
         proc.start()
         scheduler_procs.append(proc)
 
-    if server_args.node_rank >= 1:
+    if server_args.node_rank >= 1 and not server_args.dp_spmd_mode:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 

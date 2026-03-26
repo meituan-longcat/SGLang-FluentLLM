@@ -121,7 +121,7 @@ class FLASHConfig(PretrainedConfig):
         oe_vocab_size_ratio=None,
         oe_neighbor_num=None,
         oe_split_num=None,
-        embP=None,
+        embP=1,
         ignored_token_ids=None,
         ngram_vocab_size_ratio=None,
         emb_neighbor_num=None,
@@ -177,20 +177,28 @@ class FLASHConfig(PretrainedConfig):
         self.use_over_embedding = oe_vocab_size_ratio is not None
         self.over_embedding_vocab_size_ratio = oe_vocab_size_ratio
         if self.use_over_embedding:
-            self.over_embedding_m = int(vocab_size * oe_vocab_size_ratio)
+            # Use vocab_size_text if available (for multimodal models with extended vocab)
+            # Otherwise fall back to vocab_size
+            oe_base_vocab_size = kwargs.get('text_vocab_size', vocab_size)
+            self.over_embedding_m = int(oe_base_vocab_size * oe_vocab_size_ratio)
             self.oe_neighbor_num = oe_neighbor_num
             self.oe_split_num = oe_split_num
             self.oe_ignore_tokens = []
+            self.vocab_size_text = oe_base_vocab_size
             if ignored_token_ids is not None and ignored_token_ids != '':
                 # Looks like this: "ignored_token_ids": "0:4,36:55" separated by commas, left-closed right-open
                 for id_range in ignored_token_ids.split(','):
                     id_start = int(id_range.split(':')[0])
                     id_end = int(id_range.split(':')[1])
                     self.oe_ignore_tokens.extend(range(id_start, id_end))
+            self.oe_m_padding_size = embP
         self.use_ngram_embedding = ngram_vocab_size_ratio is not None
         if self.use_ngram_embedding:
             self.use_over_embedding = True
-            self.over_embedding_m = int(ngram_vocab_size_ratio * vocab_size)
+            oe_base_vocab_size = kwargs.get('text_vocab_size', vocab_size)
+            self.over_embedding_m = int(ngram_vocab_size_ratio * oe_base_vocab_size)
             self.oe_neighbor_num = emb_neighbor_num
             self.oe_split_num = emb_split_num
             self.oe_ignore_tokens = []
+            self.vocab_size_text = oe_base_vocab_size
+            self.oe_m_padding_size = embP

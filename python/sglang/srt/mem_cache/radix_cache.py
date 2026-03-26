@@ -254,7 +254,24 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
 
-    def match_prefix(self, key: List, **kwargs) -> MatchResult:
+    def gen_paged_token_ids(self, full_page_num, key, page_size, req: Req):
+        if req.input_extra_infos is not None and \
+            isinstance(req.input_extra_infos, list) and \
+                len(req.input_extra_infos) > 0 and \
+                "paged_hash_ids" in req.input_extra_infos[0]:
+            paged_hash_ids = req.input_extra_infos[0]["paged_hash_ids"]
+            paged_token_ids = [
+                tuple([paged_hash_ids[i]])
+                for i in range(0, full_page_num)
+            ]
+        else:
+            paged_token_ids = [
+                tuple(key[i * page_size : (i + 1) * page_size])
+                for i in range(0, full_page_num)
+            ]
+        return paged_token_ids
+    
+    def match_prefix(self, key: List, req: Req, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
             key: A list of token IDs to find a matching prefix.
@@ -276,10 +293,7 @@ class RadixCache(BasePrefixCache):
         # Compatible with whether the incoming key is paged
         if not isinstance(key[0], tuple):
             full_page_num = len(key) // page_size
-            paged_token_ids = [
-                tuple(key[i * page_size : (i + 1) * page_size])
-                for i in range(0, full_page_num)
-            ]
+            paged_token_ids = self.gen_paged_token_ids(full_page_num, key, page_size, req)
         else:
             paged_token_ids = key
         if len(paged_token_ids) == 0:
@@ -326,10 +340,7 @@ class RadixCache(BasePrefixCache):
         seq_len = len(token_ids)
         # without last not full page
         full_page_num = seq_len // page_size
-        paged_token_ids = [
-            tuple(token_ids[i * page_size : (i + 1) * page_size])
-            for i in range(0, full_page_num)
-        ]
+        paged_token_ids = self.gen_paged_token_ids(full_page_num, token_ids, page_size, req)
         page_ids = self.token_to_kv_pool_allocator.req_to_page[
             req_pool_idx, :full_page_num
         ].clone()
@@ -337,7 +348,7 @@ class RadixCache(BasePrefixCache):
         _ = self.insert(paged_token_ids, page_ids)
 
         # After insert, the tree changed so the match prefix ids changed
-        new_prefix_page_ids = self.match_prefix(paged_token_ids).device_indices
+        new_prefix_page_ids = self.match_prefix(paged_token_ids, req).device_indices
         # new_prefix_page_ids is cached in tree, free the diff part in page_ids
 
         if new_prefix_page_ids.numel() > 0:
@@ -377,18 +388,15 @@ class RadixCache(BasePrefixCache):
         seq_len = len(token_ids)
         # without last not full page
         full_page_num = seq_len // page_size
-        paged_token_ids = [
-            tuple(token_ids[i * page_size : (i + 1) * page_size])
-            for i in range(0, full_page_num)
-        ]
-
+        paged_token_ids = self.gen_paged_token_ids(full_page_num, token_ids, page_size, req)
+        
         page_ids = self.token_to_kv_pool_allocator.req_to_page[
             req_pool_idx, :full_page_num
         ].clone()
         _ = self.insert(paged_token_ids, page_ids)
         # After insert, perform matching, use page_id in radix tree to replace the allocated
         # page before insert, release diff part, and write to req_to_token_pool
-        match_result = self.match_prefix(paged_token_ids)
+        match_result = self.match_prefix(paged_token_ids, req)
         (new_prefix_page_ids, new_last_node) = (match_result.device_indices, match_result.last_device_node)
         if new_prefix_page_ids.numel() > 0:
             diff = self.token_to_kv_pool_allocator.free_with_diff(

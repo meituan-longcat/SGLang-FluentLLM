@@ -234,7 +234,7 @@ class TpModelWorker:
             next_token_ids = None
             next_token_multi_ids = None
         else:
-            next_token_ids = self.model_runner.sample(logits_output, forward_batch)
+            next_token_ids, output_tensor_dict = self.model_runner.sample(logits_output, forward_batch)
             if forward_batch.temp_multi_ids is not None:
                 # Multi id decoding is completed by multimodal module itself
                 assert next_token_ids.shape == (forward_batch.batch_size, )
@@ -247,7 +247,7 @@ class TpModelWorker:
             if model_worker_batch.disagg_set_aux_fn is not None:
                 model_worker_batch.disagg_set_aux_fn(next_token_ids, logits_output)
 
-        return logits_output, next_token_ids, next_token_multi_ids
+        return logits_output, next_token_ids, next_token_multi_ids, output_tensor_dict
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)

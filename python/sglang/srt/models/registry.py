@@ -1,5 +1,6 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/models/registry.py
 
+import os
 import importlib
 from sglang.srt.utils import get_colorful_logger
 import pkgutil
@@ -67,9 +68,8 @@ class _ModelRegistry:
 
 
 @lru_cache()
-def import_model_classes():
+def import_model_classes(package_name="sglang.srt.models"):
     model_arch_name_to_cls = {}
-    package_name = "sglang.srt.models"
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
@@ -104,3 +104,7 @@ def import_model_classes():
 
 
 ModelRegistry = _ModelRegistry(import_model_classes())
+if "SGLANG_DISABLED_MODEL_ARCHS" in os.environ:
+    package_name_list =  os.environ["SGLANG_DISABLED_MODEL_ARCHS"].split(",")
+    for package_name in package_name_list:
+        ModelRegistry.models.update(import_model_classes(package_name=package_name))
