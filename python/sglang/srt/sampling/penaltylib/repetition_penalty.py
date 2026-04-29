@@ -67,7 +67,8 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
     def _update_multiply_penalty(self, multiply_penalty: torch.Tensor) -> torch.Tensor:
         # multiply_penalty should be a tensor filled with 1
         assert multiply_penalty is not None
-        multiply_penalty.mul_(self.cumulated_repetition_penalties)
+        if self._is_prepared:
+            multiply_penalty.mul_(self.cumulated_repetition_penalties)
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         try:

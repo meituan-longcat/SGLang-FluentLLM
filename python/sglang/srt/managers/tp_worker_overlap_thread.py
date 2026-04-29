@@ -231,6 +231,8 @@ class TpModelWorkerClient:
                     logits_output.input_token_logprobs.tolist()
                 )
         next_token_ids = next_token_ids.tolist()
+        if next_token_multi_ids is not None:
+            next_token_multi_ids = next_token_multi_ids.tolist()
         return logits_output, next_token_ids, next_token_multi_ids
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):

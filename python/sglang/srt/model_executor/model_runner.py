@@ -43,7 +43,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.env import global_server_args_dict, global_server_args_dict_update
-
+from sglang.global_config import global_config
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.prefill_cuda_graph_runner import PrefillCudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode, CaptureHiddenMode
@@ -142,6 +142,8 @@ class ModelRunner(EPLBMixin, WeightMixin):
 
         AttnInitializer.modify_args(self)
         global_server_args_dict_update(server_args)
+        global_config.server_args = server_args
+        global_config.model_config = model_config
         self.load_model()
 
         self.enable_overlap = not server_args.disable_overlap_schedule
@@ -398,9 +400,9 @@ class ModelRunner(EPLBMixin, WeightMixin):
         if self.server_args.request_cache_size > 0:
             RequestCache.get_instance().patch_req_info(recv_req)
     
-    def init_request_cache_capture(self, forward_batch, extend_lens):
+    def init_request_cache_capture(self, forward_batch, extend_lens, stream):
         if self.server_args.request_cache_size > 0:
-            RequestCache.get_instance().init_request_cache_capture(forward_batch, extend_lens)
+            RequestCache.get_instance().init_request_cache_capture(forward_batch, extend_lens, stream)
 
     def read_from_request_cache_wrapper(self, forward_batch, new_output_dict:bool=False):
         if self.server_args.request_cache_size > 0:

@@ -145,7 +145,7 @@ class SchedulerPostProcessMixin:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
                     if next_token_multi_ids is not None:
-                        req.output_multi_ids.append(next_token_multi_ids[i].tolist())
+                        req.output_multi_ids.append(next_token_multi_ids[i])
 
                     req.check_finished()
 

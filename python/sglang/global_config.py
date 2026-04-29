@@ -44,6 +44,10 @@ class GlobalConfig:
         # Language frontend interpreter optimization configs
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
+        self.server_args = None
+        self.model_config = None
+        self.global_server_args_dict = None
+
 
 
 global_config = GlobalConfig()

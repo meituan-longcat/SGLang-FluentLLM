@@ -401,6 +401,7 @@ class CudaGraphRunner:
         self.model_runner.init_request_cache_capture(
             forward_batch,
             [self.num_tokens_per_bs] * bs,
+            stream,
         )
 
         # Attention backend
