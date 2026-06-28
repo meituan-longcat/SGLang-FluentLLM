@@ -11,7 +11,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVArgs,
     KVPoll,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, PageTransferMetadata
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ class FakeKVSender(BaseKVSender):
             return KVPoll.WaitingForInput
         else:
             # Assume transfer completed instantly
-            logger.info("FakeKVSender poll success")
+            logger.debug("FakeKVSender poll success")
             return KVPoll.Success
 
     def init(
@@ -38,18 +38,19 @@ class FakeKVSender(BaseKVSender):
         decode_prefix_len: Optional[int] = 0,
     ):
         self.decode_prefix_len = decode_prefix_len
-        logger.info(
+        logger.debug(
             f"FakeKVSender init with kv_indices: {kv_indices}, aux_index: {aux_index}, decode_prefix_len: {decode_prefix_len}"
         )
         pass
 
     def send(
-        self,
-        kv_indices: npt.NDArray[np.int64], 
-        start_idx: Optional[int] = 0
+        self, 
+        kv_indices: npt.NDArray[np.int64],
+        start_idx: Optional[int] = 0,
+        mla_l1_5_args: Optional[PageTransferMetadata] = None,
     ):
         self.has_sent = True
-        logger.info(f"FakeKVSender send with kv_indices: {kv_indices}")
+        logger.debug(f"FakeKVSender send with kv_indices: {kv_indices}")
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -71,13 +72,19 @@ class FakeKVReceiver(BaseKVReceiver):
             return KVPoll.WaitingForInput
         else:
             # Assume transfer completed instantly
-            logger.info("FakeKVReceiver poll success")
+            logger.debug("FakeKVReceiver poll success")
             return KVPoll.Success
 
-    def init(self, kv_indices: list[int], aux_index: Optional[int] = None, decode_prefix_len: Optional[int] = 0):
+    def init(
+        self,
+        kv_indices: list[int],
+        aux_index: Optional[int] = None,
+        decode_prefix_len: Optional[int] = 0,
+        mla_l1_5_args: Optional[PageTransferMetadata] = None,
+    ):
         self.has_init = True
         self.decode_prefix_len = decode_prefix_len
-        logger.info(
+        logger.debug(
             f"FakeKVReceiver init with kv_indices: {kv_indices}, aux_index: {aux_index}, decode_prefix_len: {decode_prefix_len}"
         )
 

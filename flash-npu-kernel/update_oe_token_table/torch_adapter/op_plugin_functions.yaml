@@ -1,0 +1,4 @@
+- func: npu_update_oe_token_table(Tensor tokens, Tensor req_lens, Tensor row_indices, Tensor column_starts, Tensor ignore_tokens, int batch_size, int max_context_len, Tensor(a!) oe_token_table) -> ()
+  op_api: all_version
+  gen_opapi:
+    exec: aclnnUpdateOeTokenTable

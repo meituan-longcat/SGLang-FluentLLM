@@ -27,7 +27,7 @@ from sglang.srt.layers.attention.native_sparse_attention.compress_attn import (
 from sglang.srt.layers.attention.native_sparse_attention.select_attn import (
     _select_attention_torch_aligned
 )
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn_3.flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 class CompressAttnMLA(nn.Module):
     def __init__(

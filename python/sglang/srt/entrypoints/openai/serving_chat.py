@@ -41,11 +41,14 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager, tokenizer_apply_chat_template_task, \
+    tokenizer_encode_task, tokenizer_decode_task
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import convert_json_schema_to_str
 from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils import get_bool_env_var
 
+TOOL_CHOICE_BYPASS_CHECK = get_bool_env_var("TOOL_CHOICE_BYPASS_CHECK", "false")
 logger = get_colorful_logger(__name__)
 
 
@@ -95,7 +98,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
@@ -103,7 +106,7 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
-        processed_messages = self._process_messages(request, is_multimodal)
+        processed_messages = await self._process_messages(request, is_multimodal)
         # Build sampling parameters
         sampling_params = self._build_sampling_params(
             request,
@@ -141,7 +144,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _process_messages(
+    async def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
@@ -167,14 +170,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
+            result = await self._apply_jinja_template(request, tools, is_multimodal)
         else:
-            result = self._apply_conversation_template(request, is_multimodal)
+            result = await self._apply_conversation_template(request, is_multimodal)
 
         result.tool_call_constraint = tool_call_constraint
         return result
 
-    def _apply_jinja_template(
+    async def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
         tools: Optional[List[Dict]],
@@ -253,17 +256,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 openai_compatible_messages = openai_compatible_messages[:-1]
 
         try:
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            prompt_ids = await self.tokenizer_manager.run_tokenizer_task(
+                tokenizer_apply_chat_template_task,
                 openai_compatible_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=tools,
-                reasoning_effort=request.reasoning_effort,
-                builtin_tools=[],
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
-            )
+                tools,
+                request.reasoning_effort,
+                request.chat_template_kwargs)
         except Exception:
             for processed_msg in openai_compatible_messages:
                 # TODO: Compatible with old version LongCat-Flash processing logic, to be deleted after model is deprecated
@@ -291,29 +289,26 @@ class OpenAIServingChat(OpenAIServingBase):
                                 logger.warning(f"function_call arguments JSON parse error: {e} | Original request arguments: {repr(arguments)}")
                                 raise ValueError(f"function_call arguments JSON parse error: {e} | Original request arguments: {repr(arguments[:200])}")
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                prompt_ids = await self.tokenizer_manager.run_tokenizer_task(
+                    tokenizer_apply_chat_template_task,
                     openai_compatible_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=tools,
-                    reasoning_effort=request.reasoning_effort,
-                    builtin_tools=[],
-                    **(
-                        request.chat_template_kwargs if request.chat_template_kwargs else {}
-                    ),
-                )
+                    tools,
+                    request.reasoning_effort,
+                    request.chat_template_kwargs)
             except Exception as e:
                 logger.warning(f"apply_chat_template error: {e}| Original request: {openai_compatible_messages=}")
                 raise RuntimeError(f"apply_chat_template error: {e} | Please check request data format")
 
         if assistant_prefix:
-            encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-            if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
-                encoded = encoded[1:]
+            encoded = await self.tokenizer_manager.run_tokenizer_task(
+                tokenizer_encode_task,
+                assistant_prefix,
+                None,
+                True)
             prompt_ids += encoded
 
         if is_multimodal:
-            prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+            prompt = await self.tokenizer_manager.run_tokenizer_task(tokenizer_decode_task, prompt_ids)
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -330,7 +325,7 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=stop,
         )
 
-    def _apply_conversation_template(
+    async def _apply_conversation_template(
         self,
         request: ChatCompletionRequest,
         is_multimodal: bool,
@@ -382,7 +377,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop.extend(request.stop)
 
         if not is_multimodal:
-            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+            prompt_ids = await self.tokenizer_manager.run_tokenizer_task(tokenizer_encode_task, prompt)
 
         return MessageProcessingResult(
             prompt=prompt,
@@ -505,6 +500,8 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         spec_verify_tokens = {}
         hidden_states = {}
+        if TOOL_CHOICE_BYPASS_CHECK:
+            request.tool_choice = "bypass_check"
 
         if self.tokenizer_manager.server_args.speculative_algorithm is not None:
             adapted_request.return_logprob = None
@@ -607,9 +604,32 @@ class OpenAIServingChat(OpenAIServingBase):
                         if chunk:
                             yield chunk
 
-                    # Send any remaining tool call arguments when generation finishes
+                    # Flush incomplete streaming state and send remaining args when generation finishes
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
+                        flush_text, flush_calls = parser.flush()
+                        for call_item in flush_calls:
+                            has_tool_calls[index] = True
+                            tool_call = ToolCall(
+                                id=None,
+                                index=call_item.tool_index,
+                                function=FunctionResponse(
+                                    name=None,
+                                    arguments=call_item.parameters,
+                                ),
+                            )
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(tool_calls=[tool_call]),
+                                finish_reason=None,
+                            )
+                            chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                created=int(time.time()),
+                                choices=[choice_data],
+                                model=request.model,
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
                         remaining_chunk = self._check_for_unstreamed_tool_args(
                             parser, content, request, index
                         )
@@ -733,6 +753,8 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming chat completion request"""
+        if TOOL_CHOICE_BYPASS_CHECK:
+            request.tool_choice = "bypass_check"
         if self.tokenizer_manager.server_args.speculative_algorithm is not None:
             adapted_request.return_logprob = None
             adapted_request.top_logprobs_num = None

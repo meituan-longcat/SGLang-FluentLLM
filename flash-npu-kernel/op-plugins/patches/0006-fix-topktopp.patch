@@ -1,0 +1,49 @@
+From 0501357c122f64b4cff2a07c16d44dd12d27102d Mon Sep 17 00:00:00 2001
+From: Chl_SolaAir <Chl_SolaAir@noreply.gitcode.com>
+Date: Mon, 2 Mar 2026 19:33:30 +0800
+Subject: [PATCH 6/7] fix topktopp
+
+---
+ .../ops/opapi/TopKTopPSampleKernelNpuOpApi.cpp     | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/op_plugin/ops/opapi/TopKTopPSampleKernelNpuOpApi.cpp b/op_plugin/ops/opapi/TopKTopPSampleKernelNpuOpApi.cpp
+index c6dd8cfd..adc05088 100644
+--- a/op_plugin/ops/opapi/TopKTopPSampleKernelNpuOpApi.cpp
++++ b/op_plugin/ops/opapi/TopKTopPSampleKernelNpuOpApi.cpp
+@@ -86,7 +86,6 @@ tensor_list npu_top_k_top_p_sample(const at::Tensor &logits, const at::Tensor &t
+ 
+     bool is_need_sample_result = false;
+ 
+-    at::Tensor logits_select_idx = npu_preparation::apply_tensor_without_format({batch, }, logits.options().dtype(at::kLong));
+     at::Tensor logits_top_kp_select = npu_preparation::apply_tensor_without_format({batch, voc_size}, logits.options().dtype(at::kFloat));
+ 
+     at::Tensor logits_idx = npu_preparation::apply_tensor_without_format({batch, voc_size}, logits.options().dtype(at::kLong));
+@@ -94,17 +93,18 @@ tensor_list npu_top_k_top_p_sample(const at::Tensor &logits, const at::Tensor &t
+ 
+     std::string post_sample_str = std::string(post_sample);
+     if (post_sample_str == "multiNomial") {
++        at::Tensor logits_select_idx = npu_preparation::apply_tensor_without_format({batch, 1}, logits.options().dtype(at::kLong));
+         is_need_sample_result = true;
+         EXEC_NPU_CMD(aclnnTopKTopPSampleV2, logits, top_k, top_p, q, min_ps, eps, is_need_logits, top_k_guess, ks_max, input_is_logits, is_need_sample_result, logits_select_idx, logits_top_kp_select, logits_idx, logits_sort_masked);
+         at::Tensor multinomial_result = multinomial_top_k_top_p_sample(logits_sort_masked, 1, true, generator);
+-        for (uint32_t i = 0; i < batch; ++i) {
+-            int64_t real_index = logits_idx[i][multinomial_result[i].item<int64_t>()].item<int64_t>();
+-            logits_select_idx[i] = real_index;
+-        }
++        int64_t dim = 1;
++        EXEC_NPU_CMD(aclnnGather, logits_idx, dim, multinomial_result, logits_select_idx);
++        at::Tensor ret_idx = logits_select_idx.reshape({-1});
++        return std::tie(ret_idx, logits_top_kp_select);
+     } else {
++        at::Tensor logits_select_idx = npu_preparation::apply_tensor_without_format({batch, }, logits.options().dtype(at::kLong));
+         EXEC_NPU_CMD(aclnnTopKTopPSampleV2, logits, top_k, top_p, q, min_ps, eps, is_need_logits, top_k_guess, ks_max, input_is_logits, is_need_sample_result, logits_select_idx, logits_top_kp_select, logits_idx, logits_sort_masked);
++        return std::tie(logits_select_idx, logits_top_kp_select);
+     }
+-
+-    return std::tie(logits_select_idx, logits_top_kp_select);
+ }
+ }
+-- 
+2.39.5 (Apple Git-154)
+

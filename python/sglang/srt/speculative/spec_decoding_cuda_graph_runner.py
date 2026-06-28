@@ -114,9 +114,12 @@ class SpecDecodeCudaGraphRunner:
         self.spec_decode_worker.target_worker.model_runner.attn_backend.init_cuda_graph_state(
             self.max_num_token
         )
-        self.spec_decode_worker.model_runner.attn_backend.init_cuda_graph_state(
-            self.max_num_token
-        )
+        assert hasattr(self.spec_decode_worker, "model_runner_list")
+        for runner in self.spec_decode_worker.model_runner_list:
+            runner.attn_backend.init_cuda_graph_state(
+                self.max_num_token
+            )
+
         self.disable_padding = (
             self.spec_decode_worker.model_runner.server_args.disable_cuda_graph_padding
         )
@@ -162,13 +165,12 @@ class SpecDecodeCudaGraphRunner:
                 device="cuda",
                 dtype=torch.int32,
             )
-            if self.capture_sample_graph:
-                self.temperature_buffer = torch.zeros(
-                    (self.max_bs, 1), dtype=torch.float32
-                )
-                self.topk_buffer = torch.zeros((self.max_bs,), dtype=torch.int32)
-                self.topp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
-                self.minp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
+            self.temperature_buffer = torch.zeros(
+                (self.max_bs, 1), dtype=torch.float32
+            )
+            self.topk_buffer = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.topp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
+            self.minp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
             if self.enable_dp_attention:
                 self.gathered_buffer = torch.zeros(
                     (
@@ -177,6 +179,15 @@ class SpecDecodeCudaGraphRunner:
                     ),
                     dtype=self.spec_decode_worker.model_runner.dtype,
                 )
+            self.scaling_penalties = torch.ones(
+                (self.max_bs,),
+                dtype=torch.float32
+            )
+            self.cumulated_scaling_penalties = torch.ones(
+                (self.max_bs, self.spec_decode_worker.target_worker.model_runner.model_config.vocab_size),
+                dtype=torch.float32
+            )
+
         self.grammar_backend = None
         if self.enable_grammar_backend():
             server_args = self.spec_decode_worker.model_runner.server_args
@@ -286,24 +297,28 @@ class SpecDecodeCudaGraphRunner:
 
         assert forward_batch.forward_mode.is_target_verify()
 
+        sampling_info = forward_batch.sampling_info
+        self.scaling_penalties[: raw_bs].copy_(sampling_info.repetition_penalties)
+        self.cumulated_scaling_penalties[: raw_bs].copy_(forward_batch.spec_info.cumulated_scaling_penalties)
+
         if self.capture_sample_graph:
-            sampling_info = forward_batch.sampling_info
             self.temperature_buffer[:raw_bs].copy_(sampling_info.temperatures)
             self.topk_buffer[:raw_bs].copy_(sampling_info.top_ks)
             self.topp_buffer[:raw_bs].copy_(sampling_info.top_ps)
             self.minp_buffer[:raw_bs].copy_(sampling_info.min_ps)
 
         # Attention backend
-        self.spec_decode_worker.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            self.req_pool_indices,
-            self.seq_lens,
-            forward_batch.seq_lens_sum
-            + (bs - raw_bs),  # For spec decode, this value is actually not used
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=self.seq_lens_cpu,
-        )
+        for runner in self.spec_decode_worker.model_runner_list:
+            runner.attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                self.req_pool_indices,
+                self.seq_lens,
+                forward_batch.seq_lens_sum
+                + (bs - raw_bs),
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+                seq_lens_cpu=self.seq_lens_cpu,
+            )
         self.spec_decode_worker.target_worker.model_runner.attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             self.req_pool_indices,
@@ -340,6 +355,7 @@ class SpecDecodeCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             is_all_greedy=False if self.capture_sample_graph else True,
             grammar=grammar,
+            cumulated_scaling_penalties=self.cumulated_scaling_penalties[:bs, :]
         )
         return spec_info
 
@@ -424,16 +440,16 @@ class SpecDecodeCudaGraphRunner:
             global_batch_size=global_batch_size,
         )
 
-        if self.capture_sample_graph:
-            forward_batch.sampling_info = SamplingBatchInfo(
-                temperatures=self.temperature_buffer[:bs],
-                top_ks=self.topk_buffer[:bs],
-                top_ps=self.topp_buffer[:bs],
-                min_ps=self.minp_buffer[:bs],
-                is_all_greedy=False,
-                need_min_p_sampling=False,
-                vocab_size=self.spec_decode_worker.model_runner.model_config.vocab_size,
-            )
+        forward_batch.sampling_info = SamplingBatchInfo(
+            temperatures=self.temperature_buffer[:bs],
+            top_ks=self.topk_buffer[:bs],
+            top_ps=self.topp_buffer[:bs],
+            min_ps=self.minp_buffer[:bs],
+            repetition_penalties=self.scaling_penalties[:bs],
+            is_all_greedy=False if self.capture_sample_graph else True,
+            need_min_p_sampling=False,
+            vocab_size=self.spec_decode_worker.model_runner.model_config.vocab_size,
+        )
         return forward_batch
 
     def capture_one_batch_size(self, bs: int):
@@ -450,14 +466,15 @@ class SpecDecodeCudaGraphRunner:
             forward_batch.forward_mode,
             forward_batch.spec_info,
         )
-        self.spec_decode_worker.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            bs * self.draft_token_num,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-        )
+        for runner in self.spec_decode_worker.model_runner_list:
+            runner.attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                bs * self.draft_token_num,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
 
         # Run and capture
         def run_once():

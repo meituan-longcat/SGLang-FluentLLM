@@ -1,0 +1,14 @@
+1. 写算子定义: npu_compute_n_gram_ids.json
+2. 生成单算子工程 sh msopgen.sh
+3. 修改：TAR_FORMAT=ustar -> TAR_FORMAT=posix; 修改cmake/func.cmake 加A3_COMPATIBLE; 加check_version_compatiable.sh到cmake/util；
+在op_host/*.cpp 加
+#ifdef A3_COMPATIBLE
+        this->AICore().AddConfig("ascend910_93");
+#endif
+ascend910->ascend910b;
+修改CmkaePresets.json ASCEND_COMPUTE_UNIT: ascend910b;ascend910_93;
+修改scripts里面的install.sh和upgrade.sh：
+sed -i "/load_priority=$found_vendors/s@load_priority=$found_vendors@load_priority=$vendor_name,$vendor@g" "$config_file"
+4. 实现ophost里面的InferShape InferDataType
+5. 设计tiling结构体，实现TilingFunc
+6. 实现kernel

@@ -44,7 +44,7 @@ from sglang.srt.layers.attention.native_sparse_attention.compress_kv import (
     gate_compress_torch,
     gate_compress_decode_triton,
 )
-from flash_attn_interface import flash_attn_with_kvcache
+from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear

@@ -6,6 +6,13 @@ import torch
 from sglang.srt.managers.expert_location import get_global_expert_location_metadata
 from sglang.srt.env import global_server_args_dict
 
+
+
+from sglang.srt.utils import get_colorful_logger, is_npu, make_layers, print_npu_graph_tensor
+
+logger = get_colorful_logger(__name__)
+_is_npu = is_npu()
+
 @dataclass
 class ExpertLocationDispatchInfo:
     ep_dispatch_algorithm: Literal["static", "random", "static_with_zero_expert", "dynamic_with_zero_expert"]
@@ -24,17 +31,28 @@ class ExpertLocationDispatchInfo:
 
         if ep_dispatch_algorithm is None:
             return None
-
-        return cls(
-            ep_dispatch_algorithm=ep_dispatch_algorithm,
-            partial_logical_to_rank_dispatch_physical_map=(
+        
+        partial_logical_to_rank_dispatch_physical_map = None
+        if _is_npu:
+            partial_logical_to_rank_dispatch_physical_map = (
+                expert_location_metadata.logical_to_rank_dispatch_physical_map_list[layer_id]
+                if expert_location_metadata.logical_to_rank_dispatch_physical_map_list 
+                is not None
+                else None                                                
+                )
+        else:
+            partial_logical_to_rank_dispatch_physical_map = (
                 expert_location_metadata.logical_to_rank_dispatch_physical_map[
                     layer_id, :
                 ]
-                if expert_location_metadata.logical_to_rank_dispatch_physical_map
+                if expert_location_metadata.logical_to_rank_dispatch_physical_map 
                 is not None
                 else None
-            ),
+            )
+
+        return cls(
+            ep_dispatch_algorithm=ep_dispatch_algorithm,
+            partial_logical_to_rank_dispatch_physical_map=partial_logical_to_rank_dispatch_physical_map,
             partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[
                 layer_id, :
             ],
@@ -88,14 +106,10 @@ def _topk_ids_logical_to_physical_static_with_zero_expert(
 ) -> torch.Tensor:
     assert num_experts is not None
     topk_ids_original_shape = topk_ids.shape
-    topk_ids = topk_ids.flatten()
-    mask_less_than_num_experts = topk_ids < num_experts
-    converted_part = info.partial_logical_to_rank_dispatch_physical_map[
-        topk_ids[mask_less_than_num_experts]
-    ]
-    topk_ids[mask_less_than_num_experts] = converted_part
-    topk_ids = topk_ids.view(topk_ids_original_shape)
-    return topk_ids
+    topk_ids_flat = topk_ids.flatten()
+    indices = torch.clamp(topk_ids_flat, 0, num_experts)
+    converted = torch.gather(info.partial_logical_to_rank_dispatch_physical_map, 0, indices.to(torch.int64))
+    return converted.view(topk_ids_original_shape)
 
 def _topk_ids_logical_to_physical_dynamic_with_zero_expert(
     topk_ids: torch.Tensor,

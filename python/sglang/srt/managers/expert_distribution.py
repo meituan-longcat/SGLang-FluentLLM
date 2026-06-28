@@ -1,7 +1,7 @@
 import logging
 import os
 import time
-from abc import ABC
+from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,14 +9,16 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import einops
 import torch
+import torch.nn.functional as F
 import torch.distributed
 
 from sglang.srt.managers.expert_location import ExpertLocationMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable
+from sglang.srt.utils import Withable, get_device_name, get_colorful_logger, get_device_module, is_npu
 
-logger = logging.getLogger(__name__)
+logger = get_colorful_logger(__name__)
+_is_npu = is_npu()
 
 # --------------------------------------- Entrypoint -----------------------------------------
 
@@ -39,6 +41,9 @@ class ExpertDistributionRecorder(ABC):
         else:
             return _ExpertDistributionRecorderNoop()
 
+    def set_current_layer(self, layer_idx):
+        pass
+
     @contextmanager
     def with_current_layer(self, layer_idx):
         yield
@@ -50,6 +55,9 @@ class ExpertDistributionRecorder(ABC):
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
         yield
+    
+    def on_local_expert_counts(self, local_expert_counts: torch.Tensor):
+        pass
 
     def on_select_experts(self, topk_ids: torch.Tensor, num_experts: Optional[int] = None):
         pass
@@ -74,7 +82,7 @@ class ExpertDistributionRecorder(ABC):
     def stop_record(self):
         self._on_not_implemented()
 
-    def dump_record(self, output_mode: _OutputMode = "file"):
+    def dump_record(self, output_mode: _OutputMode = "file", reset: bool = True):
         self._on_not_implemented()
 
     @property
@@ -118,6 +126,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 "ExpertDistributionRecorder auto start record since enable_expert_distribution_metrics"
             )
             self.start_record()
+    
+    def set_current_layer(self, layer_idx):
+        self._current_layer_idx.value = layer_idx
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -149,7 +160,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._accumulator.append(forward_pass_id, gatherer_key, single_pass_data)
 
     def on_select_experts(self, topk_ids: torch.Tensor, num_experts: Optional[int] = None):
-        self._on_hook("on_select_experts", topk_ids=topk_ids, num_experts=num_experts)
+        return self._on_hook("on_select_experts", topk_ids=topk_ids, num_experts=num_experts)
+
+    def on_local_expert_counts(self, local_expert_counts: torch.Tensor):
+        return self._on_hook("on_local_expert_counts", local_expert_counts=local_expert_counts)
 
     def on_deepep_dispatch_normal(
         self,
@@ -182,7 +196,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 self._current_debug_name.value
             )
         ]
-        getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
+        return getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
 
     def _reset(self):
         """Reset the expert distribution recorder."""
@@ -267,10 +281,13 @@ class _SinglePassGatherer(ABC):
         #         )
         #     else:
         #         raise NotImplementedError
+        if _is_npu:
+            return _SelectExpertsSinglePassGathererNPU(server_args, expert_location_metadata, rank)
+        else:
+            return _SelectExpertsSinglePassGatherer(server_args, expert_location_metadata, rank)
 
-        return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
-
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+    def __init__(self, server_args, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+        self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
@@ -278,6 +295,9 @@ class _SinglePassGatherer(ABC):
         pass
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        pass
+
+    def on_local_expert_counts(self, layer_idx: int, local_expert_counts: torch.Tensor):
         pass
 
     def on_deepep_dispatch_normal(
@@ -345,6 +365,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
             topk_ids
         )
+        return self._topk_ids_of_layer
 
     def on_deepep_dispatch_normal(
         self,
@@ -420,8 +441,9 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 ),
             ),
             dtype=torch.int,
-            device="cuda",
+            device=self._server_args.device,
         )
+        torch._dynamo.mark_static(self._data)
 
     def reset(self):
         self._data[...] = 0
@@ -455,6 +477,70 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )
+        return self._data
+
+
+class _SelectExpertsSinglePassGathererNPU(_SinglePassGatherer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._enable_global_physical_experts = False
+        self._data = [
+            torch.zeros(
+                (
+                    (
+                        self._expert_location_metadata.num_physical_experts
+                        if self._enable_global_physical_experts
+                        else self._expert_location_metadata.num_local_physical_experts
+                    ),
+                ),
+                dtype=torch.int64,
+                device=self._server_args.device,
+            )
+            for _ in range(self._expert_location_metadata.num_layers)
+        ]
+        for t in self._data:
+            torch._dynamo.mark_static(t)
+
+    def reset(self):
+        for t in self._data:
+            t.zero_()
+
+    def collect(self) -> Dict:
+        if self._enable_global_physical_experts:
+            global_physical_count = torch.stack(self._data, dim=0)
+        else:
+            # Can optimize if bottleneck
+            global_physical_count = _convert_local_to_global_physical_count(
+                torch.stack(self._data, dim=0),
+                rank=self._rank,
+                num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+                num_physical_experts=self._expert_location_metadata.num_physical_experts,
+            )
+
+        return dict(global_physical_count=global_physical_count)
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor, num_experts: Optional[int] = None):
+        topk_ids = topk_ids.flatten()
+        if num_experts is None:
+            mask = topk_ids != -1
+        elif _is_npu:
+            mask = (topk_ids < num_experts)
+        else:
+            mask = (topk_ids != -1) & (topk_ids < num_experts)
+        safe_ids = torch.where(
+            mask,
+            topk_ids,
+            torch.tensor(0, device=topk_ids.device, dtype=topk_ids.dtype)
+        )
+        self._data[layer_idx].index_add_(
+            dim=0, index=safe_ids, source=mask.int(),
+        )
+        return self._data[layer_idx]
+    
+    def on_local_expert_counts(self, layer_idx: int, local_expert_counts: torch.tensor):
+        assert (not self._enable_global_physical_experts == True)
+        self._data[layer_idx] += local_expert_counts
+        return self._data[layer_idx]
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
@@ -517,6 +603,195 @@ def _convert_local_to_global_physical_count(
     ] = local_physical_count
     return ans
 
+
+# --- Unbalancedness Metrics ---
+
+class BaseMetric(ABC):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    @property
+    def name(self) -> str:
+        return self.__class__.__name__
+
+    @abstractmethod
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """输入: [layers, experts], 输出: [layers]"""
+        pass
+
+class MetricRegistry:
+    _registry: Dict[str, type] = {}
+
+    @classmethod
+    def register(cls, name: str):
+        def decorator(subclass):
+            cls._registry[name] = subclass
+            return subclass
+        return decorator
+
+    @classmethod
+    def create(cls, name: str, **kwargs) -> BaseMetric:
+        return cls._registry[name](**kwargs)
+
+@MetricRegistry.register("peak_to_mean")
+class PeakToMean(BaseMetric):
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [layers, experts]
+        peak = x.max(dim=-1).values
+        mean = x.mean(dim=-1)
+        return peak / (mean + 1e-9)
+
+@MetricRegistry.register("gini")
+class GiniCoefficient(BaseMetric):
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        sorted_x, _ = torch.sort(x, dim=-1)
+        n = x.size(-1)
+        index = torch.arange(1, n + 1, device=x.device, dtype=x.dtype)
+        numerator = 2 * torch.sum(index * sorted_x, dim=-1)
+        denominator = n * torch.sum(sorted_x, dim=-1)
+        return (numerator / (denominator + 1e-9)) - (n + 1) / n
+
+@MetricRegistry.register("top_k_load")
+class TopKLoadPercentage(BaseMetric):
+    def __init__(self, k: int = 1, **kwargs):
+        super().__init__(**kwargs)
+        self.k = k
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        total = x.sum(dim=-1)
+        top_k_vals = torch.topk(x, k=min(self.k, x.size(-1)), dim=-1).values
+        return top_k_vals.sum(dim=-1) / (total + 1e-9)
+
+@MetricRegistry.register("hoover")
+class HooverIndex(BaseMetric):
+    """
+    Hoover 指数 (Robin Hood Index)
+    衡量需要移动多少比例的负载才能达到平衡。范围 [0, 1]。
+    """
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        total = x.sum(dim=-1)
+        
+        # sum(|xi - mean|) / (2 * sum(xi))
+        diff_sum = torch.sum(torch.abs(x - mean), dim=-1)
+        return 0.5 * diff_sum / (total + 1e-9)
+
+@MetricRegistry.register("entropy")
+class NormalizedEntropy(BaseMetric):
+    """
+    归一化熵 (Normalized Entropy)
+    衡量分布的无序程度。范围 [0, 1]。
+    0 = 绝对均匀 (最大熵), 1 = 绝对集中 (最小熵)
+    注：为了符合"越大越不均"的直觉，这里返回 (1 - 归一化熵)
+    """
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # 转换为概率分布
+        probs = x / (x.sum(dim=-1, keepdim=True) + 1e-9)
+        
+        # 避免 log(0)
+        probs = probs + 1e-12
+        
+        entropy = -torch.sum(probs * torch.log(probs), dim=-1)
+        max_entropy = torch.log(torch.tensor(x.size(-1), device=x.device, dtype=x.dtype))
+        
+        # normalized_entropy = entropy / max_entropy (1是均匀，0是不均)
+        return 1.0 - (entropy / max_entropy)
+
+
+# --- 2. 结果封装 ---
+
+class AnalysisResult:
+    def __init__(self, results: Dict[str, torch.Tensor], num_layers: int):
+        self._results = results
+        self.num_layers = num_layers
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        return self._results[key]
+
+    def __str__(self) -> str:
+        """
+        生成适合日志打印的表格。
+        格式：
+        Layer ID | Gini   | PeakMean | Top1Load
+        ---------------------------------------
+        0        | 0.1234 | 1.0500   | 0.0500
+        1        | 0.8800 | 7.5000   | 0.6000
+        """
+        if not self._results:
+            return "No Metrics"
+
+        metric_names = list(self._results.keys())
+        
+        # 1. 定义列宽
+        layer_col_width = 8
+        metric_col_width = 12
+        
+        # 2. 构建表头
+        header = f"{'Layer':<{layer_col_width}}" \
+            + "".join([f"{name:>{metric_col_width}}" for name in metric_names])
+        separator = "-" * len(header)
+        
+        lines = [separator, header, separator]
+
+        # 3. 构建每一层的数据行
+        for layer_idx in range(self.num_layers):
+            row_str = f"{layer_idx:<{layer_col_width}}"
+            for name in metric_names:
+                # 获取该 metric 在该 layer 的值
+                val = self._results[name][layer_idx].item()
+                row_str += f"{val:>{metric_col_width}.4f}"
+            lines.append(row_str)
+            
+        lines.append(separator)
+        return "\n".join(lines)
+
+    def summarization(self):
+        if not self._results:
+            return "No Metrics"
+
+        metric_names = list(self._results.keys())
+        summarization = f"[MetricsSummarization]:" \
+            + "".join([f"{name}:{self._results[name].mean().item():.4f} " for name in metric_names])
+        return summarization
+    
+    def dump(self) -> Dict[str, torch.Tensor]:
+        """
+        导出内部数据字典。
+        用法: torch.save(result.dump(), 'metrics.pt')
+        """
+        return self._results
+
+# --- 3. 分析器 (逻辑增强) ---
+
+class MoEAnalyzer:
+    def __init__(self):
+        self.metrics: List[BaseMetric] = []
+
+    def add_metric(self, metric_name: str, **kwargs) -> 'MoEAnalyzer':
+        self.metrics.append(MetricRegistry.create(metric_name, **kwargs))
+        return self
+
+    def analyze(self, activations: torch.Tensor) -> AnalysisResult:
+        """
+        输入 activations: 
+          - 2D Tensor [num_layers, num_experts] (标准情况)
+          - 1D Tensor [num_experts] (会自动升维处理)
+        """
+        # 1. 维度检查与标准化
+        x = activations.float()
+        if x.dim() == 1:
+            x = x.unsqueeze(0) # 变成 [1, num_experts]
+        elif x.dim() != 2:
+            raise ValueError(f"Expected 1D or 2D tensor, got {x.dim()}D")
+            
+        num_layers = x.size(0)
+        results = {}
+
+        # 2. 批量计算
+        for metric in self.metrics:
+            results[metric.name] = metric(x)
+        
+        return AnalysisResult(results, num_layers)
 
 # --------------------------------------- Accumulator -----------------------------------------
 
@@ -707,17 +982,32 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._global_physical_count_of_buffered_step = _Buffer.init_new(
-            item_shape=(
+        self._use_running_sum_only = (
+            self._server_args.enable_eplb
+            and os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_USE_RUNNING_SUM_ONLY", "1") == "1"
+        )
+        self._global_physical_count_sum = torch.zeros(
+            (
                 self._expert_location_metadata.num_layers,
-                # Cannot use local_physical_count to support select_experts
                 self._expert_location_metadata.num_physical_experts,
             ),
-            buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
-            dtype=torch.int32,
+            dtype=torch.int64,
             device=self._server_args.device,
         )
+        self._global_physical_count_of_buffered_step = None
+        if not self._use_running_sum_only:
+            self._global_physical_count_of_buffered_step = _Buffer.init_new(
+                item_shape=(
+                    self._expert_location_metadata.num_layers,
+                    # Cannot use local_physical_count to support select_experts
+                    self._expert_location_metadata.num_physical_experts,
+                ),
+                buffer_size=self._server_args.expert_distribution_recorder_buffer_size,
+                dtype=torch.int32,
+                device=self._server_args.device,
+            )
         self._first_dump = True
+        self.history_stats = []
 
     def append(
         self,
@@ -726,38 +1016,93 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         single_pass_data: Dict,
     ):
         super().append(forward_pass_id, gatherer_key, single_pass_data)
-        # Can optimize if overhead here is large
-        self._global_physical_count_of_buffered_step.append(
-            single_pass_data["global_physical_count"]
+        self._global_physical_count_sum += single_pass_data["global_physical_count"].to(
+            self._global_physical_count_sum.dtype
         )
+        if self._global_physical_count_of_buffered_step is not None:
+            # Can optimize if overhead here is large
+            self._global_physical_count_of_buffered_step.append(
+                single_pass_data["global_physical_count"]
+            )
 
     def reset(self):
         super().reset()
-        self._global_physical_count_of_buffered_step.reset()
+        self._global_physical_count_sum.zero_()
+        if self._global_physical_count_of_buffered_step is not None:
+            self._global_physical_count_of_buffered_step.reset()
+
+
+    def _get_buffered_physical_count(self) -> torch.Tensor:
+        if self._global_physical_count_of_buffered_step is not None:
+            return self._global_physical_count_of_buffered_step.get_all()
+        return self._global_physical_count_sum.unsqueeze(0)
 
     def dump(self, output_mode: _OutputMode):
+        buffered_physical_count = self._get_buffered_physical_count()
+
+
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
-            self._global_physical_count_of_buffered_step.get_all(),
+            buffered_physical_count,
             num_layers=self._expert_location_metadata.num_layers,
             num_logical_experts=self._expert_location_metadata.num_logical_experts,
             physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
+        if self._use_running_sum_only:
+            logical_count_of_buffered_step = logical_count_of_buffered_step.squeeze(0)
 
         if self._first_dump:
             self._first_dump = False
-            torch.cuda.empty_cache()
+            get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
             logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
         )
 
+        global_count_of_buffered_step = self._global_physical_count_sum.clone()
+        if not self._use_running_sum_only:
+            global_count_of_buffered_step = buffered_physical_count.sum(dim=0)
+
+        torch.distributed.all_reduce(
+            global_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+        )
+        analyzer = MoEAnalyzer() \
+                .add_metric("peak_to_mean") \
+                .add_metric("gini") \
+                .add_metric("top_k_load", k=1) \
+                .add_metric("entropy") \
+                .add_metric("hoover")
+        metrics_result = analyzer.analyze(global_count_of_buffered_step)
+        per_gpu_metrics_result = analyzer.analyze(
+            global_count_of_buffered_step \
+            .clone() \
+            .view(
+                self._expert_location_metadata.num_layers,
+                self._expert_location_metadata.num_physical_experts // self._expert_location_metadata.num_local_physical_experts,
+                self._expert_location_metadata.num_local_physical_experts
+            ) \
+            .sum(dim=-1)
+        )
+        if self._rank == 0:
+            logger.info(f"[METRICS][Unbalancedness metrics] {metrics_result.summarization()}")
+            logger.info(f"[METRICS][Unbalancedness per gpu metrics] {per_gpu_metrics_result.summarization()}")
+            # self.history_stats.append(dict(
+            #     logic_count=logical_count_of_buffered_step.sum(dim=0),
+            #     physical_count=global_count_of_buffered_step,
+            #     metrics_result=metrics_result.dump(),
+            # ))
+
         output = dict(
             rank=self._rank,
             logical_count=logical_count_of_buffered_step,
+            physical_count=global_count_of_buffered_step,
+            metrics=metrics_result.dump(),
+            per_expert_metrics=metrics_result['GiniCoefficient'].mean().item(),
+            per_device_metrics=per_gpu_metrics_result['GiniCoefficient'].mean().item(),
         )
 
         if output_mode == "file":
             if self._rank == 0:
+                output['historys'] = self.history_stats
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output

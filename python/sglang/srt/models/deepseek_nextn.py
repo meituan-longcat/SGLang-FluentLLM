@@ -38,6 +38,7 @@ from sglang.srt.layers.dense.gemms.fp8.fp8_utils import block_dequant
 from sglang.srt.layers.utils import (
     FLLM_IS_CP, CP_METADATA, cp_split_and_rebuild_data, cp_all_gather_rerange_output
 )
+from sglang.srt.configs.model_config import is_dsa
 
 is_hip_ = is_hip()
 
@@ -257,50 +258,38 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-
-                    if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    
+                    if (
+                        fuse_qkv_a_proj and (
+                            "q_a_proj" in name 
+                            or "kv_a_proj_with_mqa" in name
+                            or "indexer.wk" in name
+                        )
                     ):
-                        cached_a_proj[name] = loaded_weight
-                        q_a_proj_name = (
-                            name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                        )
-                        kv_a_proj_name = (
-                            name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                        )
+                        quant_block_size = self.quant_config.weight_block_size[0]
+                        begin_size_mp = {
+                            "q_a_proj": 0,
+                            "indexer_wk": self.config.q_lora_rank,
+                            "kv_a_proj_with_mqa": self.config.q_lora_rank,
+                        }
+                        if is_dsa(self.config):
+                            begin_size_mp["kv_a_proj_with_mqa"] += self.config.index_head_dim
 
-                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                        if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
-                        ):
-
-                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
-                            )
-
-                            if "q_a_proj" in name:
-                                param_name = name.replace(
-                                    "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                                )
-                            else:
-                                param_name = name.replace(
-                                    "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                                )
-                            param = params_dict[param_name]
-
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            weight_loader(param, fused_weight)
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
+                        if "q_a_proj" in name:
+                            param = params_dict[name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")]
+                            weight_loader = param.weight_loader
+                            begin_size = begin_size_mp["q_a_proj"]
+                        elif "kv_a_proj_with_mqa" in name:
+                            param = params_dict[name.replace("kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa")]
+                            weight_loader = param.weight_loader
+                            begin_size = begin_size_mp["kv_a_proj_with_mqa"]
+                        elif "indexer.wk" in name:
+                            param = params_dict[name.replace("indexer.wk", "fused_qkv_a_proj_with_mqa")]
+                            weight_loader = param.weight_loader
+                            begin_size = begin_size_mp["indexer_wk"]
+                        if 'scale_inv' in name:
+                            begin_size //= quant_block_size
+                        weight_loader(param, loaded_weight, begin_size=begin_size)
                     else:
                         param = params_dict[name]
                         weight_loader = getattr(

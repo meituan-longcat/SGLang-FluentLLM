@@ -22,17 +22,24 @@ from pydantic import BaseModel
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizationConfig,
+    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
-    CompressedTensorsW8A8Int8,
     CompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.gptq_marlin_moe import (
     is_activation_quantization_format,
 )
 from sglang.srt.layers.quantization.utils import find_matched_target
+from sglang.srt.layers.dense.layouts.unquant import UnquantizedLinearMethod
+from sglang.srt.utils import is_npu
+__is_npu__ = is_npu()
+if __is_npu__:
+    from sglang.srt.layers.quantization.npu_compressed_tensors.schemes import CompressedTensorsW8A8Int8
+else:
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import CompressedTensorsW8A8Int8
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +95,11 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or _packed_modules_mapping
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
-        return CompressedTensorsLinearMethod(self)
+        if __is_npu__:
+            from sglang.srt.layers.quantization.npu_compressed_tensors.compressed_tensors import NpuCompressedTensorsLinearMethod
+            return NpuCompressedTensorsLinearMethod(self)
+        else:
+            return CompressedTensorsLinearMethod(self)
 
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]
@@ -103,22 +114,32 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    # def get_quant_method(
-    #     self,
-    #     layer: torch.nn.Module,
-    #     prefix: str,
-    # ) -> Optional[QuantizeMethodBase]:
-    #     from sglang.srt.layers.linear import LinearBase
+    def get_quant_method(
+        self,
+        layer: torch.nn.Module,
+        prefix: str,
+    ) -> Optional[QuantizeMethodBase]:
+        from sglang.srt.layers.linear import LinearBase
 
-    #     if isinstance(layer, LinearBase):
-    #         if CompressedTensorsConfig.DeepSeekFP8Config is not None:
-    #             return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
-    #         scheme = self.get_scheme(layer=layer, layer_name=prefix)
-    #         if scheme is None:
-    #             return UnquantizedLinearMethod()
-    #         layer.scheme = scheme
-    #         return CompressedTensorsLinearMethod(self)
-    #     return None
+        if isinstance(layer, LinearBase):
+            if CompressedTensorsConfig.DeepSeekFP8Config is not None:
+                from sglang.srt.layers.dense.layouts.fp8 import Fp8LinearMethod
+                return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)
+            scheme = self.get_scheme(layer=layer, layer_name=prefix)
+            if scheme is None:
+                return UnquantizedLinearMethod()
+            layer.scheme = scheme
+            if __is_npu__:
+                from sglang.srt.layers.quantization.npu_compressed_tensors.compressed_tensors import NpuCompressedTensorsLinearMethod
+                return NpuCompressedTensorsLinearMethod(self)
+            else:
+                return CompressedTensorsLinearMethod(self)
+        if __is_npu__:
+            from sglang.srt.layers.moe.npu_moe.layer import NpuEPMoE
+            if isinstance(layer, NpuEPMoE):
+                from sglang.srt.layers.quantization.npu_compressed_tensors.compressed_tensors_moe import NpuCompressedTensorsMoEMethod
+                return NpuCompressedTensorsMoEMethod.get_moe_method(quant_config=layer.quant_config)
+        return None
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
@@ -216,6 +237,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        if __is_npu__:
+            return True
         capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
 
         if capability_tuple is not None:

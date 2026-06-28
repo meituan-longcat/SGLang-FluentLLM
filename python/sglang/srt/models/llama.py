@@ -16,7 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils import get_colorful_logger, device_synchronize
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -26,6 +26,7 @@ from transformers import LlamaConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    GroupCoordinator,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -40,8 +41,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
     get_attention_tp_size,
     get_attention_tp_rank,
+    get_dense_tp_group,
     get_dense_tp_size,
     get_dense_tp_rank,
 )
@@ -76,16 +79,13 @@ class LlamaMLP(nn.Module):
         super().__init__()
         self.layout = global_server_args_dict["dense_parallel_strategy"]
         if self.layout == DenseParallelStategy.TENSOR_PARALLEL:
-            tp_rank = get_dense_tp_rank()
-            tp_size = get_dense_tp_size()
             self.gate_up_proj = MergedColumnParallelLinear(
                 hidden_size,
                 [intermediate_size] * 2,
                 bias=False,
                 quant_config=quant_config,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
                 prefix=add_prefix("gate_up_proj", prefix),
+                outside_tp_group=get_dense_tp_group(),
             )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
@@ -93,9 +93,8 @@ class LlamaMLP(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 reduce_results=False,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
                 prefix=add_prefix("down_proj", prefix),
+                outside_tp_group=get_dense_tp_group(),
             )
         else:
             self.gate_up_proj = ReplicatedLinear(
@@ -143,12 +142,19 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         bias: bool = False,
+        outside_tp_group: Optional[GroupCoordinator] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.outside_tp_group = get_attention_tp_group()
+
+        if outside_tp_group is not None:
+            self.attn_tp_size = outside_tp_group.world_size
+            self.attn_tp_rank = outside_tp_group.rank_in_group
+            self.outside_tp_group = outside_tp_group
 
         self.total_num_heads = num_heads
         assert self.total_num_heads % self.attn_tp_size == 0
@@ -184,8 +190,7 @@ class LlamaAttention(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            outside_tp_group=self.outside_tp_group,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -194,8 +199,7 @@ class LlamaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            outside_tp_group=self.outside_tp_group,
         )
 
         self.rotary_emb = get_rope(
@@ -693,7 +697,7 @@ class LlamaForCausalLM(nn.Module):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -702,7 +706,7 @@ class LlamaForCausalLM(nn.Module):
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

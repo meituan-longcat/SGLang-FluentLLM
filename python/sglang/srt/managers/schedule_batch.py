@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,15 +38,17 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union, Dict
 
 import torch
 import triton
+import flash_npu_kernel
 import triton.language as tl
 
 from sglang.global_config import global_config
+# noinspection PyUnusedImports
+import sglang.srt.distributed  # 解决循环import
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.oe_utils import OverEmbeddingInfo
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -53,20 +57,21 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
 )
 from sglang.srt.mem_cache.allocator import KVAllocator
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode, PPProxyTensors
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils import get_colorful_logger, is_npu
 from sglang.srt.managers.req import Req
 
 
 if TYPE_CHECKING:
+    from sglang.srt.oe_utils import OverEmbeddingInfo
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput, EagleDraftOutput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 from sglang.srt.env import global_server_args_dict
 
+__is_npu__ = is_npu()
 logger = get_colorful_logger(__name__)
 
 bid = 0
@@ -147,7 +152,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None
+    spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput, EagleDraftOutput]] = None
     draft_token_num: Optional[int] = 0
     spec_num_steps: Optional[int] = 0
     # Reserve multiple positions for speculative decoding
@@ -167,6 +172,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    num_continous_decode_steps: int = 1
+    run_times: int = 0
+
+    pp_proxy_tensors: Optional[PPProxyTensors] = None
+
     @classmethod
     def init_new(
         cls,
@@ -182,6 +192,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reserve_num_tokens_init: int = 0,
         draft_token_num: int = 0,
         spec_num_steps: int = 0,
+        num_continous_decode_steps: int = 1
     ):
         return cls(
             reqs=reqs,
@@ -201,6 +212,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             reserve_num_tokens_init=reserve_num_tokens_init,
             draft_token_num=draft_token_num,
             spec_num_steps=spec_num_steps,
+            num_continous_decode_steps=num_continous_decode_steps
         )
 
     def batch_size(self):
@@ -256,31 +268,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         return out_cache_loc
 
-    def assign_req_to_token_pool_wrapper(self, bs, extend_lens, out_cache_loc):
-        if (
+    def assign_req_to_token_pool_wrapper(self, bs, extend_lens, out_cache_loc, req_pool_indices = None):
+        if req_pool_indices == None:
+            req_pool_indices = self.req_pool_indices
+        if (not __is_npu__) and (
             global_server_args_dict["attention_backend"] != "torch_native"
             and global_server_args_dict["attention_backend"] != "npu_mla"
         ) and global_server_args_dict["attention_backend"] != "torch_native_mla":
             assign_req_to_token_pool[(bs,)](
-                self.req_pool_indices,
+                req_pool_indices,
                 self.req_to_token_pool.req_to_token,
-                self.req_to_token_pool.alloced_lens[self.req_pool_indices],
-                self.req_to_token_pool.alloced_lens[self.req_pool_indices]
+                self.req_to_token_pool.alloced_lens[req_pool_indices],
+                self.req_to_token_pool.alloced_lens[req_pool_indices]
                 + extend_lens,
                 out_cache_loc,
                 self.req_to_token_pool.req_to_token.shape[1],
                 triton.next_power_of_2(bs),
             )
+        elif __is_npu__:
+            if False and isinstance(extend_lens, torch.Tensor):
+                torch.ops.flash.npu_assign_req_to_token_pool(req_pool_indices.to(torch.int32), extend_lens.to(torch.int32), self.req_to_token_pool.alloced_lens, out_cache_loc, self.req_to_token_pool.req_to_token, bs)
+            else:
+                pt = 0
+                for i in range(bs):
+                    pool_idx = req_pool_indices[i]
+                    alloced_len = self.req_to_token_pool.alloced_lens[pool_idx]
+                    extend_len = extend_lens[i] if isinstance(extend_lens, torch.Tensor) else extend_lens
+                    self.req_to_token_pool.req_to_token[(pool_idx, slice(alloced_len, alloced_len + extend_len))] = out_cache_loc[pt: pt + extend_len]
+                    pt += extend_len
         else:
             pt = 0
             for i in range(bs):
                 alloced_len = self.req_to_token_pool.alloced_lens[
-                    self.req_pool_indices[i]
+                    req_pool_indices[i]
                 ]
                 end_loc = alloced_len + extend_lens[i]
                 self.req_to_token_pool.write(
-                    (self.req_pool_indices[i], slice(alloced_len, end_loc)),
-                    out_cache_loc[pt : pt + extend_lens[i]],
+                    (req_pool_indices[i], slice(alloced_len, end_loc)),
+                    out_cache_loc[pt: pt + extend_lens[i]],
                 )
                 pt += extend_lens[i]
 
@@ -307,7 +332,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for req in reqs:
             if req.is_retracted:
-                assert req.req_pool_idx is None, "retracted req's req_pool_idx should be None!"
+                assert req.req_pool_idx is None, f"retracted req's req_pool_idx should be None! But got {req.req_pool_idx=}, rid={req.rid}"
 
         # Allocate memory
         no_chunk_bs = len([req for req in reqs if req.req_pool_idx is None])
@@ -476,6 +501,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_algorithm.is_eagle():
             # Pre-allocate a segment of positions for draft decode
             self.prealloc_for_draft_decode()
+        elif self.num_continous_decode_steps > 1:
+            self.prealloc_for_multi_step_decode()
 
         # Build sampling info
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -661,7 +688,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         # Happens in get_next_batch_to_run, overlapped with model forward, one extra token of KV cache is allocated below
         self.forward_mode = ForwardMode.DECODE
-        if self.sampling_info.penalizer_orchestrator.is_required:
+        if self.sampling_info.penalizer_orchestrator.is_required and self.spec_algorithm is None:
+            # TODO: refactor this
             if self.enable_overlap:
                 # TODO: this can be slow, optimize this.
                 delayed_output_ids = torch.tensor(
@@ -683,7 +711,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     self.output_ids.to(torch.int64)
                 )
-
         self.input_ids = self.output_ids
         self.input_multi_ids = self.output_multi_ids
         self.output_ids = None
@@ -697,12 +724,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_alloced_tokens_list = []
         for i, req in enumerate(self.reqs):
             if self.spec_algorithm.is_none():
-                out_cache_loc_list.append(self.alloc_token_slots(req.req_pool_idx, 1))
-                num_alloced_tokens_list.append(1)
+                out_cache_loc_list.append(self.alloc_token_slots(req.req_pool_idx, self.num_continous_decode_steps))
+                num_alloced_tokens_list.append(self.num_continous_decode_steps)
             else:
                 # For PD warmup
                 if req.reserve_num_tokens == 0:
                     req.reserve_num_tokens = self.draft_token_num
+                # Over-allocation for now
+                if self.num_continous_decode_steps > 1:
+                    req.reserve_num_tokens = self.num_continous_decode_steps * self.draft_token_num
                 if (
                     self.req_to_token_pool.alloced_lens[req.req_pool_idx].item()
                     > self.model_config.context_len + self.draft_token_num
@@ -730,6 +760,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.assign_req_to_token_pool_wrapper(
             bs, num_alloced_tokens_device, out_cache_loc
         )
+
         self.req_to_token_pool.alloced_lens[
             self.req_pool_indices
         ] += num_alloced_tokens_device
@@ -750,7 +781,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Then, each time adjust the reserved space based on acceptance length to prevent allocation divergence causing insufficient space.
             # The reserved space for draft decode will always be overwritten by valid tokens in the next verify.
             # Initially allocate spec_num_steps, subsequent allocations are not needed.
-            num_tokens_pre_alloc = self.draft_token_num + (self.spec_num_steps - 1)
+            num_tokens_pre_alloc = self.draft_token_num * self.num_continous_decode_steps + (self.spec_num_steps - 1)
         else:
             # Synchronously, each allocation is for the current batch's launch. Here we allocate spec_num_steps
             # extra slots to reserve enough space for draft decode.
@@ -778,16 +809,51 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         start_offsets = self.req_to_token_pool.alloced_lens[req_indices]
         end_offsets = start_offsets + num_tokens_pre_alloc
-        assign_req_to_token_pool[(bs,)](
-            req_indices,
-            self.req_to_token_pool.req_to_token,
-            start_offsets,
-            end_offsets,
-            out_cache_loc,
-            self.req_to_token_pool.req_to_token.shape[1],
-            triton.next_power_of_2(bs),
-        )
+        if __is_npu__:
+            self.assign_req_to_token_pool_wrapper(bs, num_tokens_pre_alloc, out_cache_loc, req_pool_indices=req_indices)
+        else:
+            assign_req_to_token_pool[(bs,)](
+                req_indices,
+                self.req_to_token_pool.req_to_token,
+                start_offsets,
+                end_offsets,
+                out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+                triton.next_power_of_2(bs),
+            )
         self.req_to_token_pool.alloced_lens[req_indices] += num_tokens_pre_alloc
+
+    def prealloc_for_multi_step_decode(self):
+        out_cache_loc_list = []
+        bs = len(self.reqs)
+        req_indices = []
+        for i, req in enumerate(self.reqs):
+            out_cache_loc_list.append(
+                self.alloc_token_slots(req.req_pool_idx, self.num_continous_decode_steps)
+            )
+            req_indices.append(req.req_pool_idx)
+        if len(out_cache_loc_list) == 0:
+            return
+        out_cache_loc = torch.concat(out_cache_loc_list)
+        out_cache_loc = out_cache_loc.to(self.device, non_blocking=True)
+        req_indices = torch.tensor(req_indices, dtype=torch.int32).to(self.device, non_blocking=True)
+        start_offsets = self.req_to_token_pool.alloced_lens[req_indices]
+        end_offsets = start_offsets + self.num_continous_decode_steps
+        if __is_npu__:
+            self.assign_req_to_token_pool_wrapper(bs, self.num_continous_decode_steps, out_cache_loc, req_pool_indices=req_indices)
+        else:
+            assign_req_to_token_pool[(bs,)](
+                req_indices,
+                self.req_to_token_pool.req_to_token,
+                start_offsets,
+                end_offsets,
+                out_cache_loc,
+                self.req_to_token_pool.req_to_token.shape[1],
+                triton.next_power_of_2(bs),
+            )
+        self.req_to_token_pool.alloced_lens[req_indices] += (
+            self.num_continous_decode_steps
+        )
 
     def filter_batch(
         self,
@@ -948,6 +1014,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             disagg_set_aux_fn=self.disagg_set_aux_fn,
             input_multi_ids=self.input_multi_ids,
             reqs=self.reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            pp_proxy_tensors=self.pp_proxy_tensors,
         )
 
     def set_new_tokens_info(self):
@@ -988,10 +1056,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.new_tokens_total = 0
 
-    def copy(self):
+    def copy(self, run_times=0):
         # Only contain fields that will be used by process_batch_result
+        reqs = [req for req in self.reqs]
         return ScheduleBatch(
-            reqs=self.reqs,
+            reqs=reqs,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             return_logprob=self.return_logprob,
@@ -999,6 +1068,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
             enable_custom_logit_processor=self.enable_custom_logit_processor,
             draft_token_num=self.draft_token_num,
+            run_times=run_times
         )
 
     def __str__(self):
@@ -1059,7 +1129,7 @@ class ModelWorkerBatch:
     oe_token_table: Optional[torch.Tensor] = None
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput, EagleDraftOutput]] = None
     # If set, the output of the batch contains the hidden states of the run.
     capture_hidden_mode: CaptureHiddenMode = None
 
@@ -1079,8 +1149,117 @@ class ModelWorkerBatch:
 
     reqs: List[Req] = None
 
+    req_to_token_pool: ReqToTokenPool=None
+
+    pp_proxy_tensors: Optional[PPProxyTensors]=None
+
     def __str__(self):
         return f"bid={self.bid} mode={self.forward_mode.name}"
+
+
+@dataclasses.dataclass
+class FutureIndices:
+    indices: torch.Tensor
+    interval: Optional[slice] = None
+
+@dataclasses.dataclass
+class GenerationBatchResult:
+    logits_output: Union[LogitsProcessorOutput, PPProxyTensors] = None
+    next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+    extend_input_len_per_req: Optional[List[int]] = None
+    extend_logprob_start_len_per_req: Optional[List[int]] = None
+    bid: int=-1
+    accept_lengths_cpu: List[int] = None
+    next_token_multi_ids: Optional[List[int]] = None
+
+    pp_hidden_states_proxy_tensors: Optional[PPProxyTensors]=None
+    num_accepted_tokens: int=0
+    accept_length_per_req_cpu: Optional[List[int]]=None
+
+    # For overlap scheduling
+    copy_done: Optional[torch.cuda.Event]=None
+    delay_sample_func: Optional[callable]=None
+    future_indices: Optional[FutureIndices]=None
+
+    # FIXME(lsyin): maybe move to a better place?
+    # sync path: forward stream -> output processor
+    accept_lens: Optional[torch.Tensor]=None
+
+    # relay path: forward stream -> next step forward
+    next_draft_input: Optional[EagleDraftInput]=None
+
+    # metrics
+    # expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+
+    def copy_to_cpu(self, return_logprob: bool):
+        """Copy tensors to CPU in overlap scheduling.
+        Only the tensors which are needed for processing results are copied,
+        e.g., next_token_ids, logits outputs
+        """
+        if return_logprob:
+            if self.logits_output.next_token_logprobs is not None:
+                self.logits_output.next_token_logprobs=(
+                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                )
+            if self.logits_output.input_token_logprobs is not None:
+                self.logits_output.input_token_logprobs=(
+                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                )
+        if self.logits_output.hidden_states is not None:
+            self.logits_output.hidden_states=self.logits_output.hidden_states.to(
+                "cpu", non_blocking=True
+            )
+        self.next_token_ids=self.next_token_ids.to("cpu", non_blocking=True)
+
+        if self.accept_lens is not None:
+            self.accept_lens=self.accept_lens.to("cpu", non_blocking=True)
+
+        if (x:=self.expert_distribution_metrics) is not None:
+            x.copy_to_cpu()
+
+        self.copy_done.record()
+
+    @classmethod
+    def from_pp_proxy(
+        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
+    ):
+        # TODO(lsyin): refactor PP and avoid using dict
+        proxy_dict=next_pp_outputs.tensors
+        return cls(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=next_pp_outputs["next_token_ids"],
+            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
+            extend_logprob_start_len_per_req=proxy_dict.get(
+                "extend_logprob_start_len_per_req", None
+            ),
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def get_logprob_dict_from_result(self) -> dict:
+        logits_output=self.logits_output
+        assert logits_output is not None
+
+        return {
+            "extend_input_len_per_req": self.extend_input_len_per_req,
+            "extend_logprob_start_len_per_req": self.extend_logprob_start_len_per_req,
+            "next_token_logprobs": self.logits_output.next_token_logprobs,
+            "next_token_top_logprobs_val": self.logits_output.next_token_top_logprobs_val,
+            "next_token_top_logprobs_idx": self.logits_output.next_token_top_logprobs_idx,
+            "next_token_token_ids_logprobs_val": self.logits_output.next_token_token_ids_logprobs_val,
+            "next_token_token_ids_logprobs_idx": self.logits_output.next_token_token_ids_logprobs_idx,
+            "input_token_logprobs": self.logits_output.input_token_logprobs,
+            "input_top_logprobs_val": self.logits_output.input_top_logprobs_val,
+            "input_top_logprobs_idx": self.logits_output.input_top_logprobs_idx,
+            "input_token_ids_logprobs_val": self.logits_output.input_token_ids_logprobs_val,
+            "input_token_ids_logprobs_idx": self.logits_output.input_token_ids_logprobs_idx,
+        }
+
+
+@dataclasses.dataclass
+class EmbeddingBatchResult:
+    embeddings: Union[torch.Tensor, Dict[str, torch.Tensor]]
+    bid: int
 
 
 @triton.jit

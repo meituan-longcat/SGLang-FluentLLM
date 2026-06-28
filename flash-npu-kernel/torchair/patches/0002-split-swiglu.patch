@@ -1,0 +1,181 @@
+From b0fe5aaf67289cb0c0f6d38401e81a92492b175f Mon Sep 17 00:00:00 2001
+From: Chl_SolaAir <Chl_SolaAir@noreply.gitcode.com>
+Date: Mon, 26 Jan 2026 15:47:12 +0800
+Subject: [PATCH 2/4] split swiglu
+
+---
+ .../auto_generated_ge_raw_ops.py              | 74 +++++++++++++++----
+ .../ge_converter/custom/mlp_split_swiglu.py   |  9 +++
+ 2 files changed, 67 insertions(+), 16 deletions(-)
+ create mode 100644 python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_split_swiglu.py
+
+diff --git a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+index 59b8039a..7ba02da4 100644
+--- a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
++++ b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+@@ -90,6 +90,48 @@ def MlpComputeNGramIds(oe_weights: Tensor, oe_mods: Tensor, over_embedding_input
+         .output("oe_n_gram_ids" , "")
+     )
+ 
++# This api is auto-generated from IR MlpSplitSwiglu
++@auto_convert_to_tensor([False, False], [False, False], inputs_tensor_type=[TensorType.TT_ALL, TensorType.TT_ALL])
++def MlpSplitSwiglu(x: Tensor, group_list: Tensor, *, local_expert_start: int, local_expert_end: int, dependencies=[], node_name=None):
++    """REG_OP(MlpSplitSwiglu)\n
++.INPUT(x, ge::TensorType::ALL())\n
++.INPUT(group_list, ge::TensorType::ALL())\n
++.OUTPUT(out, ge::TensorType::ALL())\n
++.REQUIRED_ATTR(local_expert_start, Int)\n
++.REQUIRED_ATTR(local_expert_end, Int)\n
++"""
++
++    # process inputs
++    inputs = {
++        "x": x,
++        "group_list": group_list,
++    }
++
++    # process attrs
++    attrs = {
++        "local_expert_start": attr.Int(local_expert_start),
++        "local_expert_end": attr.Int(local_expert_end),
++    }
++
++    # process outputs
++    outputs = [
++    "out",
++    ]
++
++    return ge_op(
++        op_type="MlpSplitSwiglu",
++        inputs=inputs,
++        attrs=attrs,
++        outputs=outputs,
++        dependencies=dependencies,
++        ir=IrDef("MlpSplitSwiglu") \
++        .input("x", "") \
++        .input("group_list", "") \
++        .required_attr("local_expert_start", attr.Int) \
++        .required_attr("local_expert_end", attr.Int) \
++        .output("out" , "")
++    )
++
+ # This api is auto-generated from IR Aipp
+ @auto_convert_to_tensor([False, False], [False, True])
+ def Aipp(images: Tensor, params: Optional[Tensor], *, aipp_config_path: str="./aipp.cfg", dependencies=[], node_name=None):
+@@ -80182,7 +80224,7 @@ def MoeDistributeDispatch(x: Tensor, expert_ids: Tensor, scales: Optional[Tensor
+ # This api is auto-generated from IR MoeDistributeDispatchV2
+ @auto_convert_to_tensor([False, False, False, False, False, False, False], [False, False, True, True, True, True, True])
+ def MoeDistributeDispatchV2(x: Tensor, expert_ids: Tensor, scales: Optional[Tensor], x_active_mask: Optional[Tensor], 
+-                            expert_scales: Optional[Tensor], elastic_info: Optional[Tensor], performance_info: Optional[Tensor], *, group_ep: str, ep_world_size: int, ep_rank_id: int, 
++                            expert_scales: Optional[Tensor], elastic_info: Optional[Tensor], performance_info: Optional[Tensor], *, group_ep: str, ep_world_size: int, ep_rank_id: int,
+                             moe_expert_num: int, group_tp: str = "", tp_world_size: int = 0, tp_rank_id: int = 0, 
+                             expert_shard_type: int = 0, shared_expert_num: int = 1, shared_expert_rank_num: int = 0, 
+                             quant_mode: int = 0, global_bs: int = 0, expert_token_nums_type: int = 1, 
+@@ -80268,7 +80310,7 @@ def MoeDistributeDispatchV2(x: Tensor, expert_ids: Tensor, scales: Optional[Tens
+         op.input.append(elastic_info.tensor)
+         op.input_desc.add().CopyFrom(elastic_info.desc)
+         op.input_desc[-1].name = "elastic_info"
+-        
++
+     if performance_info is not None:
+         op.input.append(performance_info.tensor)
+         op.input_desc.add().CopyFrom(performance_info.desc)
+@@ -80724,7 +80766,7 @@ def KvRmsNormRopeCache(kv: Tensor,
+         op.input.append('')
+         op.input_desc.add().CopyFrom(get_invalid_desc())
+         op.input_desc[-1].name = "v"
+-        
++
+     # process attrs
+     op.attr["epsilon"].f = epsilon
+     op.attr["cache_mode"].s = compat_as_bytes(cache_mode)
+@@ -80881,13 +80923,13 @@ def DequantSwigluQuant(x: Tensor,
+ @auto_convert_to_tensor([False, False], [False, True])
+ def ClippedSwiglu(x: Tensor,
+                 group_index: Optional[Tensor],
+-                *, 
+-                dim: int = -1, 
+-                alpha: float = 1.702, 
+-                limit: float = 7.0, 
+-                bias: float = 1.0, 
+-                interleaved: bool = True, 
+-                dependencies=[], 
++                *,
++                dim: int = -1,
++                alpha: float = 1.702,
++                limit: float = 7.0,
++                bias: float = 1.0,
++                interleaved: bool = True,
++                dependencies=[],
+                 node_name=None):
+     """REG_OP(ClippedSwiglu)\n
+     .INPUT(x, TensorType({DT_BF16, DT_FLOAT16, DT_FLOAT}))\n
+@@ -81449,7 +81491,7 @@ def RecurrentGatedDeltaRule(
+     .DATATYPE(T3, TensorType({DT_FLOAT}))\n
+     .OP_END_FACTORY_REG(RecurrentGatedDeltaRule)
+     """
+-    
++
+     op = get_default_ge_graph().op.add()
+     op.type = "RecurrentGatedDeltaRule"
+     op.name = next_unique_name(node_name, "RecurrentGatedDeltaRule")
+@@ -81496,7 +81538,7 @@ def RecurrentGatedDeltaRule(
+ 
+ 
+ # This api is auto-generated from IR GroupedMatmulSwigluQuant
+-@auto_convert_to_tensor([False, False, False, True, True, True, False, False], 
++@auto_convert_to_tensor([False, False, False, True, True, True, False, False],
+                         [False, False, False, False, False, False, True, True])
+ def GroupedMatmulSwigluQuantV2(x: Tensor,
+                                x_scale: Tensor,
+@@ -81519,11 +81561,11 @@ def GroupedMatmulSwigluQuantV2(x: Tensor,
+     """REG_OP(GroupedMatmulSwigluQuantV2)\n
+     .INPUT(x, TensorType({DT_INT8}))\n
+     .INPUT(x_scale, TensorType({DT_FLOAT}))\n
+-    .INPUT(group_list, TensorType({DT_INT64}))\n    
++    .INPUT(group_list, TensorType({DT_INT64}))\n
+     .DYNAMIC_INPUT(weight, TensorType({DT_INT8}))\n
+     .DYNAMIC_INPUT(weight_scale, TensorType({DT_FLOAT}))\n
+     .DYNAMIC_INPUT(weight_assist_matrix, TensorType({DT_FLOAT}))\n
+-    .OPTIONAL_INPUT(bias, TensorType({DT_INT8}))\n      
++    .OPTIONAL_INPUT(bias, TensorType({DT_INT8}))\n
+     .DYNAMIC_INPUT(smooth_scale, TensorType({DT_FLOAT}))\n
+     .ATTR(dequant_mode, Int, 0)\n
+     .ATTR(dequant_dtype, Int, 0)\n
+@@ -81590,7 +81632,7 @@ def GroupedMatmulSwigluQuantV2(x: Tensor,
+ 
+ 
+ # This api is auto-generated from IR AddRmsNormDynamicQuant
+-@auto_convert_to_tensor([False, False, False, False, False, False], 
++@auto_convert_to_tensor([False, False, False, False, False, False],
+                         [False, False, False, True, True, True])
+ def AddRmsNormDynamicQuant(x1: Tensor,
+                            x2: Tensor,
+@@ -81668,7 +81710,7 @@ def AddRmsNormDynamicQuant(x1: Tensor,
+ 
+ 
+ # This api is auto-generated from IR AddRmsNormCast
+-@auto_convert_to_tensor([False, False, False], 
++@auto_convert_to_tensor([False, False, False],
+                         [False, False, False])
+ def AddRmsNormCast(x1: Tensor,
+                    x2: Tensor,
+diff --git a/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_split_swiglu.py b/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_split_swiglu.py
+new file mode 100644
+index 00000000..f0216be5
+--- /dev/null
++++ b/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_split_swiglu.py
+@@ -0,0 +1,9 @@
++from torchair._ge_concrete_graph.ge_converter.converter_utils import *
++
++# local_exp_start, int local_exp_end
++@register_fx_node_ge_converter(torch.ops.npu.mlp_split_swiglu.default)
++def convert_mlp_split_swiglu(
++    x: Tensor, group_list: Tensor, *, local_exp_start: int=0, local_exp_end: int=-1, meta_outputs: TensorSpec = None 
++): 
++    group_list  = ge.Cast(group_list, dst_type=DataType.DT_INT32)
++    return ge.MlpSplitSwiglu(x, group_list, local_expert_start = local_exp_start, local_expert_end = local_exp_end)
+\ No newline at end of file
+-- 
+2.39.5 (Apple Git-154)
+

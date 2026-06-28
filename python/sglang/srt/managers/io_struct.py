@@ -178,6 +178,11 @@ class GenerateReqInput:
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
             self.parallel_sample_num = self.sampling_params[0].get("n", 1)
+
+        if self.parallel_sample_num > 1:
+            raise ValueError(
+                "n > 1 is not supported currently. Please set n=1 or omit this parameter."
+            )
             assert all(
                 self.parallel_sample_num == sampling_params.get("n", 1)
                 for sampling_params in self.sampling_params
@@ -621,10 +626,22 @@ class UpdateWeightsFromDistributedReqOutput:
 
 
 @dataclass
-class UpdateWeightsFromTensorReqInput:
-    serialized_named_tensors: bytes  # indeed Dict[str, torch.Tensor]
-    load_format: Optional[str]
-    flush_cache: bool
+class UpdateWeightsFromTensorReqInput(BaseReq):
+    """Update model weights from tensor input.
+
+    - Tensors are serialized for transmission
+    - Data is structured in JSON for easy transmission over HTTP
+    """
+
+    serialized_named_tensors: List[Union[str, bytes]] = field(default_factory=list)
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
 
 
 @dataclass
@@ -667,8 +684,10 @@ class GetWeightsByNameReqOutput:
 
 
 @dataclass
-class ReleaseMemoryOccupationReqInput:
-    pass
+class ReleaseMemoryOccupationReqInput(BaseReq):
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -677,8 +696,10 @@ class ReleaseMemoryOccupationReqOutput:
 
 
 @dataclass
-class ResumeMemoryOccupationReqInput:
-    pass
+class ResumeMemoryOccupationReqInput(BaseReq):
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
 
 
 @dataclass
@@ -690,6 +711,7 @@ class ResumeMemoryOccupationReqOutput:
 class AbortReq:
     # The request id
     rid: str
+    abort_all: bool = False
 
 
 @dataclass

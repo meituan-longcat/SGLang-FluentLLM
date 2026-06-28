@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from typing import Optional, Union, List, Tuple, TYPE_CHECKING
-  
+
 from sglang.srt.env import global_server_args_dict
 from sglang.srt.utils import get_colorful_logger
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -288,6 +288,7 @@ class SchedulerPostProcessMixin:
             for req in batch.reqs:
                 req.spec_verify_ct += 1
 
+        run_times = batch.run_times
         if self.enable_overlap:
             # Here CPU wait for GPU
             # Then do GPU -> CPU
@@ -299,6 +300,7 @@ class SchedulerPostProcessMixin:
                     _,
                     _,
                 ) = self.draft_worker.resolve_batch_result(bid)
+
                 accept_lengths_cpu = accept_lengths.tolist()
                 num_accepted_tokens = sum(accept_lengths_cpu)
                 self.spec_num_total_accepted_tokens += num_accepted_tokens
@@ -327,17 +329,28 @@ class SchedulerPostProcessMixin:
         pt = 0
         for i, req in enumerate(batch.reqs):
             if req.is_retracted:
-                # During overlap scheduling, retracted requests may enter post-processing
-                # while the previously launched batch no longer has this request.
-                # Release req_pool resources here.
-                assert (
-                    req.req_pool_idx is not None
-                    and req.req_pool_idx not in self.req_to_token_pool.free_slots
-                ), f"{req.req_pool_idx=} {self.req_to_token_pool.free_slots=}"
-                logger.info(f"Release Retracted req {req.req_pool_idx}")
-                self.req_to_token_pool.free(req.req_pool_idx)
-                req.req_pool_idx = None
-                continue
+                if self.server_args.num_continuous_decode_steps == 1:
+                    # During overlap scheduling, retracted requests may enter post-processing
+                    # while the previously launched batch no longer has this request.
+                    # Release req_pool resources here.
+                    assert (
+                        req.req_pool_idx is not None
+                        and req.req_pool_idx not in self.req_to_token_pool.free_slots
+                    ), f"{req.req_pool_idx=} {self.req_to_token_pool.free_slots=}"
+                    logger.info(f"Release Retracted req {req.req_pool_idx}")
+                    self.req_to_token_pool.free(req.req_pool_idx)
+                    req.req_pool_idx = None
+                    continue
+                else:
+                    if run_times == self.server_args.num_continuous_decode_steps - 1:
+                        assert (
+                            req.req_pool_idx is not None
+                            and req.req_pool_idx not in self.req_to_token_pool.free_slots
+                        ), f"{req.req_pool_idx=} {self.req_to_token_pool.free_slots=}"
+                        logger.info(f"Release Retracted req {req.req_pool_idx}")
+                        self.req_to_token_pool.free(req.req_pool_idx)
+                        req.req_pool_idx = None
+                    continue
 
             # For cases without speculative inference, accept_lengths_cpu is 1
             ids = next_token_ids[pt : pt + accept_lengths_cpu[i]]
@@ -348,8 +361,17 @@ class SchedulerPostProcessMixin:
             if self.enable_overlap and req.finished():
                 if req.spec_verify_ct > 0 and not self.spec_algorithm.is_none():
                     req.accept_draft_tokens = (len(req.output_ids)-1) / req.spec_verify_ct
-                # This indicates a delayed token, actually release its resources here
-                self.tree_cache.cache_finished_req(req)
+                if self.server_args.num_continuous_decode_steps == 1:
+                    # This indicates a delayed token, actually release its resources here
+                    self.tree_cache.cache_finished_req(req)
+                elif(
+                    run_times == self.server_args.num_continuous_decode_steps - 1
+                    and
+                    (self.cur_batch is None or req not in self.cur_batch.reqs)
+                    and
+                    req.finished()
+                ):
+                    self.tree_cache.cache_finished_req(req)
                 continue
 
             for token_idx, next_token_id in enumerate(ids):
@@ -391,10 +413,20 @@ class SchedulerPostProcessMixin:
                         req.accept_draft_tokens = (len(req.output_ids)-1) / req.spec_verify_ct
                     if not self.enable_overlap:
                         self.tree_cache.cache_finished_req(req)
-                    elif self.cur_batch is not None and self.cur_batch.forward_mode == ForwardMode.EXTEND:
-                        # In this case, since a new Prefill batch was launched before, finished requests are directly
-                        # filtered without delayed tokens. So cache and release related resources here.
-                        self.tree_cache.cache_finished_req(req)
+                    elif self.server_args.num_continuous_decode_steps == 1:
+                        if self.cur_batch is not None and self.cur_batch.forward_mode == ForwardMode.EXTEND:
+                            # In this case, since a new Prefill batch was launched before, finished requests are directly
+                            # filtered without delayed tokens. So cache and release related resources here.
+                            self.tree_cache.cache_finished_req(req)
+                    else:
+                        if (
+                            run_times == self.server_args.num_continuous_decode_steps - 1
+                            and
+                            (self.cur_batch is None or req not in self.cur_batch.reqs)
+                            and
+                            req.finished()
+                        ):
+                            self.tree_cache.cache_finished_req(req)
                     # Do not process tokens after EOS or reaching max length
                     break
 
@@ -505,6 +537,9 @@ class SchedulerPostProcessMixin:
                             if not self.model_config.is_multimodal_gen
                             else False
                         )
+                if len(req.output_ids[req.send_token_offset:]) == 0 and \
+                        (req.finished_reason is None or not isinstance(req.finished_reason, FINISH_ABORT)):
+                    should_output = False # skip empty output_ids
 
                 if should_output:
                     send_token_offset = req.send_token_offset

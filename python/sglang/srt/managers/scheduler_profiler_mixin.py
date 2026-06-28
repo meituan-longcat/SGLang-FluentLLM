@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_npu, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ class SchedulerProfilerMixin:
 
     def init_profier(self):
         self.torch_profiler = None
+        self.torch_npu_profiler = None
         self.torch_profiler_output_dir: Optional[str] = None
         self.profiler_activities: Optional[List[str]] = None
         self.profile_id: Optional[str] = None
@@ -29,6 +31,7 @@ class SchedulerProfilerMixin:
         self.profile_steps: Optional[int] = None
         self.profile_in_progress: bool = False
         self.rpd_profiler = None
+        self.npu_start_profile = False
 
     def init_profile(
         self,
@@ -50,7 +53,7 @@ class SchedulerProfilerMixin:
         self.profile_by_stage = profile_by_stage
 
         if output_dir is None:
-            output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+            output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/workdir/prof")
         if activities is None:
             activities = ["CPU", "GPU"]
 
@@ -59,7 +62,7 @@ class SchedulerProfilerMixin:
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
         self.profile_id = profile_id
-
+        
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
 
@@ -100,7 +103,7 @@ class SchedulerProfilerMixin:
         }
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
-        ]
+        ] if not is_npu() else None
 
         if "RPD" in activities:
             from rpdTracerControl import rpdTracerControl
@@ -131,13 +134,50 @@ class SchedulerProfilerMixin:
             self.rpd_profiler.start()
             self.rpd_profiler.rangePush("", "rpd profile range", "")
             self.profile_in_progress = True
-        elif torchprof_activities:
+        elif torchprof_activities is not None:
+            assert is_cuda(), "Profiling on GPU."
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
             )
             self.torch_profiler.start()
+            self.profile_in_progress = True
+        else:
+            assert is_npu(), "Profiling on NPU."
+            logger.info("NPU Profiling is activated.")
+            import torch_npu
+
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                l2_cache=False,
+                data_simplification=False,
+            )
+            self.torch_npu_profiler = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                ],
+                with_stack=False,  # 是否记录调用栈
+                record_shapes=True,  # 是否记录运算符的形状
+                profile_memory=False,  # 是否对显存进行 profile
+                experimental_config=experimental_config,
+                schedule=torch_npu.profiler.schedule(
+                    wait=0,  # 需要跳过的 steps
+                    warmup=0,  # wait 之后用几个 step 来 warmup
+                    active=1, # 对 warmup 之后的几个 step 进行 profile
+                    repeat=1,  # 以上过程重复几遍
+                ),
+                # 保存 profile log 的地址，想用 tb 看这里必须是 tensorboard_trace_handler
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    self.torch_profiler_output_dir # 统一存储路径
+                ),
+            )
+            self.torch_npu_profiler.prof_if.prof_if = self.torch_npu_profiler.prof_if
+            # Recording
+            self.torch_npu_profiler.start()
+            
             self.profile_in_progress = True
 
         if "MEM" in activities:
@@ -177,6 +217,23 @@ class SchedulerProfilerMixin:
             )
             torch.distributed.barrier(self.tp_cpu_group)
 
+        if self.torch_npu_profiler is not None:
+            torch.npu.synchronize()
+
+            try:
+                logger.info("Triggering flush (step)...")
+                # Flush
+                self.torch_npu_profiler.step()
+            except Exception as e:
+                logger.warning(f"Profiler step failed (possibly already stopped): {e}")
+
+            time.sleep(5)
+
+            try:
+                self.torch_npu_profiler.stop()
+            except Exception as e:
+                logger.info(f"Profiler stop called (final cleanup): {e}")
+
         if self.rpd_profiler is not None:
             self.rpd_profiler.rangePop()
             self.rpd_profiler.stop()
@@ -209,6 +266,7 @@ class SchedulerProfilerMixin:
             self.torch_profiler_output_dir,
         )
         self.torch_profiler = None
+        self.torch_npu_profiler = None
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 

@@ -24,7 +24,6 @@ from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)
 
@@ -283,6 +282,7 @@ class Qwen3NextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self):
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
         world_size = get_attention_tp_size()
         conv_dim = (
             self.linear_key_head_dim * self.linear_num_key_heads * 2

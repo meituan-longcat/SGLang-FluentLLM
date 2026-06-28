@@ -19,8 +19,7 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.layers.over_embedding import FusedOverEmbedding
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, bind_or_assign
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -40,10 +39,12 @@ from sglang.srt.env import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2AttentionMLA, DeepseekV3ForCausalLM, DecoderCommMananger
+from sglang.srt.models.deepseek_v32 import DeepseekV32MLA
 from sglang.srt.models.longcat_flash import FLASHDecoderLayer as FlASHScmoeDecoderLayer
 from sglang.srt.utils import is_hip
 from sglang.srt.layers.dense.gemms.fp8.fp8_utils import block_dequant
 from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
+from sglang.srt.configs.model_config import is_dsa
 
 is_hip_ = is_hip()
 
@@ -71,7 +72,9 @@ class FlASHDenseDecoderLayer(nn.Module):
             self.tp_size = get_tensor_model_parallel_world_size()
             self.tp_group = get_tp_group()
 
-        self.self_attn = DeepseekV2AttentionMLA(
+        AttnImpl = DeepseekV32MLA if is_dsa(config) else DeepseekV2AttentionMLA
+
+        self.self_attn = AttnImpl(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -196,16 +199,9 @@ class FLASHModelNextN(nn.Module):
         super().__init__()
         self.nextn_use_scmoe = config.nextn_use_scmoe
         self.vocab_size = config.vocab_size
-        if config.use_over_embedding:
+        if global_server_args_dict["draft_use_oe"]:
             self.use_over_embedding = True
-            self.embed_tokens = FusedOverEmbedding(
-                num_embeddings=config.vocab_size,
-                embedding_dim=config.hidden_size,
-                over_embedding_m=config.over_embedding_m,
-                over_embedding_k=config.oe_split_num,
-                over_embedding_n=config.oe_neighbor_num,
-                oe_ignore_tokens=config.oe_ignore_tokens
-            )
+            self.embed_tokens=None
         else:
             self.use_over_embedding = False
             self.embed_tokens = VocabParallelEmbedding(
@@ -224,15 +220,19 @@ class FLASHModelNextN(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("eh_proj", "")
         )
+        self.alt_stream = torch.cuda.Stream()
         if self.nextn_use_scmoe:
-            self.alt_stream = torch.cuda.Stream()
             self.decoder = FlASHScmoeDecoderLayer(config, 0, quant_config=quant_config, alt_stream=self.alt_stream)
         else:
-            self.decoder = FlASHDenseDecoderLayer(
-                config, 0, quant_config=quant_config, is_nextn=True
+            self.decoder=FlASHDenseDecoderLayer(
+                config, 0, quant_config=quant_config, is_nextn=True, alt_stream=self.alt_stream
             )
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if getattr(config, 'use_over_embedding', False):
+            self.enable_over_embedding = config.use_over_embedding
+        else:
+            self.enable_over_embedding = False
 
     def forward(
         self,
@@ -243,37 +243,39 @@ class FLASHModelNextN(nn.Module):
     ) -> torch.Tensor:
         if input_embeds is None:
             if self.use_over_embedding:
-                # if get_tensor_model_parallel_rank() == 0:
-                #     print(f'for debug | nextn forward | {input_ids=} | {forward_batch.oe_info.over_embedding_input_ids=} | {forward_batch.oe_info.oe_exclusive_oe_info_len_sums=}')
-                hidden_states = self.embed_tokens(input_ids, forward_batch, True)
+                hidden_states=self.embed_tokens(input_ids, forward_batch, is_draft=True)
             else:
-                hidden_states = self.embed_tokens(input_ids)
+                hidden_states=self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
 
-        hidden_states, _ = self.eh_proj(
-            torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(forward_batch.spec_info.hidden_states),
-                ),
-                dim=-1,
+        if hidden_states.shape[0] > 0:
+            hidden_states, _ = self.eh_proj(
+                torch.cat(
+                    (
+                        self.enorm(hidden_states),
+                        self.hnorm(forward_batch.spec_info.hidden_states),
+                    ),
+                    dim=-1,
+                )
             )
-        )
 
-        residual = None
-        tp_num_tokens = hidden_states.shape[0]
-        forward_batch.tp_num_tokens = tp_num_tokens
-        hidden_states, residual = self.decoder(
+        residual=None
+        tp_num_tokens=hidden_states.shape[0]
+        forward_batch.tp_num_tokens=tp_num_tokens
+        hidden_states, residual=self.decoder(
             positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens
         )
 
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _ = self.final_layernorm(hidden_states, residual)
+            hidden_states, _=self.final_layernorm(hidden_states, residual)
             if self.nextn_use_scmoe:
-                hidden_states, _ = self.decoder.mlp_branch_decoder_comm_manager[1].post_final_norm_comm(hidden_states, residual, tp_num_tokens)
+                hidden_states, _=self.decoder.mlp_branch_decoder_comm_manager[1].post_final_norm_comm(hidden_states,
+                                                                                                      residual,
+                                                                                                      tp_num_tokens)
             else:
-                hidden_states, _ = self.decoder.decoder_comm_manager.post_final_norm_comm(hidden_states, residual, tp_num_tokens)
+                hidden_states, _=self.decoder.decoder_comm_manager.post_final_norm_comm(hidden_states, residual,
+                                                                                        tp_num_tokens)
         return hidden_states
 
 
@@ -327,15 +329,25 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0, None),
+            ("gate_up_proj", "up_proj", 1, None),
         ]
 
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        if not is_dsa(self.config):
+            stacked_params_mapping.extend([
+                ("fused_qkv_a_proj_with_mqa", "q_a_proj", None, 0),
+                ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", None, self.config.q_lora_rank),
+            ])
+        else:
+            # change stack order
+            stacked_params_mapping.extend([
+                ("fused_qkv_a_proj_with_mqa", "q_a_proj", None, 0),
+                ("fused_qkv_a_proj_with_mqa", "indexer.wk", None, self.config.q_lora_rank),
+                ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", None, self.config.q_lora_rank+self.config.index_head_dim),
+            ])
+
+        def no_tp_load(param, loaded_weight, *args):
+            return default_weight_loader(param, loaded_weight)
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -360,6 +372,7 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
             "model.mtp.embed_tokens.weight": "embed_tokens.weight",
             "model.mtp.layers.0.eh_proj.weight": "eh_proj.weight",
             "model.mtp.layers.0.eh_proj.weight_scale_inv": "eh_proj.weight_scale_inv",
+            "model.mtp.layers.0.eh_proj.weight_scale": "eh_proj.weight_scale",
             "model.mtp.layers.0.enorm.m.weight": "enorm.weight",
             "model.mtp.layers.0.hnorm.m.weight": "hnorm.weight",
             "model.mtp.layers.0.input_layernorm.weight": "layers.0.input_layernorm.weight",
@@ -367,21 +380,30 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
             "model.mtp.layers.0.self_attn.kv_a_layernorm.weight": "layers.0.self_attn.kv_a_layernorm.weight",
             "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight": "layers.0.self_attn.kv_a_proj_with_mqa.weight",
             "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv": "layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
+            "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale": "layers.0.self_attn.kv_a_proj_with_mqa.weight_scale",
             "model.mtp.layers.0.self_attn.kv_b_proj.weight": "layers.0.self_attn.kv_b_proj.weight",
             "model.mtp.layers.0.self_attn.kv_b_proj.weight_scale_inv": "layers.0.self_attn.kv_b_proj.weight_scale_inv",
+            "model.mtp.layers.0.self_attn.kv_b_proj.weight_scale": "layers.0.self_attn.kv_b_proj.weight_scale",
             "model.mtp.layers.0.self_attn.o_proj.weight": "layers.0.self_attn.o_proj.weight",
             "model.mtp.layers.0.self_attn.o_proj.weight_scale_inv": "layers.0.self_attn.o_proj.weight_scale_inv",
+            "model.mtp.layers.0.self_attn.o_proj.weight_scale": "layers.0.self_attn.o_proj.weight_scale",
             "model.mtp.layers.0.self_attn.q_a_layernorm.weight": "layers.0.self_attn.q_a_layernorm.weight",
             "model.mtp.layers.0.self_attn.q_a_proj.weight": "layers.0.self_attn.q_a_proj.weight",
             "model.mtp.layers.0.self_attn.q_a_proj.weight_scale_inv": "layers.0.self_attn.q_a_proj.weight_scale_inv",
+            "model.mtp.layers.0.self_attn.q_a_proj.weight_scale": "layers.0.self_attn.q_a_proj.weight_scale",
             "model.mtp.layers.0.self_attn.q_b_proj.weight": "layers.0.self_attn.q_b_proj.weight",
             "model.mtp.layers.0.self_attn.q_b_proj.weight_scale_inv": "layers.0.self_attn.q_b_proj.weight_scale_inv",
+            "model.mtp.layers.0.self_attn.q_b_proj.weight_scale": "layers.0.self_attn.q_b_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight": "layers.0.mlp.down_proj.weight",
             "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight_scale_inv": "layers.0.mlp.down_proj.weight_scale_inv",
+            "model.mtp.layers.0.transformer_layer.mlp.down_proj.weight_scale": "layers.0.mlp.down_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight": "layers.0.mlp.gate_proj.weight",
             "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight_scale_inv": "layers.0.mlp.gate_proj.weight_scale_inv",
+            "model.mtp.layers.0.transformer_layer.mlp.gate_proj.weight_scale": "layers.0.mlp.gate_proj.weight_scale",
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight": "layers.0.mlp.up_proj.weight",
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale_inv": "layers.0.mlp.up_proj.weight_scale_inv",
+            "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale": "layers.0.mlp.up_proj.weight_scale",
+            "model.mtp.layers.0.norm.weight": "layers.0.final_layernorm.weight",
             "model.mtp.norm.weight": "layers.0.final_layernorm.weight",
         }
         params_dict = dict(self.named_parameters())
@@ -414,7 +436,7 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
 
             if "rotary_emb.inv_freq" in name:
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            for param_name, weight_name, shard_id, begin_size in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
                     continue
@@ -431,8 +453,15 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                weight_loader = getattr(
+                    param, "weight_loader", no_tp_load
+                )
+                if begin_size is not None and name.endswith(".weight_scale_inv"):
+                    begin_size = begin_size // self.config.quantization_config["weight_block_size"][0]
+                if "fused_qkv_a_proj_with_mqa" in name:
+                    weight_loader(param, loaded_weight, shard_id, begin_size)
+                else:
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 if "mlp.experts." in name:
@@ -453,57 +482,15 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
-                    if fuse_qkv_a_proj and (
-                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
-                    ):
-                        cached_a_proj[name] = loaded_weight
-                        q_a_proj_name = (
-                            name
-                            if "q_a_proj" in name
-                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                        )
-                        kv_a_proj_name = (
-                            name
-                            if "kv_a_proj_with_mqa" in name
-                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                        )
+        self.post_load_weights()
 
-                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                        if (
-                            q_a_proj_name in cached_a_proj
-                            and kv_a_proj_name in cached_a_proj
-                        ):
-
-                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
-                            )
-
-                            if "q_a_proj" in name:
-                                param_name = name.replace(
-                                    "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                                )
-                            else:
-                                param_name = name.replace(
-                                    "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
-                                )
-                            param = params_dict[param_name]
-
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            weight_loader(param, fused_weight)
-                            cached_a_proj.pop(q_a_proj_name)
-                            cached_a_proj.pop(kv_a_proj_name)
-                    else:
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-
+    def post_load_weights(self):
         if self.nextn_use_scmoe:
             for i in range(2):
                 self_attn = self.model.decoder.self_attn[i]
@@ -526,8 +513,13 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                 w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+
+                self_attn.w_kc = bind_or_assign(
+                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                )
+                self_attn.w_vc = bind_or_assign(
+                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                )
                 if self.config.mla_scale_q_lora:
                     self_attn.q_a_layernorm.weight.data *= (self.config.hidden_size / self.config.q_lora_rank) ** 0.5
                 if self.config.mla_scale_kv_lora:
@@ -553,8 +545,12 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            self_attn.w_kc = bind_or_assign(
+                self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            )
+            self_attn.w_vc = bind_or_assign(
+                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+            )
             if self.config.mla_scale_q_lora:
                 self_attn.q_a_layernorm.weight.data *= (self.config.hidden_size / self.config.q_lora_rank) ** 0.5
             if self.config.mla_scale_kv_lora:

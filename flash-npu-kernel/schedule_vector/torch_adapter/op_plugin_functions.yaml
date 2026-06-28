@@ -1,0 +1,9 @@
+
+  - func: npu_assign_req_to_token_pool(Tensor req_pool_indices, Tensor extend_lens, Tensor alloced_lens, Tensor out_cache_loc, Tensor(a!) req_to_token_pool, int bs) -> ()
+    op_api: all_version
+
+  - func: npu_get_out_cache_loc(Tensor req_to_token, Tensor req_pool_indices, Tensor new_compute_lens, Tensor cache_lens, Tensor(a!) out_cache_loc, int bs) -> ()
+    op_api: all_version
+
+  - func: npu_rearrange_accept_index(Tensor accept_index, Tensor accept_length, int bs, Tensor(a!) output) -> ()
+    op_api: all_version

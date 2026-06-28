@@ -36,25 +36,33 @@ from typing import TYPE_CHECKING, Any, List, Optional, Union, Dict
 
 import torch
 import triton
+import flash_npu_kernel
 import triton.language as tl
 
+from sglang.srt.env import ENV, global_server_args_dict
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.moe.npu_moe.ep_metadata import EPMetadata
 from sglang.srt.utils import get_compiler_backend, split_array_by_half_sum, is_npu, check_memory_debug
+from sglang.srt.distributed import get_ep_group
 
 from sglang.srt.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-_is_npu = is_npu()
+__is_npu__ = is_npu()
+
+if __is_npu__:
+    import torch_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.layers.attention.npu_attn.flash_attn import AttentionMetadata
     from sglang.srt.managers.req import Req
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.mem_cache.memory_pool import BaseTokenToKVPool, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput, EagleDraftOutput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -116,6 +124,11 @@ class ForwardMode(IntEnum):
     def is_decode_or_target_verify(self):
         return self.is_decode() or self.is_target_verify()
 
+    def __str__(self) -> str:
+        return self.name
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}.{self.name}"
 
 class CaptureHiddenMode(IntEnum):
     NULL = auto()
@@ -154,6 +167,35 @@ class MicroBatch:
     forward_batch: ForwardBatch
     hidden_states: Optional[torch.Tensor] = None
     residual: Optional[torch.Tensor] = None
+
+class PPProxyTensors:
+    # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    tensors: Dict[str, torch.Tensor]
+
+    def __init__(self, tensors):
+        # manually define this function, so that
+        # Dynamo knows `IntermediateTensors()` comes from this file.
+        # Otherwise, dataclass will generate this function by evaluating
+        # a string, and we will lose the information about the source file.
+        self.tensors = tensors
+
+    def __getitem__(self, key: Union[str, slice]):
+        if isinstance(key, str):
+            return self.tensors[key]
+        elif isinstance(key, slice):
+            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+
+    def __setitem__(self, key: str, value: torch.Tensor):
+        self.tensors[key] = value
+
+    def __len__(self):
+        return len(self.tensors)
+
+    def __eq__(self, other: object):
+        return isinstance(other, self.__class__) and self
+
+    def __repr__(self) -> str:
+        return f"PPProxyTensors(tensors={self.tensors})"
 
 
 @dataclass
@@ -228,12 +270,13 @@ class ForwardBatch:
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None  # e.g. dp = 4, attn-tp = 2, [A, A, B, B, C, C, D, D]
+    global_sp_num_tokens: Optional[List[int]] = None
     gathered_buffer: Optional[torch.Tensor] = None
     all_decode_or_idle: bool = False
     can_run_tbo: bool = False
 
     # Speculative decoding
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput, EagleDraftOutput]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
     spec_num_steps: int = 0
@@ -257,7 +300,17 @@ class ForwardBatch:
     req_pool_indices_cpu: Optional[List[int]] = None
     reqs: List[Req] = None
 
+    exclude_prefill: Optional[bool] = False
+
+    can_run_all2all: Optional[bool] = False
+
+    can_run_with_graph: Optional[bool] = False
+
     captureing_prefill_graph: bool = False
+    attn_metadata: AttentionMetadata = None
+
+    ep_metadata: EPMetadata = None
+    pp_proxy_tensors: Optional[PPProxyTensors] = None
 
     @classmethod
     def init_new(
@@ -305,15 +358,21 @@ class ForwardBatch:
             global_batch_size=batch.global_batch_size,
             input_multi_ids=batch.input_multi_ids,
             reqs=batch.reqs,
+            pp_proxy_tensors=batch.pp_proxy_tensors,
         )
 
-        if ret.global_num_tokens is not None:
-            max_len = max(ret.global_num_tokens)
-            ret.gathered_buffer = torch.zeros(
-                (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
-                dtype=model_runner.dtype,
-                device=device,
-            )
+        # ForwardBatch to EPMetadata
+        if __is_npu__ and not ret.forward_mode.is_target_verify():
+            ret.set_npu_ep_metadata(model_runner)
+
+        if not __is_npu__:
+            if ret.global_num_tokens is not None:
+                max_len = max(ret.global_num_tokens)
+                ret.gathered_buffer = torch.zeros(
+                    (max_len * model_runner.tp_size, model_runner.model_config.hidden_size),
+                    dtype=model_runner.dtype,
+                    device=device,
+                )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
@@ -336,22 +395,32 @@ class ForwardBatch:
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
-            ret.extend_num_tokens = batch.extend_num_tokens
-            if not _is_npu:
+            if not __is_npu__:
+                ret.extend_seq_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens = torch.tensor(
+                    batch.extend_prefix_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_num_tokens = batch.extend_num_tokens
                 positions, ret.extend_start_loc = compute_position_triton(
                     ret.extend_prefix_lens,
                     ret.extend_seq_lens,
                     ret.extend_num_tokens,
                 )
             else:
+                extend_seq_lens = torch.tensor(
+                    batch.extend_seq_lens, dtype=torch.int32, pin_memory=True
+                )
+                extend_prefix_lens = torch.tensor(
+                    batch.extend_prefix_lens, dtype=torch.int32, pin_memory=True
+                )
+                ret.extend_seq_lens = extend_seq_lens.to(device, non_blocking=True)
+                ret.extend_prefix_lens = extend_prefix_lens.to(device, non_blocking=True)
+                ret.extend_num_tokens = batch.extend_num_tokens
+
                 positions, ret.extend_start_loc = compute_position_torch(
-                    ret.extend_prefix_lens, ret.extend_seq_lens
+                    extend_prefix_lens, extend_seq_lens, device
                 )
             if ret.positions is None:
                 ret.positions = positions
@@ -365,8 +434,32 @@ class ForwardBatch:
         ret.set_out_cache_loc()
         return ret
 
+    def set_npu_ep_metadata(self, model_runner):
+        assert __is_npu__, "set_npu_ep_metadata should only be called on NPU devices"
+
+        if global_server_args_dict["npu_disable_all_gather"]:
+            self.exclude_prefill = True
+            self.can_run_all2all = ENV.npu_enable_all2all_comm
+            self.all_decode_or_idle = True
+        else:
+            # ForwardBatch to EPMetadata
+            decode_only_without_graph = self.forward_mode.is_decode() or self.forward_mode.is_idle()
+            decode_only = decode_only_without_graph and ENV.npu_enable_graph
+            if not (ENV.npu_enable_graph and self.all_decode_or_idle) and global_server_args_dict["disaggregation_mode"] != "prefill":
+                if self.input_ids.shape[0] == 0:
+                    ep_metadata = EPMetadata(model_runner.dtype, model_runner.model_config.hidden_size, 1,
+                                            decode_only, decode_only_without_graph, self.input_ids.device)
+                else:
+                    ep_metadata = EPMetadata(model_runner.dtype, model_runner.model_config.hidden_size, self.input_ids.shape[0],
+                                                decode_only, decode_only_without_graph, self.input_ids.device)
+                self.ep_metadata = ep_metadata
+            exclude_prefill = self.all_decode_or_idle
+            can_run_all2all = exclude_prefill and ENV.npu_enable_all2all_comm
+            self.exclude_prefill = exclude_prefill
+            self.can_run_all2all = can_run_all2all
+
     def get_out_cache_loc_kernel_wrapper(self, bs, out_cache_loc):
-        if not _is_npu:
+        if not __is_npu__:
             get_out_cache_loc_kernel[(bs,)](
                 out_cache_loc_ptr=out_cache_loc,
                 req_to_token_ptr=self.req_to_token_pool.req_to_token,
@@ -376,25 +469,19 @@ class ForwardBatch:
                 req_to_token_ptr_stride=self.req_to_token_pool.req_to_token.shape[1]
             )
         else:
-            # TODO for npu
-            batch_size = self.req_pool_indices.shape[0]
-            device = self.req_pool_indices.device
-
-            # Cumulative sum
-            cumsum_starts = torch.cat([
-                torch.tensor([0], device=device),
-                self.new_tokens_to_compute.cumsum(0)[:-1]
-            ])
-
-            for i in range(batch_size):
-                new_compute_len = self.new_tokens_to_compute[i].item()
-                if new_compute_len == 0:
-                    continue
-                req_index = self.req_pool_indices[i].item()
-                cache_len = self.req_to_token_pool.verified_lens[req_index].item()
-                cumsum_start = cumsum_starts[i].item()
-                req_tokens = self.req_to_token_pool.req_to_token[req_index, cache_len:cache_len + new_compute_len]
-                out_cache_loc[cumsum_start:cumsum_start + new_compute_len] = req_tokens
+            new_compute_lens = self.new_tokens_to_compute
+            if ENV.npu_enable_get_out_cache:
+                torch.ops.flash.npu_get_out_cache_loc(self.req_to_token_pool.req_to_token, self.req_pool_indices.to(torch.int32), new_compute_lens,
+                                                self.req_to_token_pool.verified_lens, out_cache_loc, bs)
+            else:
+                cumsum_offsets = torch.zeros_like(new_compute_lens)
+                torch.cumsum(new_compute_lens[:-1], dim=0, out=cumsum_offsets[1:])
+                cache_starts = self.req_to_token_pool.verified_lens[self.req_pool_indices]
+                row_indices = torch.repeat_interleave(self.req_pool_indices, new_compute_lens)
+                col_indices = (cache_starts.repeat_interleave(new_compute_lens) +
+                               torch.arange(new_compute_lens.sum(), device=new_compute_lens.device) -
+                               cumsum_offsets.repeat_interleave(new_compute_lens))
+                out_cache_loc[:col_indices.size(0)] = self.req_to_token_pool.req_to_token[row_indices, col_indices]
 
     def get_num_tokens(self, tp_num_tokens: int):
         if self.global_num_tokens is not None:
@@ -428,7 +515,16 @@ class ForwardBatch:
             self.req_to_token_pool.verified_lens[self.req_pool_indices] = self.extend_prefix_lens
         bs = self.batch_size
         self.get_out_cache_loc_kernel_wrapper(bs, out_cache_loc)
-        self.out_cache_loc = out_cache_loc
+
+        if hasattr(self.token_to_kv_pool, "enable_mla_l1_5_cache") and self.token_to_kv_pool.enable_mla_l1_5_cache:
+            # out_cache_loc will be modified inplace
+            # nonlocal pages all set to page 0, local pages are remapped to local indices
+            _, _, _, _, _ = self.token_to_kv_pool.global_loc_to_local_mapping(
+                out_cache_loc
+            )
+            self.out_cache_loc = out_cache_loc
+        else:
+            self.out_cache_loc = out_cache_loc
         # Increment slot reference count by 1 for server idle check
         if check_memory_debug():
             self.token_to_kv_pool.token_slot_refs[self.out_cache_loc] += 1
@@ -523,6 +619,173 @@ class ForwardBatch:
                 if self.spec_info else seq_split_idx
         return seq_split_idx, token_split_idx
 
+    def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        if value == 0:
+            return torch.cat(
+                [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:], dtype=tensor.dtype)],
+                dim=0,
+            )
+        else:
+            return torch.cat(
+                [
+                    tensor,
+                    tensor.new_full((size - tensor.shape[0], *tensor.shape[1:]), value, dtype=tensor.dtype),
+                ],
+                dim=0,
+            )
+
+    def _pad_list_to_size(self, l: list, size: int):
+        for _ in range(size - len(l)):
+            l.append(0)
+        return l
+
+    def padding_for_graph_mtp(self, model_runner: ModelRunner, max_padding_size):
+        global_num_tokens = self.global_num_tokens
+        mtpn_factor = model_runner.server_args.speculative_num_steps + 1
+        if not global_server_args_dict["npu_disable_all_gather"]:
+            max_num_tokens = max(global_num_tokens)
+            assert max_num_tokens <= max_padding_size * mtpn_factor, f"max num tokens ({max_num_tokens}) should less equal than max padding size({max_padding_size * mtpn_factor}) in graph mode"
+
+        sync_group_size = get_ep_group().world_size
+        global_num_tokens = [max_padding_size] * sync_group_size
+
+        if self.forward_mode.is_target_verify():
+            setattr(self, "ori_bs", self.batch_size)
+            self.batch_size = max_padding_size
+
+        if self.forward_mode.is_idle():
+            self.extend_logprob_start_lens_cpu = []
+            self.forward_mode = ForwardMode.TARGET_VERIFY
+            setattr(self, "ori_bs", self.batch_size)
+            self.batch_size = max_padding_size
+
+            bs = self.batch_size
+            self.extend_seq_lens = torch.full((bs,), 0, device="npu", dtype=torch.int32)
+            self.new_tokens_to_compute = torch.full((bs,), mtpn_factor, device="npu", dtype=torch.int32)
+            if model_runner.model_config.use_over_embedding:
+                self.oe_token_table=model_runner.oe_token_table
+                self.oe_column_starts=torch.zeros(bs, dtype=torch.int32, device="npu")
+                self.oe_req_lens=torch.zeros(bs, dtype=torch.int32, device="npu")
+                self.oe_out_column_starts=torch.zeros(bs, dtype=torch.int32, device="npu")
+                self.oe_out_req_lens=torch.zeros(bs, dtype=torch.int32, device="npu")
+
+            from sglang.srt.speculative.eagle_utils import EagleVerifyInput
+
+            draft_token_num = model_runner.server_args.speculative_num_draft_tokens
+            self.spec_info = EagleVerifyInput(
+                draft_token=torch.zeros(bs * draft_token_num, device="npu"),
+                positions=torch.zeros(bs * draft_token_num, device="npu"),
+
+                draft_token_num=draft_token_num,
+                spec_steps=model_runner.server_args.speculative_num_steps,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                is_all_greedy=True,
+                cumulated_scaling_penalties=torch.ones(
+                    (bs, model_runner.model_config.vocab_size),
+                    dtype=torch.float32,
+                    device="npu",
+                ),
+            )
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+        else:
+            bs = self.batch_size
+
+            self.spec_info.cumulated_scaling_penalties = self._pad_tensor_to_size(
+                self.spec_info.cumulated_scaling_penalties, bs, value=1)
+
+        # padding
+        if self.input_ids is None:
+            self.input_ids = torch.empty(0, dtype=torch.int32, device=model_runner.device)
+        self.input_ids = self._pad_tensor_to_size(self.input_ids, bs*mtpn_factor).to(torch.int64)
+        self.spec_info.draft_token = self._pad_tensor_to_size(self.spec_info.draft_token, bs*mtpn_factor)
+
+        self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+
+        seq_len_fill_value = (
+            model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
+        self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+            bs - self.seq_lens.shape[0]
+        )
+        self.seq_lens = self._pad_tensor_to_size(
+            self.seq_lens, bs, value=seq_len_fill_value
+        )
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_cpu = self._pad_tensor_to_size(
+                self.seq_lens_cpu, bs, value=seq_len_fill_value
+            )
+
+        self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, bs*mtpn_factor)
+        self.positions = self._pad_tensor_to_size(self.positions, bs*mtpn_factor).to(torch.int32)
+        self.global_num_tokens = global_num_tokens
+        self.new_tokens_to_compute = self._pad_tensor_to_size(self.new_tokens_to_compute, bs)
+
+        if self.extend_seq_lens is not None:
+            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+
+        self.extend_seq_lens_cpu=None
+
+        self.extend_logprob_start_lens_cpu = [0] * bs  # bugfix
+
+        if model_runner.model_config.use_over_embedding:
+            self.oe_column_starts=self._pad_tensor_to_size(self.oe_column_starts, bs)
+            self.oe_req_lens=self._pad_tensor_to_size(self.oe_req_lens, bs)
+            self.oe_out_column_starts=self._pad_tensor_to_size(self.oe_out_column_starts, bs)
+            self.oe_out_req_lens=self._pad_tensor_to_size(self.oe_out_req_lens, bs)
+
+    def padding_for_npu_graph(self, model_runner: ModelRunner, max_padding_size):
+        global_num_tokens = self.global_num_tokens
+        sync_group_size = len(global_num_tokens)
+        max_num_tokens = max(global_num_tokens)
+        assert max_num_tokens <= max_padding_size, "max num tokens should less equal than max padding size in graph mode"
+        global_num_tokens = [max_padding_size] * sync_group_size
+
+        if self.forward_mode.is_idle():
+            self.forward_mode = ForwardMode.DECODE
+
+            if model_runner.model_config.use_over_embedding:
+                self.oe_token_table=model_runner.oe_token_table
+                self.oe_column_starts=torch.zeros(max_padding_size, dtype=torch.int32, device="npu")
+                self.oe_req_lens=torch.zeros(max_padding_size, dtype=torch.int32, device="npu")
+                self.oe_out_column_starts=torch.zeros(max_padding_size, dtype=torch.int32, device="npu")
+                self.oe_out_req_lens=torch.zeros(max_padding_size, dtype=torch.int32, device="npu")
+
+        if self.forward_mode.is_decode():
+            setattr(self, "ori_bs", self.batch_size)
+            self.batch_size = max_padding_size
+
+        bs=self.batch_size
+
+        # padding
+        self.input_ids = self._pad_tensor_to_size(self.input_ids, bs)
+        self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+
+        seq_len_fill_value = (
+            model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        )
+        self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
+            bs - self.seq_lens.shape[0]
+        )
+        self.seq_lens = self._pad_tensor_to_size(
+            self.seq_lens, bs, value=seq_len_fill_value
+        )
+        if self.seq_lens_cpu is not None:
+            self.seq_lens_cpu = self._pad_tensor_to_size(
+                self.seq_lens_cpu, bs, value=seq_len_fill_value
+            )
+
+        self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, bs)
+        self.positions = self._pad_tensor_to_size(self.positions, bs).to(torch.int32)
+        self.global_num_tokens = global_num_tokens
+
+        if self.extend_seq_lens is not None:
+            self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+
+        if model_runner.model_config.use_over_embedding:
+            self.oe_column_starts=self._pad_tensor_to_size(self.oe_column_starts, bs)
+            self.oe_req_lens=self._pad_tensor_to_size(self.oe_req_lens, bs)
+            self.oe_out_column_starts=self._pad_tensor_to_size(self.oe_out_column_starts, bs)
+            self.oe_out_req_lens=self._pad_tensor_to_size(self.oe_out_req_lens, bs)
 
 def compute_position_triton(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, extend_seq_lens_sum
@@ -579,13 +842,13 @@ def compute_position_kernel(
 
 
 def compute_position_torch(
-    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
+    extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor, device
 ):
     # There is a list comparison here, which causes CPU-GPU synchronization
     positions = torch.concat(
         [
             torch.arange(
-                prefix_len, prefix_len + extend_len, device=extend_prefix_lens.device
+                prefix_len, prefix_len + extend_len, device=device
             )
             for prefix_len, extend_len in zip(extend_prefix_lens, extend_seq_lens)
         ],
@@ -593,8 +856,7 @@ def compute_position_torch(
     )
     extend_start_loc = torch.zeros_like(extend_seq_lens)
     extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
-    return positions.to(torch.int64), extend_start_loc
-
+    return positions.to(torch.int64), extend_start_loc.pin_memory().to(device, non_blocking=True)
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def clamp_position(seq_lens):
@@ -637,7 +899,7 @@ def get_out_cache_loc_kernel(
     cumsum_start = tl.cast(0, tl.int32)
     for i in range(pid):
         cumsum_start += tl.load(new_compute_lens_ptr + i)
-    
+
     # 0 means padding position
     if req_index == 0:
         for i in range(num_loop):

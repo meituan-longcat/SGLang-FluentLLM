@@ -92,10 +92,13 @@ class DecodePreallocQueue:
         tree_cache: BasePrefixCache,
         gloo_group: ProcessGroup,
         tp_rank: int,
-        world_size: int,
+        tp_size: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
         transfer_backend: TransferBackend,
+        scheduler_comm_device: torch.device,
+        pp_rank: int,
+        pp_size: int,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
@@ -103,6 +106,8 @@ class DecodePreallocQueue:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.draft_is_mla_backend = is_mla_backend(self.draft_token_to_kv_pool)
+        if self.draft_token_to_kv_pool is None:
+            self.draft_is_mla_backend = self.is_mla_backend
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
@@ -110,7 +115,9 @@ class DecodePreallocQueue:
         self.tree_cache = tree_cache  # enable decode prefix cache
         self.gloo_group = gloo_group
         self.tp_rank = tp_rank
-        self.tp_size = world_size
+        self.tp_size = tp_size
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
 
@@ -134,9 +141,18 @@ class DecodePreallocQueue:
         else:
             self.kv_transfer_metrics = None
 
+        # Decode cache hit rate tracking
+        self.total_decode_tokens = 0
+        self.total_decode_hit_tokens = 0
+        self.scheduler_comm_device = scheduler_comm_device
+
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args = KVArgs()
-        kv_args.engine_rank = self.tp_rank
+        kv_args.tp_rank = self.tp_rank
+        kv_args.pp_rank = self.pp_rank
+        kv_args.prefill_start_layer=self.token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer=self.token_to_kv_pool.end_layer
+        assert kv_args.pp_rank == 0 and kv_args.prefill_start_layer == 0
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -217,6 +233,7 @@ class DecodePreallocQueue:
         """Add a request to the pending queue."""
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
+
     def resume_retracted_reqs(self) -> List[Req]:
         # TODO refactor scheduling part, reuse with unified engine logic as much as possible
 
@@ -318,7 +335,7 @@ class DecodePreallocQueue:
             return
 
         polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group, self.scheduler_comm_device
         )
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
@@ -443,6 +460,13 @@ class DecodePreallocQueue:
             page_indices = kv_to_page_indices(
                 kv_indices, self.token_to_kv_pool.page_size
             )
+            decode_mla_l1_5_args = None
+            if (
+                hasattr(self.token_to_kv_pool, "enable_mla_l1_5_cache")
+                and self.token_to_kv_pool.enable_mla_l1_5_cache
+            ):
+                page_meta = self.token_to_kv_pool.get_page_transfer_metadata(page_indices)
+                decode_mla_l1_5_args = page_meta
 
             allocatable_tokens -= required_tokens_for_request
             if self.kv_transfer_metrics:
@@ -452,7 +476,16 @@ class DecodePreallocQueue:
                 transfer_size_bytes = num_pages * self.token_to_kv_pool.page_size_bytes
                 self.kv_transfer_metrics.log_kv_transfer_size(transfer_size_bytes)
 
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index, decode_prefix_len = decode_req.req.prefix_len)
+            # Track decode cache hit rate
+            self.total_decode_tokens += len(decode_req.req.origin_input_ids)
+            self.total_decode_hit_tokens += decode_req.req.prefix_len
+
+            decode_req.kv_receiver.init(
+                page_indices,
+                decode_req.metadata_buffer_index,
+                decode_prefix_len=decode_req.req.prefix_len,
+                mla_l1_5_args=decode_mla_l1_5_args,
+            )
             if self.scheduler.global_rank == 0:
                 decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
@@ -463,6 +496,15 @@ class DecodePreallocQueue:
         ]
 
         return preallocated_reqs
+
+    def get_and_reset_decode_cache_hit_rate(self) -> float:
+        """Calculate and reset decode cache hit rate."""
+        if self.total_decode_tokens == 0:
+            return 0.0
+        hit_rate = self.total_decode_hit_tokens / self.total_decode_tokens
+        self.total_decode_tokens = 0
+        self.total_decode_hit_tokens = 0
+        return hit_rate
 
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
@@ -582,6 +624,8 @@ class DecodePreallocQueue:
             new_tokens_needed = total_len
 
         alloced_len = self.req_to_token_pool.alloced_lens[req.req_pool_idx].item()
+        if prefix_len > alloced_len:
+            alloced_len = prefix_len
         # Allocate memory for new tokens
         if new_tokens_needed > 0:
 
@@ -616,6 +660,7 @@ class DecodeTransferQueue:
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        scheduler_comm_device,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
@@ -623,6 +668,7 @@ class DecodeTransferQueue:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self.tree_cache = tree_cache
+        self.scheduler_comm_device = scheduler_comm_device
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -635,7 +681,7 @@ class DecodeTransferQueue:
             return []
 
         polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group, self.scheduler_comm_device
         )
 
         transferred_reqs = []
@@ -711,6 +757,10 @@ class DecodeTransferQueue:
                     self.tree_cache.cache_finished_req(decode_req.req)
                     self.tree_cache.token_to_kv_pool_allocator.free_group_end()
                 else:
+                    if self.scheduler.server_args.ret_first_token_no_waiting:
+                        self.scheduler.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
                     transferred_reqs.append(decode_req.req)
                 indices_to_remove.add(i)
             elif poll in [
@@ -858,45 +908,153 @@ class SchedulerDisaggregationDecodeMixin:
 
             self.last_batch = batch
 
+    def _multi_step_decode_launch(self: Scheduler, batch: ScheduleBatch, result_queue: deque):
+        for i in range(self.server_args.num_continuous_decode_steps):
+            # launch cur batch
+            result = self.run_batch(batch)
+            # put cur batch and into result queue for async post process
+            result_queue.append((batch.copy(run_times=i), result))
+            # update cur batch for next launch
+            batch.input_ids = result.next_token_ids
+            if i < self.server_args.num_continuous_decode_steps - 1:
+                # NOTE: This is not correct when MTP enabled, so it should never be used
+                batch.seq_lens = batch.seq_lens + 1
+                batch.seq_lens_sum += len(batch.reqs)
+
+    def _multi_step_decode_post_process(self: Scheduler, result_queue: deque):
+        for i in range(self.server_args.num_continuous_decode_steps):
+            tmp_batch, tmp_result = result_queue.popleft()
+            self.process_batch_result(
+                tmp_batch, tmp_result
+            )
+
+    def _schedule_next_batch_to_lauch(self: Scheduler):
+        recv_reqs = self.recv_requests()
+        self.process_input_requests(recv_reqs)
+        self.process_decode_queue()
+        batch: ScheduleBatch = self.get_next_disagg_decode_batch_to_run()
+        if batch:
+            if batch.forward_mode.is_extend():
+                self.stream_output(
+                    batch.reqs, any(req.return_logprob for req in batch.reqs)
+                )
+                self.last_batch = batch
+                batch: ScheduleBatch = self.get_next_disagg_decode_batch_to_run(True)
+        # Idle or Decode
+        dp_batch = self.prepare_dp_attn_batch(batch)
+
+        if batch and batch.forward_mode.is_decode():
+            assert len(batch.reqs) > 0, f"{batch=} {dp_batch=}"
+        return batch, dp_batch
+
+    def multi_step_decode_overlap_loop(self: Scheduler, batch: ScheduleBatch, result_queue: deque):
+        self._multi_step_decode_launch(batch, result_queue)
+        self._multi_step_decode_post_process(result_queue)
+
+    @torch.no_grad()
+    def event_loop_overlap_disagg_multi_step_decode(self: Scheduler):
+        # When dp size is 1, there's no cpu all-gather overhead, we don't need multi-step decode
+        assert self.server_args.dp_size > 1, "multi-step decode only support dp > 1 for now"
+        assert self.server_args.enable_dp_attention
+        result_queue = deque()
+        self.result_queue = result_queue
+        # When we get a newly built extend batch, we need a EXTEND batch to merge into
+        # running batch, but we will generate an idle batch to launch. So we record a
+        # last dp batch.
+        self.last_batch = None
+        self.last_dp_batch = None
+        def _loop_process(step_func=None):
+            while True:
+                batch, dp_batch = self._schedule_next_batch_to_lauch()
+                self.cur_batch = batch
+                if dp_batch:
+                    if self.last_dp_batch:
+                        if dp_batch:
+                            # Overlapping
+                            self.multi_step_decode_overlap_loop(dp_batch, result_queue)
+                            if step_func:
+                                step_func()
+                        else:
+                            assert batch.forward_mode.is_extend()
+                    else:
+                        # Warmup
+                        if dp_batch:
+                            self._multi_step_decode_launch(dp_batch, result_queue)
+                            if step_func:
+                                step_func()
+                            tmp_batch, tmp_result = result_queue.popleft()
+                            self.process_batch_result(
+                                tmp_batch, tmp_result
+                            )
+                        else:
+                            assert batch.forward_mode.is_extend()
+                elif self.last_dp_batch:
+                    # Cool down
+                    for _ in range(self.server_args.num_continuous_decode_steps - 1):
+                        tmp_batch, tmp_result = result_queue.popleft()
+                        self.process_batch_result(
+                            tmp_batch, tmp_result
+                        )
+
+                if batch and batch.forward_mode.is_extend():
+                    self.last_batch = batch
+                else:
+                    self.last_batch = dp_batch
+                self.last_dp_batch = dp_batch
+
+                if dp_batch is None and batch is None and self.last_batch is None and self.last_dp_batch is None and (
+                    len(self.waiting_queue)
+                    + len(self.disagg_decode_transfer_queue.queue)
+                    + len(self.disagg_decode_prealloc_queue.queue)
+                    == 0
+                ):
+                    # When the server is idle, do self-check and re-init some states
+                    self.check_memory()
+                    self.new_token_ratio = self.init_new_token_ratio
+        if self.npu_custom_profiler:
+            with self.npu_custom_profiler as p:
+                p.start()
+                _loop_process(p.step)  # do npu process
+                p.stop()
+        else:
+            _loop_process()
+
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
         self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
+        def _loop_process(step_func=None):
+            while True:
+                recv_reqs = self.recv_requests()
+                self.process_input_requests(recv_reqs)
+                # polling and allocating kv cache
+                self.process_decode_queue()
 
-        while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
-            # polling and allocating kv cache
-            self.process_decode_queue()
+                # Check hierarchical cache events (write_through completion, load_back completion, etc.)
+                if self.enable_hierarchical_cache:
+                    self.tree_cache.check_hicache_events()
 
-            # Check hierarchical cache events (write_through completion, load_back completion, etc.)
-            if self.enable_hierarchical_cache:
-                self.tree_cache.check_hicache_events()
+                batch = self.get_next_disagg_decode_batch_to_run()
+                self.cur_batch = batch
+                last_batch_in_queue = False
 
-            batch = self.get_next_disagg_decode_batch_to_run()
-            self.cur_batch = batch
-            last_batch_in_queue = False
-
-            if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    if self.server_args.enable_dp_attention:
-                        batch_, result = self._prepare_idle_batch_and_run(
-                            None, delay_process=True
+                if batch:
+                    # Generate fake extend output.
+                    if batch.forward_mode.is_extend():
+                        # Note: Logprobs should be handled on the prefill engine.
+                        self.stream_output(
+                            batch.reqs, any(req.return_logprob for req in batch.reqs)
                         )
-                        if batch_:
-                            result_queue.append((batch_.copy(), result))
-                            last_batch_in_queue = True
-                else:
+                        self.last_batch = batch
+                        batch = self.get_next_disagg_decode_batch_to_run(True)
+                        self.cur_batch = batch
                     if self.server_args.enable_dp_attention:
                         self.prepare_dp_attn_batch(batch)
                     result = self.run_batch(batch)
                     result_queue.append((batch.copy(), result))
+                    if step_func:
+                        step_func()  # p.step()
 
                     if (self.last_batch is None) or (not self.last_batch_in_queue):
                         # Create a dummy first batch to start the pipeline for overlap schedule.
@@ -913,47 +1071,57 @@ class SchedulerDisaggregationDecodeMixin:
                         self.set_next_batch_sampling_info_done(tmp_batch)
                     last_batch_in_queue = True
 
-            elif self.server_args.enable_dp_attention:
-                batch, result = self._prepare_idle_batch_and_run(
-                    None, delay_process=True
-                )
-                if batch:
-                    result_queue.append((batch.copy(), result))
-                    last_batch_in_queue = True
+                elif self.server_args.enable_dp_attention:
+                    batch, result = self._prepare_idle_batch_and_run(
+                        None, delay_process=True
+                    )
+                    if batch:
+                        if step_func:
+                            step_func()
+                        result_queue.append((batch.copy(), result))
+                        last_batch_in_queue = True
 
-            # Process the results of the previous batch but skip if the last batch is extend
-            if self.last_batch and self.last_batch_in_queue:
-                tmp_batch, tmp_result = result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info
-                    if self.draft_worker is None
-                    else self.draft_worker.cur_sampling_info
-                )
-                self.process_batch_result(tmp_batch, tmp_result)
-            elif self.running_batch is not None and self.draft_worker:
-                # In overlap + MTP mode, correct reserve num tokens here to ensure
-                # sufficient allocation
-                for req in self.running_batch.reqs:
-                    req.reserve_num_tokens = self.server_args.speculative_num_draft_tokens
+                # Process the results of the previous batch but skip if the last batch is extend
+                if self.last_batch and self.last_batch_in_queue:
+                    tmp_batch, tmp_result = result_queue.popleft()
+                    tmp_batch.next_batch_sampling_info = (
+                        self.tp_worker.cur_sampling_info
+                        if self.draft_worker is None
+                        else self.draft_worker.cur_sampling_info
+                    )
+                    self.process_batch_result(tmp_batch, tmp_result)
+                elif self.running_batch is not None and self.draft_worker:
+                    # In overlap + MTP mode, correct reserve num tokens here to ensure
+                    # sufficient allocation
+                    for req in self.running_batch.reqs:
+                        req.reserve_num_tokens = self.server_args.speculative_num_draft_tokens
 
-            if batch is None and (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.new_token_ratio = self.init_new_token_ratio
+                if batch is None and (
+                    len(self.waiting_queue)
+                    + len(self.disagg_decode_transfer_queue.queue)
+                    + len(self.disagg_decode_prealloc_queue.queue)
+                    == 0
+                ):
+                    # When the server is idle, do self-check and re-init some states
+                    self.check_memory()
+                    self.new_token_ratio = self.init_new_token_ratio
 
-            if batch is None:
-                self.log_idle_stats()
+                if batch is None:
+                    self.log_idle_stats()
 
-            self.last_batch = batch
-            self.last_batch_in_queue = last_batch_in_queue
+                self.last_batch = batch
+                self.last_batch_in_queue = last_batch_in_queue
+
+        if self.npu_custom_profiler:
+            with self.npu_custom_profiler as p:
+                p.start()
+                _loop_process(p.step)  # do npu process
+                p.stop()
+        else:
+            _loop_process()
 
     def get_next_disagg_decode_batch_to_run(
-        self: Scheduler,
+        self: Scheduler, only_merge=False
     ) -> Optional[Tuple[ScheduleBatch, bool]]:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
@@ -970,7 +1138,7 @@ class SchedulerDisaggregationDecodeMixin:
                     # merge running_batch with prefill batch
                     self.running_batch.merge_batch(last_batch)
 
-        new_prebuilt_batch = self.get_new_prebuilt_batch()
+        new_prebuilt_batch = None if only_merge else self.get_new_prebuilt_batch()
 
         ret: Optional[ScheduleBatch] = None
         if new_prebuilt_batch:
@@ -1048,11 +1216,15 @@ class SchedulerDisaggregationDecodeMixin:
             self.reserve_num_tokens,
             draft_token_num,
             spec_num_steps,
+            self.server_args.num_continuous_decode_steps
         )
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt_extend()
         new_batch.process_prebuilt_extend(self.server_args, self.model_config)
+
+        if self.draft_worker:
+            self.draft_worker.renew_scaling_penalty(new_batch.req_pool_indices)
 
         return new_batch
 

@@ -64,7 +64,7 @@ class OpenAIServingBase(ABC):
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
-            adapted_request, processed_request = self._convert_to_internal_request(
+            adapted_request, processed_request = await self._convert_to_internal_request(
                 request
             )
 
@@ -106,7 +106,7 @@ class OpenAIServingBase(ABC):
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
     @abstractmethod
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: OpenAIServingRequest,
     ) -> tuple[GenerateReqInput, OpenAIServingRequest]:

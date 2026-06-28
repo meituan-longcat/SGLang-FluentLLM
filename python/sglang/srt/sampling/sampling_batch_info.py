@@ -26,6 +26,13 @@ class SamplingBatchInfo:
     top_ks: torch.Tensor
     min_ps: torch.Tensor
 
+    # This will be a snapshot of repeat_penalties of reqs in ForwardBatch. Since the sampling of
+    # spec-decoding is in the middle of a cudagraph and we need to cumulate multi output tokens,
+    # the penalties in penalizer_orchestrator is difficult to use. So make it permanent like temperatures
+    # and top_ks, and cumulate/apply repetition_penalties on forward_thread(for Spec-Decoding).
+    # It's default value is 1.0 in samling_params.
+    repetition_penalties: torch.Tensor
+
     # Whether all requests use greedy sampling
     is_all_greedy: bool
 
@@ -44,7 +51,7 @@ class SamplingBatchInfo:
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
     linear_penalty: torch.Tensor = None
-    multiply_penalty: torch.Tensor = None
+    scaling_penalty: torch.Tensor = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -83,6 +90,9 @@ class SamplingBatchInfo:
         ).to(device, non_blocking=True)
         min_ps = torch.tensor(
             [r.sampling_params.min_p for r in reqs], dtype=torch.float
+        ).to(device, non_blocking=True)
+        repetition_penalties = torch.tensor(
+            [r.sampling_params.repetition_penalty for r in reqs], dtype=torch.float32,
         ).to(device, non_blocking=True)
 
         if any(hasattr(r.tokenizer, "think_end_id") for r in reqs):
@@ -163,6 +173,7 @@ class SamplingBatchInfo:
             top_ps=top_ps,
             top_ks=top_ks,
             min_ps=min_ps,
+            repetition_penalties=repetition_penalties,
             thinking_budgets=thinking_budgets,
             think_end_ids=think_end_ids,
             last_token_ids=last_token_ids,
@@ -208,7 +219,6 @@ class SamplingBatchInfo:
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
 
     def update_penalties(self):
-        # TODO: supported penalty in spec decoding
         if self.penalizer_orchestrator.is_required:
             self.linear_penalty = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
@@ -218,7 +228,7 @@ class SamplingBatchInfo:
             # NOTE: This is specialized for repetition penalty, since it's not a
             # linear verison penalty. I don't why we still need this, but add a
             # multiply version in case of more options in the future.
-            self.multiply_penalty = torch.ones(
+            self.scaling_penalty = torch.ones(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
                 device=self.temperatures.device,
@@ -226,10 +236,10 @@ class SamplingBatchInfo:
             self.penalizer_orchestrator.apply(self.linear_penalty)
             for penalizer in self.penalizer_orchestrator.penalizers.values():
                 if isinstance(penalizer, penaltylib.BatchedRepetitionPenalizer):
-                    penalizer._update_multiply_penalty(self.multiply_penalty)
+                    penalizer._update_scaling_penalty(self.scaling_penalty)
         else:
             self.linear_penalty = None
-            self.multiply_penalty = None
+            self.scaling_penalty = None
 
     def apply_thinking_budgets(
         self, seq_lens: torch.Tensor, next_token_ids: torch.Tensor
@@ -260,9 +270,9 @@ class SamplingBatchInfo:
             # Used in the overlap mode
             logits.add_(self.linear_penalty)
         
-        if self.multiply_penalty is not None:
+        if self.scaling_penalty is not None:
             # Used in the overlap mode
-            apply_scaling_penalties(logits, self.multiply_penalty)
+            apply_scaling_penalties(logits, self.scaling_penalty)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
@@ -284,6 +294,7 @@ class SamplingBatchInfo:
             "top_ps",
             "top_ks",
             "min_ps",
+            "repetition_penalties",
             "thinking_budgets",
             "think_end_ids",
             "last_token_ids",
@@ -380,6 +391,7 @@ class SamplingBatchInfo:
         # the merge operation of the temperatures tensor below.
         for item in [
             "temperatures",
+            "repetition_penalties",
             "top_ps",
             "top_ks",
             "min_ps",

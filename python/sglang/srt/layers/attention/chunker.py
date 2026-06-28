@@ -7,9 +7,9 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.flash_attention_backend import FlashAttentionMetadata
 from sglang.srt.env import global_server_args_dict
-from flash_attn_interface import flash_attn_varlen_func
-from sglang.srt.utils import get_colorful_logger
+from flash_attn_3.flash_attn_interface import flash_attn_varlen_func
 
+from sglang.srt.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 
 @triton.jit
@@ -103,7 +103,12 @@ def chunking(prefix_lens: torch.Tensor, num_chunks, batch_size, chunk_len):
 
 # Called before each attention module if using chunked kv cache for prefill
 # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
-def get_chunks(prefix_lens, prefix_lens_cpu, req_to_token, req_pool_indices):
+def get_chunks(
+    prefix_lens, 
+    prefix_lens_cpu, 
+    req_to_token, 
+    req_pool_indices,
+    token_to_kv_pool):
     device: torch.device = prefix_lens.device
     batch_size = len(prefix_lens_cpu)
 
@@ -120,7 +125,7 @@ def get_chunks(prefix_lens, prefix_lens_cpu, req_to_token, req_pool_indices):
 
     chunk_kv_indices_list = []
     for idx in range(num_chunks):
-        chunk_kv_indices = torch.empty(num_tokens_per_forward[idx] , dtype=torch.int32, device=device)
+        chunk_kv_indices = torch.empty(num_tokens_per_forward[idx], dtype=torch.int32, device=device)
         create_chunked_cache_kv_indices[(batch_size,)](
             req_to_token,
             req_pool_indices,
@@ -130,6 +135,24 @@ def get_chunks(prefix_lens, prefix_lens_cpu, req_to_token, req_pool_indices):
             chunk_kv_indices,
             req_to_token.shape[1],
         )
+        
+        if (
+            hasattr(token_to_kv_pool, 'enable_mla_l1_5_cache')
+            and token_to_kv_pool.enable_mla_l1_5_cache
+        ):
+            mask, local_indices, per_rank_count, perm, inv_perm = (
+                token_to_kv_pool.global_loc_to_local_mapping(
+                    chunk_kv_indices,
+                )
+            )
+            chunk_kv_indices = (
+                chunk_kv_indices,
+                mask,
+                local_indices,
+                per_rank_count,
+                perm,
+                inv_perm,
+            )
 
         chunk_kv_indices_list.append(chunk_kv_indices)
 
@@ -425,10 +448,7 @@ def get_streamed_kv_indices(extend_seq_lens, extend_seq_lens_cpu, seq_lens, seq_
 
     return streamed_kv_indices, streamed_lens
 
-try:
-    from duo_flash_attn_interface import flash_attn_varlen_func as duo_flash_attn_varlen_func
-except ImportError:
-    logger.warning("duo_flash_attn_interface not installed!")
+from duo_flash_attn_interface import flash_attn_varlen_func as duo_flash_attn_varlen_func
 
 class StreamedFlashAttn(object):
     def __init__(self, num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, q_lens, kv_lens, streaming_info, head_mask_type, step_counter):

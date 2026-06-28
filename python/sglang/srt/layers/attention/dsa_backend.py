@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.configs.model_config import get_nsa_index_topk, is_dsa
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.nsa_indexer import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
@@ -24,7 +24,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.utils import FLLM_IS_CP, CP_METADATA, get_cp_metadata, cp_split_and_rebuild_data
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
-from flash_attn_interface import flash_attn_with_kvcache
+from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -107,6 +107,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         lengths: Optional[torch.Tensor] = None,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         row_starts: Optional[torch.Tensor] = None,
+        num_init_and_local_tokens: List[int] = [0, 0],
     ) -> torch.Tensor:
         from flashinfer import (
             fast_topk_transform_fused,
@@ -121,15 +122,16 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
 
         if cu_seqlens_q is None:
             cu_seqlens_q = self.attn_metadata.cu_seqlens_q
-        # import flashinfer
-        # if row_starts is None:
-        #     seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-        #     real_bs = seqlens_q.shape[0]
-        #     row2batch = torch.arange(real_bs, dtype=torch.int32, device=logits.device).repeat_interleave(seqlens_q)
-        #     # logits = logits.contiguous() flashinfer topk need logits to be contiguous
-        #     return flashinfer.top_k_page_table_transform(
-        #         logits, self.attn_metadata.page_table_1, lengths, topk, row2batch
-        #     )
+        num_init_tokens, num_local_tokens = num_init_and_local_tokens
+        # init or local tokens dont care about row_start, because longcat doesn't use `row_start`
+        if num_init_tokens > 0:
+            init_idxs = torch.arange(num_init_tokens, dtype=lengths.dtype, device=lengths.device)[None,:]
+            init_idxs.clamp_max_(logits.shape[-1]-1)
+            logits.scatter_(dim=1, index=init_idxs.expand(logits.shape[0], -1), value=float('inf'))
+        if num_local_tokens > 0:
+            local_idxs = lengths[:,None] - 1 - torch.arange(num_local_tokens, dtype=lengths.dtype, device=lengths.device)[None,:]
+            local_idxs.clamp_min_(0)
+            logits.scatter_(dim=1, index=local_idxs, value=float('inf'))
         # NOTE(dark): if fused, we return a transformed page table directly
         return fast_topk_transform_fused(
             score=logits,
@@ -199,8 +201,8 @@ class DpskSparseAttnBackend(AttentionBackend):
         assert isinstance(model_runner.page_size, int)
         self.real_page_size = model_runner.page_size
         self.num_splits = 0 # not model_runner.server_args.enable_deterministic_inference
-        self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
-        assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
+        self.use_dsa = is_dsa(model_runner.model_config.hf_config)
+        assert self.use_dsa, "NSA backend only supports DeepSeek NSA"
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )

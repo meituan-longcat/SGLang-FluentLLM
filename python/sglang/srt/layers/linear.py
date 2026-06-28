@@ -12,8 +12,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     split_tensor_along_last_dim,
-    tensor_model_parallel_all_gather,
-    tensor_model_parallel_all_reduce,
     get_tp_group,
 )
 from sglang.srt.layers.parameter import (
@@ -31,6 +29,7 @@ from sglang.srt.utils import set_weight_attrs
 
 from sglang.srt.utils import is_npu
 from sglang.srt.env import global_server_args_dict
+from sglang.srt.distributed import GroupCoordinator
 
 __is_npu__ = is_npu()
 if __is_npu__:
@@ -102,6 +101,19 @@ def adjust_scalar_to_fused_array(param, loaded_weight, shard_id):
     return param[shard_id], loaded_weight
 
 
+def weight_loader_shard(param: torch.nn.Parameter, loaded_weight: torch.Tensor, shard_id=0):
+    rank_id = getattr(param, "rank_id", 0)
+    rank_size = getattr(param, "rank_size", 1)
+    shard_dim = getattr(param, "shard_dim", 0)
+    if rank_size > 1:
+        shard_size = param.data.shape[shard_dim]
+        loaded_weight = loaded_weight.narrow(
+            shard_dim, rank_id * shard_size, shard_size
+        )
+    assert param.data.shape == loaded_weight.shape
+    param.data.copy_(loaded_weight)
+
+
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
 
@@ -124,6 +136,8 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        enable_weight_transpsoe: bool = False,
+        enable_weight_nz: bool = False,
         prefix: str = "",
     ):
         super().__init__(
@@ -135,6 +149,8 @@ class ReplicatedLinear(LinearBase):
             prefix=prefix,
         )
 
+        self.enable_weight_transpsoe = enable_weight_transpsoe
+        self.enable_weight_nz = enable_weight_nz
         # All the linear layer supports quant method.
         assert self.quant_method is not None
         self.quant_method.create_weights(
@@ -184,6 +200,8 @@ class ReplicatedLinear(LinearBase):
             # Note: block_scale is not None means flashinfer reduce-scatter fusion is used for fp8 block quant
             # in this case, the input_ is already quantized to a fp8 tensor
             output = self.quant_method.apply(self, x, bias, block_scale, output_dtype)
+        elif self.enable_weight_transpsoe:
+            output = self.quant_method.apply(self, x, bias, enable_weight_transpsoe=True)
         else:
             output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
@@ -195,6 +213,11 @@ class ReplicatedLinear(LinearBase):
         s += f", bias={self.bias is not None}"
         return s
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self.enable_weight_transpsoe:
+            self.weight.data = self.weight.T.contiguous()
+        if __is_npu__ and self.enable_weight_nz:
+            self.weight.data = torch_npu.npu_format_cast(self.weight.data.contiguous(), 29)
 
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
@@ -227,34 +250,45 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = True,
         gather_output: bool = False,
         skip_bias_add: bool = False,
+        enable_weight_transpsoe: bool = False,
+        enable_weight_nz: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         output_sizes: Optional[List[int]] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        outside_tp_group: Optional[GroupCoordinator] = None,
+        disable_parallel: bool = False
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
-
+        self.enable_weight_transpsoe = enable_weight_transpsoe
+        self.enable_weight_nz = enable_weight_nz
         self.gather_output = gather_output
         self.use_presharded_weights = use_presharded_weights
 
         # Divide the weight matrix along the last dimension.
-        if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
-        if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank, self.tp_size = tp_rank, tp_size
+        if outside_tp_group is not None:
+            self.tp_rank = outside_tp_group.rank_in_group
+            self.tp_size = outside_tp_group.world_size
+            self.tp_group = outside_tp_group
+        elif disable_parallel:
+            self.tp_rank = 0
+            self.tp_size = 1
+            self.tp_group = None
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group()
+
         assert self.quant_method is not None
-        self.output_size_per_partition = divide(self.output_size, tp_size)
+        self.output_size_per_partition = divide(self.output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = [
-                divide(output_size, tp_size) for output_size in self.output_sizes
+                divide(output_size, self.tp_size) for output_size in self.output_sizes
             ]
 
         if output_sizes is None:
@@ -286,6 +320,12 @@ class ColumnParallelLinear(LinearBase):
             )
         else:
             self.register_parameter("bias", None)
+        if global_server_args_dict['npu_smooth_quant'] and quant_config is not None:
+            self.register_parameter('smooth_scale',
+                    Parameter(torch.ones((input_size,), device=torch.npu.current_device(), dtype=torch.float32,),
+                              requires_grad=False)
+                    )
+            set_weight_attrs(self.smooth_scale, {"weight_loader": weight_loader_shard})
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
@@ -337,12 +377,15 @@ class ColumnParallelLinear(LinearBase):
         if block_scale is not None:
             # Note: block_scale is not None means flashinfer all-reduce fusion is used for fp8 block quant
             # in this case, the input_ is already quantized to a fp8 tensor
+            assert not __is_npu__
             output_parallel = self.quant_method.apply(self, input_, bias, block_scale, output_dtype)
+        elif self.enable_weight_transpsoe:
+            output_parallel = self.quant_method.apply(self, input_, bias, enable_weight_transpsoe=True)
         else:
             output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
-            output = tensor_model_parallel_all_gather(output_parallel)
+            output = self.tp_group.all_gather(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -355,6 +398,12 @@ class ColumnParallelLinear(LinearBase):
         s += f", tp_size={self.tp_size}"
         s += f", gather_output={self.gather_output}"
         return s
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self.enable_weight_transpsoe:
+            self.weight.data = self.weight.T.contiguous()
+        if __is_npu__ and self.enable_weight_nz:
+            self.weight.data = torch_npu.npu_format_cast(self.weight.contiguous(), 29)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -387,20 +436,32 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         bias: bool = True,
         gather_output: bool = False,
         skip_bias_add: bool = False,
+        enable_weight_transpsoe: bool = False,
+        enable_weight_nz: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        outside_tp_group: Optional[GroupCoordinator] = None,
+        disable_parallel: bool = False
     ):
         self.output_sizes = output_sizes
-        if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
-        if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank, self.tp_size = tp_rank, tp_size
-        assert all(output_size % tp_size == 0 for output_size in output_sizes)
+
+        if outside_tp_group is not None:
+            self.tp_rank = outside_tp_group.rank_in_group
+            self.tp_size = outside_tp_group.world_size
+            self.tp_group = outside_tp_group
+        elif disable_parallel:
+            self.tp_rank = 0
+            self.tp_size = 1
+            self.tp_group = None
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group()
+
+
+        assert all(output_size % self.tp_size == 0 for output_size in output_sizes)
         self.use_presharded_weights = use_presharded_weights
         super().__init__(
             input_size=input_size,
@@ -408,11 +469,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             bias=bias,
             gather_output=gather_output,
             skip_bias_add=skip_bias_add,
+            enable_weight_transpsoe=enable_weight_transpsoe,
+            enable_weight_nz=enable_weight_nz,
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
+            outside_tp_group=outside_tp_group,
+            disable_parallel=disable_parallel,
             use_presharded_weights=use_presharded_weights,
         )
         self.prefix = prefix
@@ -596,10 +659,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             use_presharded_weights=self.use_presharded_weights,
         )
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if __is_npu__:
-            if global_server_args_dict["npu_enable_weight_nz"]:
-                self.weight.data = torch_npu.npu_format_cast(self.weight.contiguous(), 29)
 
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -639,9 +698,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
+        outside_tp_group: Optional[GroupCoordinator] = None,
+        disable_parallel: bool = False
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -650,26 +709,35 @@ class QKVParallelLinear(ColumnParallelLinear):
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
-        if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
-        if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank, self.tp_size = tp_rank, tp_size
-        self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+
+        if outside_tp_group is not None:
+            self.tp_rank = outside_tp_group.rank_in_group
+            self.tp_size = outside_tp_group.world_size
+            self.tp_group = outside_tp_group
+        elif disable_parallel:
+            self.tp_rank = 0
+            self.tp_size = 1
+            self.tp_group = None
         else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group()
+
+        self.num_heads = divide(self.total_num_heads, self.tp_size)
+        if self.tp_size >= self.total_num_kv_heads:
+            self.num_kv_heads = 1
+            self.num_kv_head_replicas = divide(self.tp_size, self.total_num_kv_heads)
+        else:
+            self.num_kv_heads = divide(self.total_num_kv_heads, self.tp_size)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
         output_size = (
-            (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
+            (self.num_heads + 2 * self.num_kv_heads) * self.tp_size * self.head_size
         )
         self.output_sizes = [
-            self.num_heads * self.head_size * tp_size,  # q_proj
-            self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj
+            self.num_heads * self.head_size * self.tp_size,  # q_proj
+            self.num_kv_heads * self.head_size * self.tp_size,  # k_proj
+            self.num_kv_heads * self.head_size * self.tp_size,  # v_proj
         ]
         self.use_presharded_weights = load_presharded_attn
 
@@ -682,9 +750,9 @@ class QKVParallelLinear(ColumnParallelLinear):
             params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=prefix,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
             use_presharded_weights=self.use_presharded_weights,
+            outside_tp_group=outside_tp_group,
+            disable_parallel=disable_parallel
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
@@ -993,27 +1061,38 @@ class RowParallelLinear(LinearBase):
         bias: bool = True,
         input_is_parallel: bool = True,
         skip_bias_add: bool = False,
+        enable_weight_transpsoe: bool = False,
+        enable_weight_nz: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        tp_rank: Optional[int] = None,
-        tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        outside_tp_group: Optional[GroupCoordinator] = None,
+        disable_parallel: bool = False
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
-
+        self.enable_weight_transpsoe = enable_weight_transpsoe
+        self.enable_weight_nz = enable_weight_nz
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
         # Divide the weight matrix along the last dimension.
-        if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
-        if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
-        self.tp_rank, self.tp_size = tp_rank, tp_size
+        if outside_tp_group is not None:
+            self.tp_rank = outside_tp_group.rank_in_group
+            self.tp_size = outside_tp_group.world_size
+            self.tp_group = outside_tp_group
+        elif disable_parallel:
+            self.tp_rank = 0
+            self.tp_size = 1
+            self.tp_group = None
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_group = get_tp_group()
+
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
@@ -1043,6 +1122,18 @@ class RowParallelLinear(LinearBase):
             )
         else:
             self.register_parameter("bias", None)
+        if global_server_args_dict['npu_smooth_quant'] and quant_config is not None:
+            self.register_parameter('smooth_scale',
+                    Parameter(torch.ones((input_size // self.tp_size,), device=torch.npu.current_device(),
+                                         dtype=torch.float32,),
+                              requires_grad=False)
+                    )
+            load_params = {
+                "rank_id": self.tp_rank,
+                "rank_size": self.tp_size,
+                "weight_loader": weight_loader_shard,
+            }
+            set_weight_attrs(self.smooth_scale, load_params)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         input_dim = getattr(param, "input_dim", None)
@@ -1090,29 +1181,12 @@ class RowParallelLinear(LinearBase):
             param.load_row_parallel_weight(loaded_weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if __is_npu__:
-            use_mc2 = global_server_args_dict["npu_enable_mc2"] and __is_npu__ and isinstance(self.quant_method, UnquantizedLinearMethod) and self.reduce_results and self.tp_size > 1
-            if use_mc2:
-                self.weight.data = self.weight.T.contiguous()
-            if global_server_args_dict["npu_enable_weight_nz"]:
-                self.weight.data = torch_npu.npu_format_cast(self.weight.contiguous(), 29)
+        if self.enable_weight_transpsoe:
+            self.weight.data = self.weight.T.contiguous()
+        if __is_npu__ and global_server_args_dict["npu_enable_weight_nz"]:
+            self.weight.data = torch_npu.npu_format_cast(self.weight.contiguous(), 29)
 
-    def npu_forward_mc2(self, input, bias):
-        mc2_group = get_tp_group().device_group
-        hcom_info = mc2_group._get_backend(torch.device("npu")).get_hccl_comm_name(torch.distributed.get_rank(mc2_group))
-        output = torch_npu.npu_mm_all_reduce_base(x1=input,
-                                                      x2=self.weight,
-                                                      hcom=hcom_info,
-                                                      reduce_op="sum",
-                                                      bias=bias,
-                                                      #antiquant_scale=antiquant_scale,
-                                                      #antiquant_offset=antiquant_offset,
-                                                      #x3=x3,
-                                                      #dequant_scale=dequant_scale
-                                                      )
-        return output
-
-    def forward(self, input_, scale = None):
+    def forward(self, input_, scale = None, force_skip_reduce_results=False):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1126,19 +1200,18 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        use_mc2 = global_server_args_dict["npu_enable_mc2"] and __is_npu__ and isinstance(self.quant_method, UnquantizedLinearMethod) and self.reduce_results and self.tp_size > 1
-        if use_mc2:
-            output = self.npu_forward_mc2(input_parallel, bias_)
+        if scale is not None:
+            # TODO: dtype
+            assert not __is_npu__
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_, scale, torch.bfloat16)
+        elif self.enable_weight_transpsoe:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_, enable_weight_transpsoe=True)
         else:
-            if scale is not None:
-                # TODO: dtype
-                output_parallel = self.quant_method.apply(self, input_parallel, bias_, scale, torch.bfloat16)
-            else:
-                output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
-            if self.reduce_results and self.tp_size > 1:
-                output = tensor_model_parallel_all_reduce(output_parallel)
-            else:
-                output = output_parallel
+            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        if not force_skip_reduce_results and self.reduce_results and self.tp_size > 1:
+            output = self.tp_group.all_reduce(output_parallel)
+        else:
+            output = output_parallel
 
         output_bias = self.bias if self.skip_bias_add else None
 

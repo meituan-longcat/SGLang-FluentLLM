@@ -179,7 +179,7 @@ class CompletionRequest(BaseModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
-    stream_options: Optional[StreamOptions] = None
+    stream_options: Optional[StreamOptions] = StreamOptions()
     suffix: Optional[str] = None
     temperature: float = 1.0
     top_p: float = 1.0
@@ -207,6 +207,15 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
+
+    @field_validator("n")
+    @classmethod
+    def validate_n_not_greater_than_one(cls, v):
+        if v is not None and v > 1:
+            raise ValueError(
+                "n > 1 is not supported currently. Please set n=1 or omit this parameter."
+            )
+        return v
 
     @field_validator("max_tokens")
     @classmethod
@@ -444,6 +453,15 @@ class ChatCompletionRequest(BaseModel):
         "result in faster responses and fewer tokens used on reasoning in a response. "
         "Currently only supported for OpenAI models.",
     )
+
+    @field_validator("n")
+    @classmethod
+    def validate_n_not_greater_than_one(cls, v):
+        if v is not None and v > 1:
+            raise ValueError(
+                "n > 1 is not supported currently. Please set n=1 or omit this parameter."
+            )
+        return v
 
     @model_validator(mode="before")
     @classmethod

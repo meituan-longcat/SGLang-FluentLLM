@@ -64,7 +64,8 @@ class HiRadixCache(RadixCache):
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.enable_storage = server_args.hicache_storage_backend is not None
-        self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        # tmp stop storage metrics
+        self.enable_storage_metrics = None #self.enable_storage and params.enable_metrics 
 
         (
             extra_config,
@@ -123,11 +124,6 @@ class HiRadixCache(RadixCache):
 
         self.device = self.token_to_kv_pool.device
         self.is_decode = False 
-        self.metrics_collector = None  # Will be set if metrics are enabled
-        if params.enable_metrics:
-            from sglang.srt.metrics.collector import CacheMetricsCollector
-            self.metrics_collector = CacheMetricsCollector()
-
         super().__init__(params=params)
 
     def _parse_storage_backend_extra_config(
@@ -328,6 +324,7 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def evict(self, num_pages: int, evict_callback: Callable = None):
+        logger.debug(f"[evict] start {num_pages=} ")
         start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
@@ -370,6 +367,7 @@ class HiRadixCache(RadixCache):
                 self._evict_backuped(node)
 
         self.cache_controller.mem_pool_device_allocator.free_group_end()
+        logger.debug(f"[evict] end {num_pages=} {num_evicted}")
         return num_evicted
 
     def _evict_backuped(self, node: TreeNode):
@@ -470,11 +468,13 @@ class HiRadixCache(RadixCache):
         # Allocate device memory for loading
         # Use the last_hit_node's req_pool_idx if available, otherwise use 0
         req_pool_idx = last_hit_node.req_pool_idx if hasattr(last_hit_node, 'req_pool_idx') and last_hit_node.req_pool_idx is not None else 0
-        device_token_indices = self.cache_controller.mem_pool_device_allocator.alloc(req_pool_idx, num_tokens)
+        # Get the already allocated length from req_to_token_pool
+        alloced_len = self.req_to_token_pool.alloced_lens[req_pool_idx].item()
+        device_token_indices = self.cache_controller.mem_pool_device_allocator.alloc(req_pool_idx, num_tokens, alloced_len)
         
         if device_token_indices is None:
             self.evict(num_pages)
-            device_token_indices = self.cache_controller.mem_pool_device_allocator.alloc(req_pool_idx, num_tokens)
+            device_token_indices = self.cache_controller.mem_pool_device_allocator.alloc(req_pool_idx, num_tokens, alloced_len)
         
         self.dec_lock_ref(ancester_node)
         if device_token_indices is None:
@@ -502,14 +502,7 @@ class HiRadixCache(RadixCache):
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
 
-        if self.metrics_collector is not None:
-            self.metrics_collector.observe_load_back_duration(
-                time.perf_counter() - start_time
-            )
-            # device_indices is in pages, convert to tokens for metrics
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices) * self.page_size)
-
-        return device_indices
+        return device_indices.to(self.device)
 
     def init_load_back(
         self,
@@ -688,7 +681,7 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"{req_id}Prefetch completed with {completed_tokens} tokens")
+        logger.debug(f"{req_id} Prefetch completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:

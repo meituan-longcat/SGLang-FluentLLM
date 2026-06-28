@@ -25,8 +25,11 @@ from torch import nn
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
-    get_tensor_model_parallel_group
+    get_tensor_model_parallel_group,
+    GroupCoordinator,
+    get_lm_head_tp_group, get_attn_tp_group,
 )
+
 from sglang.srt.layers.dp_attention import (
     dp_gather,
     dp_scatter,
@@ -44,7 +47,10 @@ from sglang.srt.utils import dump_to_file
 from sglang.srt.utils import (is_npu)
 
 from sglang.srt.env import global_server_args_dict
-from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allgather_vocab
+
+__is_npu__ = is_npu()
+if not __is_npu__:
+    from sglang.srt.layers.flashinfer_comm_fusion import flashinfer_allgather_vocab
 
 logger = get_colorful_logger(__name__)
 
@@ -187,6 +193,50 @@ class LogitsMetadata:
         self.dp_local_num_tokens = dp_local_num_tokens
         self.gathered_buffer = gathered_buffer
 
+def lm_head_tp_allgather(hidden_states, lm_head_tp_group: GroupCoordinator, padding_num=0):
+    hidden_states = hidden_states.view(-1, hidden_states.size(-1))
+    if padding_num > 0:
+        padding = torch.zeros(padding_num, hidden_states.shape[-1], device=hidden_states.device,
+                              dtype=hidden_states.dtype)
+        x = torch.cat([hidden_states, padding], dim=0)
+    else:
+        x = hidden_states
+    if get_attn_tp_group().world_size > 1:
+        split_size=x.shape[0]//get_attn_tp_group().world_size
+        start=split_size*get_attn_tp_group().rank_in_group
+        end=start+split_size
+        x=x[start:end]
+    x = lm_head_tp_group.all_gather(x, dim=0)
+    return x
+
+def lm_head_tp_all2all(logits: torch.Tensor, lm_head_tp_group: GroupCoordinator, global_sp_num_tokens=None):
+    all_seq, voc_local = logits.size()
+    if global_sp_num_tokens is None:
+        local_seq = all_seq // lm_head_tp_group.world_size
+        all_voc = voc_local * lm_head_tp_group.world_size
+        all_to_all_out = torch.empty([local_seq * all_voc], dtype=logits.dtype, device=logits.device)
+        torch.distributed.all_to_all_single(all_to_all_out, logits.reshape(-1), group=lm_head_tp_group.device_group)
+        logits_dp =  all_to_all_out.view(
+            lm_head_tp_group.world_size, local_seq, voc_local).transpose(0, 1).reshape(local_seq, all_voc)
+        return logits_dp
+    else:
+        local_sp_num_tokens = lm_head_tp_group.get_local_sp_token_num(global_sp_num_tokens)
+        input_splits=[s*voc_local for s in local_sp_num_tokens]
+        local_seq=local_sp_num_tokens[lm_head_tp_group.rank_in_group]
+        output_splits=[local_seq*voc_local]*lm_head_tp_group.world_size
+        all_voc=voc_local*lm_head_tp_group.world_size
+        output_buffer=torch.empty([local_seq*all_voc], dtype=logits.dtype, device=logits.device)
+        torch.distributed.all_to_all_single(
+            output_buffer,
+            logits.reshape(-1),
+            output_splits,
+            input_splits,
+            group=lm_head_tp_group.device_group
+        )
+
+        return output_buffer.view(lm_head_tp_group.world_size, local_seq, voc_local) \
+            .transpose(0, 1) \
+            .reshape(local_seq, all_voc)
 
 class LogitsProcessor(nn.Module):
     def __init__(
@@ -195,12 +245,20 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.logit_scale = logit_scale
-        self.do_tensor_parallel_all_gather = (
-            not skip_all_gather and get_tensor_model_parallel_world_size() > 1
-        )
-        self.do_tensor_parallel_all_gather_dp_attn = (
-            self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
-        )
+        if not is_npu():
+            self.do_tensor_parallel_all_gather=(
+                not skip_all_gather and get_tensor_model_parallel_world_size()>1
+            )
+            self.do_tensor_parallel_all_gather_dp_attn = (
+                self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
+            )
+        else:
+            self.do_tensor_parallel_all_gather=(
+                not skip_all_gather and get_lm_head_tp_group().world_size>1
+            )
+            self.do_tensor_parallel_all_gather_dp_attn = (
+                self.do_tensor_parallel_all_gather and get_lm_head_tp_group().world_size != get_attn_tp_group().world_size
+            )
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -225,11 +283,10 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
-            spec_info = logits_metadata.spec_info
+            # padded_static_len was not used previously, but it fits the situaiton of DRAFT_EXTEND with padding.
+            # Remove permute here and use padded_static_len to get last_index.
             if logits_metadata.forward_mode.is_draft_extend():
-                hidden_states = hidden_states[spec_info.accept_index]
-                if aux_hidden_states is not None:
-                    aux_hidden_states = [aux_hidden_state[spec_info.accept_index] for aux_hidden_state in aux_hidden_states]
+                logits_metadata.padded_static_len = logits_metadata.spec_info.draft_token_num
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction
@@ -312,6 +369,12 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices, device=pruned_states.device, dtype=torch.int64
             )
 
+        if __is_npu__:
+            # prefetch lm head weight to l2; mm: 100u -> 60u
+            import torch_npu
+            if hasattr(lm_head, "weight"):
+                torch_npu.npu_prefetch(lm_head.weight, pruned_states,
+                               lm_head.weight.numel() * lm_head.weight.element_size())
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head, logits_metadata)
         sampled_logits = (
@@ -427,14 +490,21 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        if self.do_tensor_parallel_all_gather_dp_attn:
-            logits_metadata.compute_dp_attention_metadata(hidden_states)
-            hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
-                hidden_states.clone(),
-            )
-            dp_gather(hidden_states, local_hidden_states, logits_metadata, "embedding")
 
+        if not is_npu():
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                logits_metadata.compute_dp_attention_metadata(hidden_states)
+                hidden_states, local_hidden_states = (
+                    logits_metadata.gathered_buffer,
+                    hidden_states.clone(),
+                )
+                dp_gather(hidden_states, local_hidden_states, logits_metadata, "embedding")
+        else:
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                padding_num=0
+                if get_attn_tp_group().world_size>1 and hidden_states.shape[0]%get_attn_tp_group().world_size!=0:
+                    padding_num=get_attn_tp_group().world_size-hidden_states.shape[0]%get_attn_tp_group().world_size
+                hidden_states=lm_head_tp_allgather(hidden_states, get_lm_head_tp_group(), padding_num=padding_num)
         if hasattr(lm_head, "weight"):
             logits = torch.matmul(
                 hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
@@ -446,27 +516,37 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self.do_tensor_parallel_all_gather:
-            if logits.shape[0] < global_server_args_dict["flashinfer_comm_max_num_tokens"]:
-                logits = flashinfer_allgather_vocab(
-                    logits,
-                    group=get_tensor_model_parallel_group(),
-                    max_tokens_num=global_server_args_dict["flashinfer_comm_max_num_tokens"],
-                    local_vocab_size=logits.shape[-1]
-                )
-            else:
-                logits = tensor_model_parallel_all_gather(logits)
+        # only gpu or npu with not attn tp, need allgather
+        if not is_npu():
+            if self.do_tensor_parallel_all_gather:
+                if logits.shape[0] < global_server_args_dict["flashinfer_comm_max_num_tokens"]:
+                    logits = flashinfer_allgather_vocab(
+                        logits,
+                        group=get_tensor_model_parallel_group(),
+                        max_tokens_num=global_server_args_dict["flashinfer_comm_max_num_tokens"],
+                        local_vocab_size=logits.shape[-1]
+                    )
+                else:
+                    logits = tensor_model_parallel_all_gather(logits)
 
-        if self.do_tensor_parallel_all_gather_dp_attn:
-            logits, global_logits = (
-                torch.empty(
-                    (local_hidden_states.shape[0], logits.shape[1]),
-                    device=logits.device,
-                    dtype=logits.dtype,
-                ),
-                logits,
-            )
-            dp_scatter(logits, global_logits, logits_metadata)
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                logits, global_logits=(
+                    torch.empty(
+                        (local_hidden_states.shape[0], logits.shape[1]),
+                        device=logits.device,
+                        dtype=logits.dtype,
+                    ),
+                    logits,
+                )
+                dp_scatter(logits, global_logits, logits_metadata)
+        else:
+            if self.do_tensor_parallel_all_gather_dp_attn:
+                logits = lm_head_tp_all2all(logits, get_lm_head_tp_group())
+                if get_attn_tp_group().world_size > 1:
+                    logits = get_attn_tp_group().all_gather(logits, dim=0)
+                    logits = logits[:logits.shape[0]-padding_num]
+            elif self.do_tensor_parallel_all_gather:
+                logits = get_lm_head_tp_group().all_gather(logits)
 
         logits = logits[:, : self.config.vocab_size].float()
 
@@ -610,7 +690,7 @@ def fused_softcap_npu(full_logits, final_logit_softcapping):
     return x
 
 def fused_softcap_generic(full_logits, final_logit_softcapping):
-    if is_npu():
+    if __is_npu__:
         return fused_softcap_npu(full_logits, final_logit_softcapping)
     else:
         return fused_softcap(full_logits, final_logit_softcapping)

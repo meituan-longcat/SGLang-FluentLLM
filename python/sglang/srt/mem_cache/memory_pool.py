@@ -14,6 +14,7 @@ limitations under the License.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 from contextlib import contextmanager
@@ -30,31 +31,50 @@ BaseTokenToKVPool maps a token location to its KV cache data.
 import threading
 from enum import IntEnum
 from functools import wraps
+import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import numpy.typing as npt
 import psutil
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from sglang.srt.disaggregation.utils import PageTransferMetadata
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import is_npu, is_sm90_supported
 if not is_npu():
     if is_sm90_supported():
         from flash_mla_fp8 import quantize_and_cache_k, dequantize_ckv_fused_indexed
 from sglang.srt.utils import debug_timing, get_colorful_logger, get_compiler_backend
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.distributed import get_attn_tp_group
+
+from sglang.srt.constants import (
+    GPU_MEMORY_ALL_TYPES,
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.req import Req
 
+from sglang.srt.env import ENV
+
+
 logger = get_colorful_logger(__name__)
+
+__is_npu__ = is_npu()
 
 GB = 1024 * 1024 * 1024
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
-    if isinstance(t, list):
+def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor], tuple]):
+    if isinstance(t, (list, tuple)):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
 
@@ -84,7 +104,7 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
@@ -161,6 +181,8 @@ class BaseTokenToKVPool:
         max_context_len: int,
         page_size: int,
         rank: int,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
         self.dtype = dtype
         self.rank = rank
@@ -174,10 +196,13 @@ class BaseTokenToKVPool:
         self.device = device
         self.offload_chunk_page_num = 1024
         self.token_slot_refs = None
-        
+
+        self.max_batch_size = max_batch_size
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
-        logger.info(f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}")
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        logger.info(f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank} {self.start_layer=} {self.end_layer=}")
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
@@ -210,7 +235,7 @@ class BaseTokenToKVPool:
         self, kv_cache_cpu: torch.Tensor, page_indices: list[int]
     ) -> None:
         raise NotImplementedError()
-    
+
     # for pd disaggregation
     def get_contiguous_buf_infos(self):
         raise NotImplementedError()
@@ -218,6 +243,18 @@ class BaseTokenToKVPool:
     # for pd disaggregation
     def get_layerwise_buf_info_offsets(self, start_idx=0):
         raise NotImplementedError()
+
+    def get_page_transfer_metadata(
+        self, page_indices: Union[npt.NDArray[np.int64], torch.Tensor]
+    ) -> PageTransferMetadata:
+        if isinstance(page_indices, torch.Tensor):
+            page_indices = page_indices.detach().cpu().numpy()
+        page_indices = np.asarray(page_indices, dtype=np.int64)
+        return PageTransferMetadata(
+            indices_are_local=False,
+            page_transfer_mask=np.ones(page_indices.shape[0], dtype=np.bool_),
+            page_local_indices=page_indices,
+        )
 
 
 class MHATokenToKVPool(BaseTokenToKVPool):
@@ -270,7 +307,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         return 2 * self.page_size * self.layer_num * self.head_num * self.head_dim * torch._utils._element_size(self.dtype)
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             # [size, head_num, head_dim] for each layer
             # The padded page 0 is used for writing dummy outputs from padded tokens.
             logger.info(f"_create_buffers {self.size=}, {self.page_size=}, {self.head_num=}, {self.head_dim=}, {self.layer_num=}")
@@ -514,6 +551,91 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self.v_buffer[layer_id][loc] = cache_v
 
 
+class NPUMHATokenToKVPool(MHATokenToKVPool):
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region():
+            # [size, head_num, head_dim] for each layer
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            # Continuous memory improves the efficiency of NPU MHA`s transmission backend,
+            # while other backends remain unchanged.
+            logger.info(f"NPUMHA _create_buffers {self.size=}, {self.page_size=}, {self.head_num=}, {self.head_dim=}, {self.layer_num=}")
+            block_num = self.size // self.page_size + 1
+
+            self.k_buffer = [
+                torch.empty(
+                    (block_num, self.head_num * self.head_dim // 16, self.page_size, 16),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_buffer = [
+                torch.empty(
+                    (block_num, self.head_num * self.head_dim // 16, self.page_size, 16),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError("NPU KV buffer内存布局和GPU不同，暂未实现HiCache")
+
+    # for disagg
+    def get_contiguous_buf_infos(self):
+        kv_data_ptrs = [
+            self.get_key_buffer(i).data_ptr() for i in range(self.layer_num)
+        ] + [
+            self.get_value_buffer(i).data_ptr() for i in range(self.layer_num)
+        ]
+        kv_data_lens = [
+            self.get_key_buffer(i).nbytes for i in range(self.layer_num)
+        ] + [
+            self.get_value_buffer(i).nbytes for i in range(self.layer_num)
+        ]
+        kv_item_lens = [
+            self.get_key_buffer(i)[0].nbytes for i in range(self.layer_num)
+        ] + [
+            self.get_value_buffer(i)[0].nbytes for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ):
+        layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        import torch_npu
+
+        torch_npu.npu_scatter_pa_kv_cache(
+            key=cache_k,
+            value=cache_v,
+            key_cache=self.k_buffer[layer_id],
+            value_cache=self.v_buffer[layer_id],
+            slot_mapping=loc,
+        )
+
 # This compiled version is slower in the unit test
 # python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -597,7 +719,7 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         quant_method: str,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
-        layer_num: int,
+        layer_num: int, # valid layer num
         device: str,
         enable_memory_saver: bool,
         max_batch_size: int,
@@ -607,9 +729,11 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         use_dsa: bool = False,
         enable_kv_cache_copy: bool = False,
         enable_alt_stream: bool = True,
+        start_layer: Optional[int] = None, # pp's start
+        end_layer: Optional[int] = None, # pp's end
     ):
         super().__init__(
-            size, dtype, device, max_batch_size, max_context_len, page_size, rank
+            size, dtype, device, max_batch_size, max_context_len, page_size, rank, start_layer, end_layer
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method
@@ -630,9 +754,11 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         )
         self.page_size_bytes = self._get_page_size_bytes()
 
-        with memory_saver_adapter.region():
+        with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             # The padded page 0 is used for writing dummy outputs from padded tokens.
             if self.quant_method == "per_token_head":
+                if ENV.npu_enable_mla_split_kv_kr:
+                    raise RuntimeError("per_token_head is not implemented when enable npu_enable_mla_split_kv_kr.")
                 self.kv_buffer = [
                     (
                         torch.empty((self.size + self.page_size, 1, kv_lora_rank),
@@ -648,15 +774,23 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                     for _ in range(layer_num)
                 ]
             else:
-                self.kv_buffer = [
-                    torch.empty(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
-                        dtype=self.store_dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
-        
+                if ENV.npu_enable_mla_split_kv_kr:
+                    assert not (self.use_dsa and self.nsa_kv_cache_store_fp8)
+                    self.kv_buffer = []
+                    block_num = (self.size + self.page_size)//self.page_size
+                    for _ in range(layer_num):
+                        self.kv_buffer.append(torch.zeros((block_num, self.page_size, 1, kv_lora_rank), dtype=self.store_dtype, device=device).contiguous())
+                        self.kv_buffer.append(torch.zeros((block_num, self.page_size, 1, qk_rope_head_dim), dtype=self.store_dtype, device=device).contiguous())
+                else:
+                    self.kv_buffer = [
+                        torch.ones(
+                            (self.size + self.page_size, 1, self.kv_cache_dim),
+                            dtype=self.store_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
+
         # Calculate data pointers and strides for all buffers
         all_buffers = []
         if self.quant_method == "per_token_head":
@@ -667,20 +801,21 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         else:
             # kv_buffer is a list of single tensors
             all_buffers = self.kv_buffer
-        
-        self.data_ptrs = torch.tensor(
-            [buf.data_ptr() for buf in all_buffers],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.data_strides = torch.tensor(
-            [
-                np.prod(buf.shape[1:]) * buf.dtype.itemsize
-                for buf in all_buffers
-            ],
-            device=self.device,
-        )
-        
+
+        if not ENV.npu_enable_mla_split_kv_kr:
+            self.data_ptrs = torch.tensor(
+                [buf.data_ptr() for buf in all_buffers],
+                dtype=torch.uint64,
+                device=self.device,
+            )
+            self.data_strides = torch.tensor(
+                [
+                    np.prod(buf.shape[1:]) * buf.dtype.itemsize
+                    for buf in all_buffers
+                ],
+                device=self.device,
+            )
+
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = (
             self.device_module.Stream() if torch.cuda.is_available() and enable_alt_stream else None
@@ -690,6 +825,24 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
+
+        kv_size = sum(get_tensor_size_bytes(buf) for buf in all_buffers)
+
+        logger.info(f"KV Cache is allocated. KV size: {kv_size / GB:.2f} GB.")
+        if self.quant_method == "per_token_head":
+            # kv_buffer contains tuples of 3 tensors
+            first_buffer = self.kv_buffer[0]
+            device_info = first_buffer[0].device
+            shape_info = f"({first_buffer[0].shape}, {first_buffer[1].shape}, {first_buffer[2].shape})"
+        elif ENV.npu_enable_mla_split_kv_kr:
+            first_kv_buffer, first_kr_buffer, *_ = self.kv_buffer
+            device_info = first_kv_buffer.device
+            shape_info = f"({first_kv_buffer.shape}, {first_kr_buffer.shape})"
+        else:
+            # kv_buffer contains single tensors
+            device_info = self.kv_buffer[-1].device
+            shape_info = self.kv_buffer[0].shape
+        logger.info(f"MLATokenToKVPool: {len(self.kv_buffer)=} device={device_info} shape={shape_info} {self.size=} {self.page_size=} {self.kv_cache_dim=} {self.store_dtype=}")
 
     def _get_page_size_bytes(self):
         if self.quant_method ==  "per_token_head":
@@ -701,6 +854,8 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         return self.page_size * self.layer_num * dim_size_bytes
 
     def _init_kv_copy_and_warmup(self):
+        if ENV.npu_enable_mla_split_kv_kr:
+            raise NotImplementedError("mla_split_kv_kr模式KV buffer内存布局不同，暂未实现HiCache")
         # Heuristics for KV copy tiling
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
@@ -744,14 +899,16 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if ENV.npu_enable_mla_split_kv_kr:
+            raise NotImplementedError("mla_split_kv_kr模式KV buffer内存布局不同，暂未实现HiCache")
         if self._kv_copy_config is None:
             # Native implementation for MLA
             if tgt_loc.numel() == 0:
                 return
-            
+
             tgt_loc_flat = tgt_loc.view(-1).long()
             src_loc_flat = src_loc.view(-1).long()
-            
+
             if self.quant_method == "per_token_head":
                 # kv_buffer is a list of tuples
                 for layer_buffers in self.kv_buffer:
@@ -782,29 +939,45 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         for kv_cache in self.kv_buffer:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
         return kv_size_bytes
-    
+
     # for disagg
     def get_contiguous_buf_infos(self):
         if self.quant_method ==  "per_token_head":
+            if ENV.npu_enable_mla_split_kv_kr:
+                raise RuntimeError("per_token_head is not implemented when enable npu_enable_mla_split_kv_kr.")
             kv_data_ptrs = [sub_tuple[i].data_ptr() for i in range(3) for sub_tuple in self.kv_buffer]
             kv_data_lens = [sub_tuple[i].nbytes for i in range(3) for sub_tuple in self.kv_buffer]
             kv_item_lens = [sub_tuple[i][0].nbytes*self.page_size for i in range(3) for sub_tuple in self.kv_buffer]
         else:
             # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
-            kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
-            kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-            kv_item_lens = [
-                self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
-            ]
+            if ENV.npu_enable_mla_split_kv_kr:
+                kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(len(self.kv_buffer))]
+                kv_data_lens = [self.kv_buffer[i].nbytes for i in range(len(self.kv_buffer))]
+                kv_item_lens = [
+                    self.kv_buffer[i][0][0].nbytes * self.page_size for i in range(len(self.kv_buffer))
+                ]
+            else:
+                kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+                kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+                kv_item_lens = [
+                    self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
+                ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_layerwise_buf_info_offsets(self, start_idx=0):
         if self.quant_method == "per_token_head":
             return [[start_idx + i*self.layer_num + layer_id for i in range(3)] for layer_id in range(self.layer_num)]
         else:
-            return [[start_idx + layer_id] for layer_id in range(self.layer_num)]
+            if ENV.npu_enable_mla_split_kv_kr:
+                offsets = [[start_idx + layer_id * 2 + i for i in range(2)] for layer_id in range(self.layer_num)]
+                return offsets
+            else:
+                return [[start_idx + i*self.layer_num + layer_id for i in range(2)] for layer_id in range(self.layer_num)]
 
     def get_key_buffer(self, layer_id: int):
+        layer_id=layer_id-self.start_layer
+        if ENV.npu_enable_mla_split_kv_kr:
+            raise RuntimeError("get_key_buffer is not implemented when enable npu_enable_mla_split_kv_kr.")
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
         if self.quant_method ==  "per_token_head":
@@ -815,6 +988,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             return self.kv_buffer[layer_id]
 
     def get_key_split_contiguous(self, layer_id: int, indices: torch.Tensor):
+        layer_id=layer_id-self.start_layer
+        if ENV.npu_enable_mla_split_kv_kr:
+            raise RuntimeError("get_key_split_contiguous is not implemented when enable npu_enable_mla_split_kv_kr.")
         if self.quant_method ==  "per_token_head":
             k_lora_cache, k_scale_cache, k_rope_cache = self.kv_buffer[layer_id]
             if not is_npu() and is_sm90_supported():
@@ -839,6 +1015,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         return kv_a_normed, k_pe
 
     def get_value_buffer(self, layer_id: int):
+        layer_id=layer_id-self.start_layer
+        if ENV.npu_enable_mla_split_kv_kr:
+            raise RuntimeError("get_value_buffer is not implemented when enable npu_enable_mla_split_kv_kr.")
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id)
         if self.quant_method == "per_token_head":
@@ -849,7 +1028,10 @@ class MLATokenToKVPool(BaseTokenToKVPool):
             return self.kv_buffer[layer_id][..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+        if ENV.npu_enable_mla_split_kv_kr:
+            return self.kv_buffer[(layer_id-self.start_layer)*2], self.kv_buffer[(layer_id-self.start_layer)*2+1]
+        else:
+            return self.get_key_buffer(layer_id-self.start_layer), self.get_value_buffer(layer_id-self.start_layer)
 
     def set_kv_buffer(
         self,
@@ -858,7 +1040,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
-        layer_id = layer.layer_id
+        if ENV.npu_enable_mla_split_kv_kr:
+            raise RuntimeError("set_kv_buffer is not implemented when enable npu_enable_mla_split_kv_kr.")
+        layer_id=layer.layer_id-self.start_layer
         if self.quant_method == "per_token_head":
             if not is_npu() and is_sm90_supported():
                 quantize_and_cache_k(
@@ -879,7 +1063,12 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 self.kv_buffer[layer_id][1][loc] = scale
                 self.kv_buffer[layer_id][2][loc] = k_rope
         else:
-            self.kv_buffer[layer_id][loc] = cache_k
+            if cache_k.dtype != self.dtype:
+                cache_k = cache_k.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                self.kv_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
+            else:
+                self.kv_buffer[layer_id][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -888,7 +1077,9 @@ class MLATokenToKVPool(BaseTokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        layer_id = layer.layer_id
+        if ENV.npu_enable_mla_split_kv_kr:
+            raise RuntimeError("set_mla_kv_buffer is not implemented when enable npu_enable_mla_split_kv_kr.")
+        layer_id = layer.layer_id - self.start_layer
         if self.use_dsa and self.nsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
@@ -928,44 +1119,766 @@ class MLATokenToKVPool(BaseTokenToKVPool):
                 self.kv_buffer[layer_id], loc, cache_k_nope, cache_k_rope
             )
 
+    def sync_device(self):
+        if not __is_npu__:
+            torch.cuda.synchronize()
+        else:
+            torch.npu.synchronize()
+
+    def get_md5(self, kv_cache_cpu):
+        md5_hash=hashlib.md5()
+        for layer_data in kv_cache_cpu:
+            # 遍历每个layer中的chunk
+            for chunk_data in layer_data:
+                # 遍历chunk中的每个tensor
+                for tensor in chunk_data:
+                    # 将tensor数据转换为bytes并更新MD5
+                    tensor_bytes=tensor.view(torch.int8).cpu().numpy().tobytes()
+                    md5_hash.update(tensor_bytes)
+
+        return md5_hash.hexdigest()
+
     def get_cpu_copy(self, token_indices: list[int]) -> torch.Tensor:
-        torch.cuda.synchronize()
+        self.sync_device()
         kv_cache_cpu = []
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
-            for i in range(0, len(token_indices), self.offload_chunk_page_num):
-                chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
-                if self.quant_method == "per_token_head":
-                    kv_cache_cpu[-1].append([
-                        buffer[chunk_indices].to("cpu", non_blocking=True) for buffer in self.kv_buffer[layer_id]
-                    ])
+            if not __is_npu__:
+                for i in range(0, len(token_indices), self.offload_chunk_page_num):
+                    chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
+                    if self.quant_method == "per_token_head":
+                        if ENV.npu_enable_mla_split_kv_kr:
+                            raise RuntimeError("per_token_head is not implemented when enable npu_enable_mla_split_kv_kr.")
+                        kv_cache_cpu[-1].append([
+                            buffer[chunk_indices].to("cpu", non_blocking=True) for buffer in self.kv_buffer[layer_id]
+                        ])
+                    else:
+                        kv_cpu=self.kv_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        )
+                        kv_cache_cpu[-1].append([kv_cpu])
+            else:
+                page_indices = token_indices[::self.page_size] // self.page_size
+                if ENV.npu_enable_mla_split_kv_kr:
+                    kv_cpu1=self.kv_buffer[2*layer_id].view(-1, self.page_size * self.kv_lora_rank)[page_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    kv_cpu2=self.kv_buffer[2*layer_id+1].view(-1, self.page_size * self.qk_rope_head_dim)[page_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    kv_cache_cpu[-1].append([kv_cpu1, kv_cpu2])
                 else:
-                    kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
+                    kv_cpu = self.kv_buffer[layer_id].view(-1, self.page_size * (self.qk_rope_head_dim + self.kv_lora_rank))[page_indices].to(
                         "cpu", non_blocking=True
                     )
                     kv_cache_cpu[-1].append([kv_cpu])
-        torch.cuda.synchronize()
+        self.sync_device()
         return kv_cache_cpu
 
     def load_cpu_copy(
         self, kv_cache_cpu: torch.Tensor, token_indices: list[int]
     ) -> None:
-        torch.cuda.synchronize()
+        # md51 = self.get_md5(kv_cache_cpu)
+
+        self.sync_device()
+        for layer_id in range(self.layer_num):
+            if not __is_npu__:
+                for i in range(0, len(token_indices), self.offload_chunk_page_num):
+                    chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
+                    if self.quant_method == "per_token_head":
+                        if ENV.npu_enable_mla_split_kv_kr:
+                            raise RuntimeError("per_token_head is not implemented when enable npu_enable_mla_split_kv_kr.")
+                        for j in range(3):
+                            t = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][j]
+                            assert t.shape[0] == len(chunk_indices)
+                            self.kv_buffer[layer_id][j][chunk_indices] = t.to(self.kv_buffer[0][0].device, non_blocking=True)
+                    else:
+                        if ENV.npu_enable_mla_split_kv_kr:
+                            kv_cpu1 = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][0]
+                            kv_cpu2 = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][1]
+                            assert kv_cpu1.shape[0] == len(chunk_indices) and kv_cpu2.shape[0] == len(chunk_indices), f"kv_cpu1.shape[0] {kv_cpu1.shape[0]} or kv_cpu2.shape[0] {kv_cpu2.shape[0]} != len(chunk_indices) {len(chunk_indices)}"
+                            kv_chunk1 = kv_cpu1.to(self.kv_buffer[0].device, non_blocking=True)
+                            kv_chunk2 = kv_cpu2.to(self.kv_buffer[0].device, non_blocking=True)
+                            self.kv_buffer[2*layer_id].view(-1, 1, self.kv_lora_rank)[chunk_indices] = kv_chunk1
+                            self.kv_buffer[2*layer_id + 1].view(-1, 1, self.qk_rope_head_dim)[chunk_indices] = kv_chunk2
+                        else:
+                            kv_cpu = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][0]
+                            assert kv_cpu.shape[0] == len(chunk_indices), f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(chunk_indices) {len(chunk_indices)}"
+                            kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
+                            self.kv_buffer[layer_id][chunk_indices] = kv_chunk
+            else:
+                page_indices=token_indices[::self.page_size] // self.page_size
+                if ENV.npu_enable_mla_split_kv_kr:
+                    kv_cpu1 = kv_cache_cpu[layer_id][0][0]
+                    kv_cpu2 = kv_cache_cpu[layer_id][0][1]
+                    assert kv_cpu1.shape[0] == len(page_indices) and kv_cpu2.shape[0] == len(page_indices), f"kv_cpu1.shape[0] {kv_cpu1.shape[0]} or kv_cpu2.shape[0] {kv_cpu2.shape[0]} != len(page_indices) {len(page_indices)}"
+                    kv1 = kv_cpu1.to(self.kv_buffer[0].device, non_blocking=True)
+                    kv2 = kv_cpu2.to(self.kv_buffer[0].device, non_blocking=True)
+                    self.kv_buffer[2*layer_id].view(-1, self.page_size * self.kv_lora_rank)[page_indices]=kv1
+                    self.kv_buffer[2*layer_id+1].view(-1, self.page_size * self.qk_rope_head_dim)[page_indices]=kv2
+                else:
+                    kv_cpu=kv_cache_cpu[layer_id][0][0]
+                    assert kv_cpu.shape[0]==len(page_indices), f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(page_indices) {len(page_indices)}"
+                    kv = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
+                    self.kv_buffer[layer_id].view(-1, self.page_size * (self.kv_lora_rank + self.qk_rope_head_dim))[page_indices]=kv
+
+        self.sync_device()
+
+        # for debug:
+        # kv_cache_cpu = self.get_cpu_copy(token_indices)
+        # md52 = self.get_md5(kv_cache_cpu)
+        # assert md51 == md52, f"md5 mismatch: {md51} vs {md52}"
+
+class L1HalfMixin:
+    def global_page_loc_to_local_mapping(self, pages):
+        """Map global page ids to this rank's local page ids.
+
+        Args:
+            pages: Global page ids (1-based).
+
+        Returns:
+            mask: Boolean mask aligned with pages, True if a page belongs to this rank.
+            new_page_indices: Local page ids (1-based) for pages selected by mask.
+        """
+        reserved_block_num = 1
+        if global_server_args_dict["kvp_size"] > 1:
+            reserved_block_num = 1 + self.max_batch_size
+
+        mask = (pages < reserved_block_num) | (((pages - reserved_block_num) & self.group_mask) == self.kvp_rank)
+        local_pages = pages[mask]
+        if isinstance(pages, torch.Tensor):
+            new_page_indices = torch.where(
+                local_pages < reserved_block_num,
+                0,
+                ((local_pages - reserved_block_num) >> self.group_shift) + reserved_block_num,
+            )
+        else:
+            new_page_indices = np.where(
+                local_pages < reserved_block_num,
+                0,
+                ((local_pages - reserved_block_num) >> self.group_shift) + reserved_block_num,
+            )
+
+        return mask, new_page_indices
+
+    def global_loc_to_local_mapping(
+        self,
+        indices: torch.Tensor,
+    ):
+        """Map global token indices to this rank's local indices and grouping info.
+
+        Args:
+            indices: Global token indices, will be modified in place. Nonlocal tokens will be set to index 0.
+
+        Returns:
+            mask_out: Boolean mask aligned with indices, True if a token belongs to this rank.
+            compact_local_indices: Local indices for tokens selected by mask_out.
+            rank_counts: Token counts per rank, length equals attn_tp_group_size, used in all gather.
+            perm: Stable permutation that groups indices by target rank.
+            inv_perm: Inverse permutation to restore the original order, used to recover batch dimension after all gather.
+        """
+        reserved_block_num = 1
+        if global_server_args_dict["kvp_size"] > 1:
+            reserved_block_num = 1 + self.max_batch_size
+
+        if indices.numel() == 0:
+            empty = torch.empty(0, dtype=indices.dtype, device=indices.device)
+            mask_out = torch.empty(0, dtype=torch.bool, device=indices.device)
+            rank_counts = [0 for _ in range(self.attn_tp_group_size)]
+            perm = torch.empty(0, dtype=torch.int64, device=indices.device)
+            inv_perm = torch.empty(0, dtype=torch.int64, device=indices.device)
+            return mask_out, empty, rank_counts, perm, inv_perm
+
+        pages = indices >> self.page_shift
+        offsets = indices & self.page_mask
+
+        mask_out, new_page_indices = self.global_page_loc_to_local_mapping(pages)
+        local_offsets = offsets[mask_out]
+        compact_local_indices = (new_page_indices << self.page_shift) | local_offsets
+
+        dense_local = indices.clone()
+        dense_local[mask_out] = compact_local_indices
+
+        # nonlocal pages all set to page 0, so don't need to modify logic about set_kv_buffer
+        dense_local.masked_fill_(~mask_out, 0)
+        indices.copy_(dense_local)
+
+        target_rank = ((pages - reserved_block_num) & self.group_mask).to(torch.int64)
+        rank_counts = torch.bincount(
+            target_rank,
+            minlength=self.attn_tp_group_size,
+        ).to(torch.int32)
+
+        actual_local_count = compact_local_indices.numel()
+        expected_local_count = int(rank_counts[self.kvp_rank].item())
+        if actual_local_count != expected_local_count:
+            logger.warning(
+                "local token count %s does not equal expected count %s for rank %s "
+                "(total_indices=%s, rank_counts=%s)",
+                actual_local_count,
+                expected_local_count,
+                self.kvp_rank,
+                indices.numel(),
+                rank_counts.tolist(),
+            )
+        # kv cache all gathered from all ranks will disturb the order of sequences, use inv_perm to recover
+        perm = torch.argsort(target_rank, stable=True)
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(indices.numel(), device=indices.device)
+
+
+        return mask_out, compact_local_indices, rank_counts.tolist(), perm, inv_perm
+
+    def _token_ind_to_local(
+        self,
+        global_indices: torch.Tensor,
+        seqlens: torch.Tensor,
+    ):
+        page_size = 128 if is_npu() else 64
+        bs, max_token_num = global_indices.shape
+        max_local_token_num = max_token_num // self.cp_size
+        local_indices = global_indices.new_zeros(bs, max_local_token_num+1)
+        page_ids = global_indices//page_size
+        mask = (global_indices > 0) & ((page_ids - 1) % self.cp_size == self.cp_rank)
+        # [bs, s]
+        len_mask = torch.arange(max_token_num, device=seqlens.device)[None, :] < seqlens[:,None]
+        mask = mask & len_mask
+        pos = torch.cumsum(mask.int(), dim=1) - 1
+
+        safe_pos = torch.where(mask, pos, max_local_token_num)
+        new_pages = (page_ids - 1) // self.cp_size + 1
+        new_indices = new_pages * page_size + global_indices % page_size
+        safe_val = torch.where(mask, new_indices, 0)
+
+        local_indices.scatter_(
+            dim=1,
+            index=safe_pos,
+            src=safe_val
+        )
+        global_valid_indices = global_indices.new_zeros(bs, max_local_token_num+1)
+        global_valid_indices.scatter_(
+            dim=1,
+            index=safe_pos,
+            src=torch.where(mask, global_indices, 0)
+        )
+        local_lens = mask.sum(dim=1, dtype=torch.int32)
+
+        return local_indices[:,:-1], global_valid_indices[:,:-1], local_lens
+
+class MLAL1HalfTokenToKVPool(MLATokenToKVPool):
+
+    def __init__(
+        self,
+        size: int,
+        model_dtype: torch.dtype,
+        dtype: torch.dtype,
+        quant_method: str,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        max_batch_size: int,
+        max_context_len: int,
+        page_size: int,
+        rank: int,
+        use_dsa: bool = False,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size + 1, model_dtype, dtype, quant_method, kv_lora_rank, qk_rope_head_dim, layer_num, device, enable_memory_saver,
+            max_batch_size, max_context_len, page_size, rank, use_dsa, start_layer=start_layer, end_layer=end_layer
+        )
+        self.attn_tp_group_size = global_server_args_dict["attn_tp_size"]
+        self.enable_mla_l1_5_cache = True
+
+        self.page_shift = int(math.log(page_size, 2))
+        assert page_size == (1 << self.page_shift), f"page size is expected to be the power of 2, but {page_size=}"
+        self.page_mask = page_size - 1 # used to replace modulo operation
+        self.group_shift = int(math.log(self.attn_tp_group_size, 2))
+        assert self.attn_tp_group_size == (1 << self.group_shift), \
+            f"attn tp size is expected to be the power of 2, but {self.attn_tp_group_size=}"
+        self.group_mask = self.attn_tp_group_size - 1 # used to replace modulo operation
+        self.kvp_rank = get_attn_tp_group().rank_in_group
+
+    def empty_cache_shape(self):
+        if self.quant_method == "per_token_head":
+            raise NotImplementedError
+        else:
+            return (0, 1, self.kv_cache_dim)
+
+    def global_page_loc_to_local_mapping(self, pages):
+        """Map global page ids to this rank's local page ids.
+
+        Args:
+            pages: Global page ids (1-based).
+
+        Returns:
+            mask: Boolean mask aligned with pages, True if a page belongs to this rank.
+            new_page_indices: Local page ids (1-based) for pages selected by mask.
+        """
+        reserved_block_num = 1
+        if global_server_args_dict["kvp_size"] > 1:
+            reserved_block_num = 1 + self.max_batch_size
+
+        mask = (pages < reserved_block_num) | (((pages - reserved_block_num) & self.group_mask) == self.kvp_rank)
+        local_pages = pages[mask]
+        if isinstance(pages, torch.Tensor):
+            new_page_indices = torch.where(
+                local_pages < reserved_block_num,
+                0,
+                ((local_pages - reserved_block_num) >> self.group_shift) + reserved_block_num,
+            )
+        else:
+            new_page_indices = np.where(
+                local_pages < reserved_block_num,
+                0,
+                ((local_pages - reserved_block_num) >> self.group_shift) + reserved_block_num,
+            )
+
+        return mask, new_page_indices
+
+    def get_page_transfer_metadata(
+        self, page_indices: Union[npt.NDArray[np.int64], torch.Tensor]
+    ):
+        if isinstance(page_indices, torch.Tensor):
+            page_indices = page_indices.detach().cpu().numpy()
+        page_indices = np.asarray(page_indices, dtype=np.int64)
+        page_transfer_mask, page_local_indices = self.global_page_loc_to_local_mapping(
+            page_indices
+        )
+        return PageTransferMetadata(
+            indices_are_local=True,
+            page_transfer_mask=page_transfer_mask,
+            page_local_indices=page_local_indices,
+        )
+
+    def global_loc_to_local_mapping(self, indices: torch.Tensor):
+        """Map global token indices to this rank's local indices and grouping info.
+
+        Args:
+            indices: Global token indices, will be modified in place. Nonlocal tokens will be set to index 0.
+
+        Returns:
+            mask_out: Boolean mask aligned with indices, True if a token belongs to this rank.
+            compact_local_indices: Local indices for tokens selected by mask_out.
+            rank_counts: Token counts per rank, length equals attn_tp_group_size, used in all gather.
+            perm: Stable permutation that groups indices by target rank.
+            inv_perm: Inverse permutation to restore the original order, used to recover batch dimension after all gather.
+        """
+        reserved_block_num = 1
+        if global_server_args_dict["kvp_size"] > 1:
+            reserved_block_num = 1 + self.max_batch_size
+
+        if indices.numel() == 0:
+            empty = torch.empty(0, dtype=indices.dtype, device=indices.device)
+            mask_out = torch.empty(0, dtype=torch.bool, device=indices.device)
+            rank_counts = [0 for _ in range(self.attn_tp_group_size)]
+            perm = torch.empty(0, dtype=torch.int64, device=indices.device)
+            inv_perm = torch.empty(0, dtype=torch.int64, device=indices.device)
+            return mask_out, empty, rank_counts, perm, inv_perm
+
+        pages = indices >> self.page_shift
+        offsets = indices & self.page_mask
+
+        mask_out, new_page_indices = self.global_page_loc_to_local_mapping(pages)
+        local_offsets = offsets[mask_out]
+        compact_local_indices = (new_page_indices << self.page_shift) | local_offsets
+
+        dense_local = indices.clone()
+        dense_local[mask_out] = compact_local_indices
+
+        # nonlocal pages all set to page 0, so don't need to modify logic about set_kv_buffer
+        dense_local.masked_fill_(~mask_out, 0)
+        indices.copy_(dense_local)
+
+        target_rank = ((pages - reserved_block_num) & self.group_mask).to(torch.int64)
+        rank_counts = torch.bincount(
+            target_rank,
+            minlength=self.attn_tp_group_size,
+        ).to(torch.int32)
+
+        # kv cache all gathered from all ranks will disturb the order of sequences, use inv_perm to recover
+        perm = torch.argsort(target_rank, stable=True)
+        inv_perm = torch.empty_like(perm)
+        inv_perm[perm] = torch.arange(indices.numel(), device=indices.device)
+
+        return mask_out, compact_local_indices, rank_counts.tolist(), perm, inv_perm
+
+    def get_key_split_contiguous(self, layer_id: int, indices: torch.Tensor):
+
+        mask, local_indices, _ = self.global_loc_to_local_mapping(indices)
+        if not mask.any():
+            return None
+
+        assert local_indices.max() < self.size, f"cannot access invalid location."
+        return super().get_key_split_contiguous(layer_id, local_indices)
+
+    def get_key_contiguous(self, layer_id: int, indices: torch.Tensor) -> torch.Tensor:
+        """
+        for performance reason, we expected `indices` is a local indices that has been mapped by `global_loc_to_local_mapping`.
+        If one cannot guarantee this, use `get_key_split_contiguous` which can handle global indices but with overhead of remapping.
+        """
+        assert self.quant_method != "per_token_head", f"get_key_contiguous do not support get key contiguous"
+        layer_id=layer_id-self.start_layer
+        try:
+            if self.store_dtype != self.dtype:
+                latent_cache = self.kv_buffer[layer_id].view(self.dtype)[indices].contiguous()
+            else:
+                latent_cache = self.kv_buffer[layer_id][indices].contiguous()
+        except Exception as e:
+            logger.error(f"Error in getting key contiguous for layer {layer_id} with indices shape {indices.shape} and max index {indices.max()}, kv_buffer shape {self.kv_buffer[layer_id].shape}")
+            raise e
+
+        return latent_cache
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: Optional[torch.Tensor],
+    ):
+        return super().set_kv_buffer(layer, loc, cache_k, cache_v)
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        return super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+
+    def _flatten_local_cpu_copy(self, kv_cache_cpu):
+        assert self.quant_method != "per_token_head", (
+            "MLAL1HalfTokenToKVPool CPU offload does not support kv cache quant path yet"
+        )
+
+        flat_kv_cache_cpu = []
+        for layer_id in range(self.layer_num):
+            layer_chunks = [chunk[0] for chunk in kv_cache_cpu[layer_id]]
+            if len(layer_chunks) == 0:
+                empty_shape = (0,) + tuple(self.kv_buffer[layer_id].shape[1:])
+                flat_layer = torch.empty(
+                    empty_shape,
+                    dtype=self.kv_buffer[layer_id].dtype,
+                    device="cpu",
+                )
+            else:
+                flat_layer = torch.cat(layer_chunks, dim=0)
+            flat_kv_cache_cpu.append(flat_layer)
+        return flat_kv_cache_cpu
+
+    def npu_get_cpu_copy(self, local_page_indices: torch.Tensor):
+        assert self.quant_method != "per_token_head", (
+            "MLAL1HalfTokenToKVPool CPU offload does not support kv cache quant path yet"
+        )
+
+        self.sync_device()
+        kv_cache_cpu = []
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            for i in range(0, len(local_page_indices), self.offload_chunk_page_num):
+                chunk_page_indices = local_page_indices[
+                    i : i + self.offload_chunk_page_num
+                ]
+                if ENV.npu_enable_mla_split_kv_kr:
+                    kv_cpu1 = self.kv_buffer[2 * layer_id].view(
+                        -1, self.page_size * self.kv_lora_rank
+                    )[chunk_page_indices].to("cpu", non_blocking=True)
+                    kv_cpu2 = self.kv_buffer[2 * layer_id + 1].view(
+                        -1, self.page_size * self.qk_rope_head_dim
+                    )[chunk_page_indices].to("cpu", non_blocking=True)
+                    kv_cache_cpu[-1].append([kv_cpu1, kv_cpu2])
+                else:
+                    kv_cpu = self.kv_buffer[layer_id].view(
+                        -1, self.page_size * (self.qk_rope_head_dim + self.kv_lora_rank)
+                    )[chunk_page_indices].to("cpu", non_blocking=True)
+                    kv_cache_cpu[-1].append([kv_cpu])
+        self.sync_device()
+        return kv_cache_cpu
+
+    def _get_global_page_indices(self, token_indices: torch.Tensor) -> torch.Tensor:
+        """Convert global token indices to global page indices.
+
+        NPU KV offload operates on pages. The input of public interfaces is still
+        global token indices, so NPU-specific save/load paths should first derive
+        the corresponding global page indices and then keep the rest of the logic
+        page-based.
+        """
+        return token_indices[:: self.page_size] >> self.page_shift
+
+    def _get_dense_local_page_mapping(
+        self, page_indices: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Map global page indices to a dense local-page view.
+
+        Returns:
+            local_page_mask: marks which global pages belong to this rank.
+            dense_local_page_indices: same shape as ``page_indices``. Local pages
+                are replaced with their mapped local page ids, and nonlocal pages
+                are filled with 0 so chunked writes can index it directly.
+        """
+        local_page_mask, local_page_indices = self.global_page_loc_to_local_mapping(
+            page_indices
+        )
+        dense_local_page_indices = page_indices.clone()
+        dense_local_page_indices[local_page_mask] = local_page_indices
+        dense_local_page_indices.masked_fill_(~local_page_mask, 0)
+        return local_page_mask, dense_local_page_indices
+
+    def npu_flatten_local_cpu_copy(self, kv_cache_cpu):
+        assert self.quant_method != "per_token_head", (
+            "MLAL1HalfTokenToKVPool CPU offload does not support kv cache quant path yet"
+        )
+
+        flat_kv_cache_cpu = []
+        for layer_id in range(self.layer_num):
+            layer_chunks = kv_cache_cpu[layer_id]
+            if ENV.npu_enable_mla_split_kv_kr:
+                flat_layer = []
+                for tensor_idx in range(2):
+                    tensor_chunks = [chunk[tensor_idx] for chunk in layer_chunks]
+                    if len(tensor_chunks) == 0:
+                        src_buf = self.kv_buffer[layer_id * 2 + tensor_idx]
+                        flat_tensor = torch.empty(
+                            (0, src_buf.shape[-1] * self.page_size),
+                            dtype=src_buf.dtype,
+                            device="cpu",
+                        )
+                    else:
+                        flat_tensor = torch.cat(tensor_chunks, dim=0)
+                    flat_layer.append(flat_tensor)
+                flat_kv_cache_cpu.append(flat_layer)
+            else:
+                tensor_chunks = [chunk[0] for chunk in layer_chunks]
+                if len(tensor_chunks) == 0:
+                    flat_layer = torch.empty(
+                        (0, self.page_size * self.kv_cache_dim),
+                        dtype=self.kv_buffer[layer_id].dtype,
+                        device="cpu",
+                    )
+                else:
+                    flat_layer = torch.cat(tensor_chunks, dim=0)
+                flat_kv_cache_cpu.append([flat_layer])
+        return flat_kv_cache_cpu
+
+    def npu_all_gather_cpu_copy(self, local_page_mask: torch.Tensor, kv_cache_cpu):
+        assert self.quant_method != "per_token_head", (
+            "MLAL1HalfTokenToKVPool CPU offload does not support kv cache quant path yet"
+        )
+
+        if self.attn_tp_group_size == 1:
+            return kv_cache_cpu
+
+        gathered_payloads = [None for _ in range(self.attn_tp_group_size)]
+        local_payload = (
+            local_page_mask.detach().cpu(),
+            self.npu_flatten_local_cpu_copy(kv_cache_cpu),
+        )
+        dist.all_gather_object(
+            gathered_payloads,
+            local_payload,
+            group=get_attention_tp_group().cpu_group,
+        )
+
+        num_pages = local_page_mask.numel()
+        global_kv_cache_cpu = []
+        for layer_id in range(self.layer_num):
+            global_kv_cache_cpu.append([])
+            if ENV.npu_enable_mla_split_kv_kr:
+                full_tensor_1 = torch.empty(
+                    (num_pages, self.page_size * self.kv_lora_rank),
+                    dtype=self.kv_buffer[2 * layer_id].dtype,
+                    device="cpu",
+                )
+                full_tensor_2 = torch.empty(
+                    (num_pages, self.page_size * self.qk_rope_head_dim),
+                    dtype=self.kv_buffer[2 * layer_id + 1].dtype,
+                    device="cpu",
+                )
+                for rank_page_mask, rank_payload in gathered_payloads:
+                    if rank_page_mask.any():
+                        full_tensor_1[rank_page_mask] = rank_payload[layer_id][0]
+                        full_tensor_2[rank_page_mask] = rank_payload[layer_id][1]
+
+                for i in range(0, num_pages, self.offload_chunk_page_num):
+                    global_kv_cache_cpu[-1].append(
+                        [
+                            full_tensor_1[i : i + self.offload_chunk_page_num],
+                            full_tensor_2[i : i + self.offload_chunk_page_num],
+                        ]
+                    )
+            else:
+                full_layer = torch.empty(
+                    (num_pages, self.page_size * self.kv_cache_dim),
+                    dtype=self.kv_buffer[layer_id].dtype,
+                    device="cpu",
+                )
+                for rank_page_mask, rank_payload in gathered_payloads:
+                    if rank_page_mask.any():
+                        full_layer[rank_page_mask] = rank_payload[layer_id][0]
+
+                for i in range(0, num_pages, self.offload_chunk_page_num):
+                    global_kv_cache_cpu[-1].append(
+                        [full_layer[i : i + self.offload_chunk_page_num]]
+                    )
+
+        return global_kv_cache_cpu
+
+    def _all_gather_cpu_copy(self, local_mask: torch.Tensor, kv_cache_cpu):
+        assert self.quant_method != "per_token_head", (
+            "MLAL1HalfTokenToKVPool CPU offload does not support kv cache quant path yet"
+        )
+
+        if self.attn_tp_group_size == 1:
+            return kv_cache_cpu
+
+        gathered_payloads = [None for _ in range(self.attn_tp_group_size)]
+        local_payload = (
+            local_mask.detach().cpu(),
+            self._flatten_local_cpu_copy(kv_cache_cpu),
+        )
+        dist.all_gather_object(
+            gathered_payloads,
+            local_payload,
+            group=get_attention_tp_group().cpu_group,
+        )
+
+        num_tokens = local_mask.numel()
+        global_kv_cache_cpu = []
+        for layer_id in range(self.layer_num):
+            full_layer = torch.empty(
+                (num_tokens,) + tuple(self.kv_buffer[layer_id].shape[1:]),
+                dtype=self.kv_buffer[layer_id].dtype,
+                device="cpu",
+            )
+            for rank_mask, rank_payload in gathered_payloads:
+                if rank_mask.any():
+                    full_layer[rank_mask] = rank_payload[layer_id]
+
+            global_kv_cache_cpu.append([])
+            for i in range(0, num_tokens, self.offload_chunk_page_num):
+                global_kv_cache_cpu[-1].append(
+                    [full_layer[i : i + self.offload_chunk_page_num]]
+                )
+
+        return global_kv_cache_cpu
+
+    def get_cpu_copy(self, token_indices):
+        assert self.quant_method != "per_token_head", (
+            "MLAL1HalfTokenToKVPool CPU offload does not support kv cache quant path yet"
+        )
+
+        if __is_npu__:
+            page_indices = self._get_global_page_indices(token_indices)
+            local_page_mask, local_page_indices = self.global_page_loc_to_local_mapping(
+                page_indices
+            )
+
+            kv_cache_cpu = self.npu_get_cpu_copy(local_page_indices)
+            return self.npu_all_gather_cpu_copy(local_page_mask, kv_cache_cpu)
+
+        dense_local_indices = token_indices.clone()
+        local_mask, _, _, _, _ = self.global_loc_to_local_mapping(dense_local_indices)
+        local_indices = dense_local_indices[local_mask]
+        kv_cache_cpu = super().get_cpu_copy(local_indices)
+        return self._all_gather_cpu_copy(local_mask, kv_cache_cpu)
+
+    def npu_load_cpu_copy(self, kv_cache_cpu, token_indices):
+        page_indices = self._get_global_page_indices(token_indices)
+        local_page_mask, dense_local_page_indices = self._get_dense_local_page_mapping(
+            page_indices
+        )
+        local_page_mask_cpu = local_page_mask.cpu()
+
+        self.sync_device()
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(page_indices), self.offload_chunk_page_num):
+                chunk_page_mask_cpu = local_page_mask_cpu[
+                    i : i + self.offload_chunk_page_num
+                ]
+                if not chunk_page_mask_cpu.any():
+                    continue
+
+                chunk_page_mask = local_page_mask[i : i + self.offload_chunk_page_num]
+                chunk_local_page_indices = dense_local_page_indices[
+                    i : i + self.offload_chunk_page_num
+                ][chunk_page_mask]
+
+                if ENV.npu_enable_mla_split_kv_kr:
+                    kv_cpu1 = kv_cache_cpu[layer_id][
+                        i // self.offload_chunk_page_num
+                    ][0][chunk_page_mask_cpu]
+                    kv_cpu2 = kv_cache_cpu[layer_id][
+                        i // self.offload_chunk_page_num
+                    ][1][chunk_page_mask_cpu]
+                    assert (
+                        kv_cpu1.shape[0] == len(chunk_local_page_indices)
+                        and kv_cpu2.shape[0] == len(chunk_local_page_indices)
+                    ), (
+                        f"kv_cpu1.shape[0] {kv_cpu1.shape[0]} or kv_cpu2.shape[0] {kv_cpu2.shape[0]} != len(chunk_local_page_indices) {len(chunk_local_page_indices)}"
+                    )
+                    self.kv_buffer[2 * layer_id].view(
+                        -1, self.page_size * self.kv_lora_rank
+                    )[chunk_local_page_indices] = kv_cpu1.to(
+                        self.kv_buffer[0].device, non_blocking=True
+                    )
+                    self.kv_buffer[2 * layer_id + 1].view(
+                        -1, self.page_size * self.qk_rope_head_dim
+                    )[chunk_local_page_indices] = kv_cpu2.to(
+                        self.kv_buffer[0].device, non_blocking=True
+                    )
+                else:
+                    kv_cpu = kv_cache_cpu[layer_id][
+                        i // self.offload_chunk_page_num
+                    ][0][chunk_page_mask_cpu]
+                    assert kv_cpu.shape[0] == len(chunk_local_page_indices), (
+                        f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(chunk_local_page_indices) {len(chunk_local_page_indices)}"
+                    )
+                    self.kv_buffer[layer_id].view(
+                        -1, self.page_size * (self.kv_lora_rank + self.qk_rope_head_dim)
+                    )[chunk_local_page_indices] = kv_cpu.to(
+                        self.kv_buffer[0].device, non_blocking=True
+                    )
+        self.sync_device()
+        return
+
+    def load_cpu_copy(self, kv_cache_cpu, token_indices):
+        assert self.quant_method != "per_token_head", (
+            "MLAL1HalfTokenToKVPool CPU offload does not support kv cache quant path yet"
+        )
+
+        if __is_npu__:
+            return self.npu_load_cpu_copy(kv_cache_cpu, token_indices)
+
+        dense_local_indices = token_indices.clone()
+        local_mask, _, _, _, _ = self.global_loc_to_local_mapping(dense_local_indices)
+        local_mask_cpu = local_mask.cpu()
+
+        self.sync_device()
         for layer_id in range(self.layer_num):
             for i in range(0, len(token_indices), self.offload_chunk_page_num):
-                chunk_indices = token_indices[i : i + self.offload_chunk_page_num]
-                if self.quant_method == "per_token_head":
-                    for j in range(3):
-                        t = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][j]
-                        assert t.shape[0] == len(chunk_indices)
-                        self.kv_buffer[layer_id][j][chunk_indices] = t.to(self.kv_buffer[0][0].device, non_blocking=True)
-                else:
-                    kv_cpu = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][0]
-                    assert kv_cpu.shape[0] == len(chunk_indices), f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(chunk_indices) {len(chunk_indices)}"
-                    kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
-                    self.kv_buffer[layer_id][chunk_indices] = kv_chunk
-        torch.cuda.synchronize()
+                chunk_mask_cpu = local_mask_cpu[i : i + self.offload_chunk_page_num]
+                if not chunk_mask_cpu.any():
+                    continue
 
+                chunk_mask = local_mask[i : i + self.offload_chunk_page_num]
+                chunk_local_indices = dense_local_indices[
+                    i : i + self.offload_chunk_page_num
+                ][chunk_mask]
+
+                kv_cpu = kv_cache_cpu[layer_id][i // self.offload_chunk_page_num][0][
+                    chunk_mask_cpu
+                ]
+                assert kv_cpu.shape[0] == len(chunk_local_indices), (
+                    f"kv_cpu.shape[0] {kv_cpu.shape[0]} != len(chunk_local_indices) {len(chunk_local_indices)}"
+                )
+                kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
+                self.kv_buffer[layer_id][chunk_local_indices] = kv_chunk
+        self.sync_device()
 
 class MemoryStateInt(IntEnum):
     IDLE = 0
@@ -1191,7 +2104,7 @@ class NativeSparseMHATokenToKVPool(MHATokenToKVPool):
 
     def _create_compressed_buffers(self):
         compress_block_size = (self.size + self.page_size) // self.compressed_block_stride
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             # [compress_block_size, head_num, head_dim] for each layer
             # The padded page 0 is used for writing dummy outputs from padded tokens.
             self.compressed_k_buffer = [
@@ -1293,7 +2206,7 @@ class NativeSparseMLATokenToKVPool(MLATokenToKVPool):
 
     def _create_compressed_buffers(self):
         compress_block_size = (self.size + self.page_size) // self.compressed_block_stride
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             # [compress_block_size, head_num, head_dim] for each layer
             # The padded page 0 is used for writing dummy outputs from padded tokens.
             self.compressed_kv_buffer = [
@@ -1474,7 +2387,7 @@ class MambaPool:
         temporal_state_shape: Tuple[int, int],
         device: str,
         speculative_num_draft_tokens: Optional[int] = None,
-    ):  
+    ):
         self.is_kda_cache = isinstance(conv_state_shape, List)
         if self.is_kda_cache:
             conv_state = [
@@ -1576,7 +2489,7 @@ class MambaPool:
 
     def mamba2_layer_cache(self, layer_id: int):
         return self.at_layer_idx(layer_id)
-    
+
     def at_layer_idx(self, layer: int):
         if isinstance(self.mamba_cache[0], list):
             return {
@@ -1904,7 +2817,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         page_size: int,
         rank: int,
         index_head_dim: int,
-        index_dtype: torch.dtype
+        index_dtype: torch.dtype,
+        start_layer: Optional[int] = None,  # pp's start
+        end_layer: Optional[int] = None,  # pp's end
     ):
         super().__init__(
             size,
@@ -1920,14 +2835,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
             max_context_len,
             page_size,
             rank,
-            True,
+            start_layer=start_layer,
+            end_layer=end_layer
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         assert index_dtype in [torch.float8_e4m3fn, torch.bfloat16]
         # num head == 1 and head dim == 128 for index_k in NSA
         assert index_head_dim == 128
-        assert self.page_size == 64
+        if not is_npu():
+            assert self.page_size == 64
         self.index_head_dim = index_head_dim
         self.index_dtype = index_dtype
         if index_dtype == torch.float8_e4m3fn:
@@ -1937,7 +2854,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             self.index_k_cache_dim = index_head_dim
             self.index_k_with_scale_buffer_dtype = torch.bfloat16
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.index_k_with_scale_buffer = [
                 torch.zeros(
                     # Layout:
@@ -1955,6 +2872,22 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+            if is_npu():
+                # PA_BNSD
+                if ENV.npu_enable_mla_split_kv_kr:
+                    self.index_k_with_scale_buffer = []
+                    block_num = (self.size + self.page_size)//self.page_size
+                    for _ in range(layer_num):
+                        self.index_k_with_scale_buffer.append(torch.zeros((block_num, self.page_size, 1, index_head_dim), dtype=self.index_k_with_scale_buffer_dtype, device=device).contiguous())
+                else:
+                    self.index_k_with_scale_buffer = [
+                        torch.empty(
+                            (self.size+self.page_size, 1, self.index_head_dim),
+                            dtype=self.index_k_with_scale_buffer_dtype,
+                            device=device,
+                        )
+                        for _ in range(layer_num)
+                    ]
 
     def get_contiguous_buf_infos(self):
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
@@ -1969,9 +2902,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
 
     def get_layerwise_buf_info_offsets(self, start_idx=0):
-        return [[start_idx + i*self.layer_num + layer_id for i in range(2)] for layer_id in range(self.layer_num)]
+        if ENV.npu_enable_mla_split_kv_kr and is_npu():
+            num_kv_buffers = 2 * self.layer_num
+            offsets = [[start_idx + layer_id * 2 + i for i in range(2)] for layer_id in range(self.layer_num)]
+            index_offsets = [[start_idx + num_kv_buffers + layer_id] for layer_id in range(self.layer_num)]
+            return list(map(lambda x, y: x + y, offsets, index_offsets))
+        else:
+            return [[start_idx + i*self.layer_num + layer_id for i in range(2)] for layer_id in range(self.layer_num)]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        layer_id = layer_id-self.start_layer
         if getattr(self, "layer_transfer_counter", None) is not None:
             self.layer_transfer_counter.wait_until(layer_id)
         return self.index_k_with_scale_buffer[layer_id]
@@ -1982,6 +2922,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        layer_id=layer_id-self.start_layer
         buf = self.index_k_with_scale_buffer[layer_id]
         return index_buf_accessor.GetK.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
@@ -1993,6 +2934,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        layer_id=layer_id-self.start_layer
         buf = self.index_k_with_scale_buffer[layer_id]
         if self.index_dtype == torch.float8_e4m3fn:
             return index_buf_accessor.GetS.execute(
@@ -2009,14 +2951,25 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor = None,
     ) -> None:
-        buf = self.index_k_with_scale_buffer[layer_id]
-        if self.index_dtype == torch.float8_e4m3fn:
-            index_buf_accessor.SetKAndS.execute(
-                pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
-            )
+        layer_id=layer_id-self.start_layer
+        if not is_npu():
+            buf = self.index_k_with_scale_buffer[layer_id]
+            if self.index_dtype == torch.float8_e4m3fn:
+                index_buf_accessor.SetKAndS.execute(
+                    pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+                )
+            else:
+                buf = buf.view(-1, self.index_k_cache_dim)
+                buf[loc] = index_k
         else:
-            buf = buf.view(-1, self.index_k_cache_dim)
-            buf[loc] = index_k
+            import torch_npu
+            torch_npu.npu_scatter_nd_update_(
+                self.index_k_with_scale_buffer[layer_id].view(
+                    -1, 1, self.index_head_dim
+                ),
+                loc.view(-1, 1),
+                index_k.view(-1, 1, self.index_head_dim),
+            )
 
     def get_state_buf_infos(self):
         data_ptrs = [
@@ -2032,9 +2985,134 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
-        for index_k_cache in self.index_k_with_scale_buffer:
-            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        if hasattr(self, 'index_k_with_scale_buffer'):
+            for index_k_cache in self.index_k_with_scale_buffer:
+                kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
+
+class L1HalfDSATokenToKVPool(L1HalfMixin, DSATokenToKVPool):
+    def __init__(
+        self,
+        size: int,
+        model_dtype: torch.dtype,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        max_batch_size: int,
+        max_context_len: int,
+        page_size: int,
+        rank: int,
+        index_head_dim: int,
+        index_dtype: torch.dtype,
+        start_layer: Optional[int] = None,  # pp's start
+        end_layer: Optional[int] = None,  # pp's end
+    ):
+        super().__init__(
+            size + 1,
+            model_dtype,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            max_batch_size,
+            max_context_len,
+            page_size,
+            rank,
+            index_head_dim,
+            index_dtype,
+            start_layer=start_layer,
+            end_layer=end_layer
+        )
+        self.attn_tp_group_size = global_server_args_dict["attn_tp_size"]
+        self.enable_mla_l1_5_cache = True
+
+        self.page_shift = int(math.log(page_size, 2))
+        assert page_size == (1 << self.page_shift), f"page size is expected to be the power of 2, but {page_size=}"
+        self.page_mask = page_size - 1 # used to replace modulo operation
+        self.group_shift = int(math.log(self.attn_tp_group_size, 2))
+        assert self.attn_tp_group_size == (1 << self.group_shift), \
+            f"attn tp size is expected to be the power of 2, but {self.attn_tp_group_size=}"
+        self.group_mask = self.attn_tp_group_size - 1 # used to replace modulo operation
+        self.kvp_rank = get_attn_tp_group().rank_in_group
+
+    def empty_cache_shape(self):
+        if self.quant_method == "per_token_head":
+            raise NotImplementedError
+        else:
+            return (0, 1, self.kv_cache_dim)
+
+    def empty_attn_cache_shape(self):
+        return (0, 1, self.kv_cache_dim)
+    def empty_attn_cache_tensor(self):
+        return self.kv_buffer[0].new_empty(
+            (0, 1, self.kv_cache_dim)
+        )
+
+    def empty_indexer_cache_shape(self):
+        return (0, self.index_head_dim)
+    def empty_indexer_cache_tensor(self):
+        return self.index_k_with_scale_buffer[0].new_empty(
+            (0, self.index_k_cache_dim)
+        )
+
+    def get_page_transfer_metadata(
+        self, page_indices: Union[np.NDArray[np.int64], torch.Tensor]
+    ):
+        if isinstance(page_indices, torch.Tensor):
+            page_indices = page_indices.detach().cpu().numpy()
+        page_indices = np.asarray(page_indices, dtype=np.int64)
+        page_transfer_mask, page_local_indices = self.global_page_loc_to_local_mapping(
+            page_indices
+        )
+        return PageTransferMetadata(
+            indices_are_local=True,
+            page_transfer_mask=page_transfer_mask,
+            page_local_indices=page_local_indices,
+        )
+
+    def get_key_split_contiguous(self, layer_id: int, indices: torch.Tensor):
+        mask, local_indices, _, _, _ = self.global_loc_to_local_mapping(indices)
+        if not mask.any():
+            return None
+
+        assert local_indices.max() < self.size, f"cannot access invalid location."
+        return super().get_key_split_contiguous(layer_id, local_indices)
+
+    def get_key_contiguous(self, layer_id: int, indices: torch.Tensor) -> torch.Tensor:
+        layer_id=layer_id-self.start_layer
+        mask, local_indices, _, _, _ = self.global_loc_to_local_mapping(indices)
+        if not mask.any():
+            return self.empty_attn_cache_tensor()
+
+        assert local_indices.max() < self.size, f"cannot access invalid location."
+        latent_cache = self.kv_buffer[layer_id][local_indices].contiguous()
+        return latent_cache
+
+    def get_key_contiguous_by_local_loc(self, layer_id: int, local_indices: torch.Tensor) -> torch.Tensor:
+        layer_id=layer_id-self.start_layer
+        latent_cache = self.kv_buffer[layer_id][local_indices].contiguous()
+        return latent_cache
+
+    def get_index_k_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        raise NotImplementedError("L1.5 not support page_indices get_index_k_continuous")
+
+    def get_index_k_scale_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        raise NotImplementedError
 
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],

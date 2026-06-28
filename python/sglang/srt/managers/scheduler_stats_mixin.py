@@ -9,6 +9,7 @@ from sglang.srt.managers.req import Req
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.utils import crash_on_warnings, check_memory_debug, get_bool_env_var
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +56,31 @@ class SchedulerStatsMixin:
         logger.info(f)
 
         if self.enable_metrics:
-            cache_hit_rate = adder.log_hit_tokens / max(
+            total_tokens = max(
                 adder.log_input_tokens + adder.log_hit_tokens, 1
             )
+
+            logger.debug(
+                f"[log_prefill_stats] log_l1_hit_tokens={adder.log_l1_hit_tokens} log_l2_hit_tokens={adder.log_l2_hit_tokens} "
+                f"log_l3_hit_tokens={adder.log_l3_hit_tokens} log_input_tokens={adder.log_input_tokens} total_tokens={total_tokens}"
+            )
+
+            if total_tokens > 0:
+                cache_hit_rate = adder.log_hit_tokens / total_tokens
+                self.stats.hicache_l1_hit_rate = adder.log_l1_hit_tokens / total_tokens
+                self.stats.hicache_l2_hit_rate = adder.log_l2_hit_tokens / total_tokens
+                self.stats.hicache_l3_hit_rate = adder.log_l3_hit_tokens / total_tokens
+                # Note: With the fix in schedule_policy.py, cumulative_l1_hit_tokens now correctly
+                # represents incremental L1 hits per prefill, not cumulative cache size
+            else:
+                cache_hit_rate = 0.0
+                self.stats.hicache_l1_hit_rate = 0.0
+                self.stats.hicache_l2_hit_rate = 0.0
+                self.stats.hicache_l3_hit_rate = 0.0
+            logger.debug(
+                f"[log_prefill_metrics] cache_hit_rate={cache_hit_rate} {self.stats.hicache_l1_hit_rate=} {self.stats.hicache_l2_hit_rate=} {self.stats.hicache_l3_hit_rate=}"
+            )
+
             self.stats.num_running_reqs = running_bs
             self.stats.num_used_tokens = num_used_pages * self.server_args.page_size
             self.stats.token_usage = round(num_used_pages * self.server_args.page_size / self.max_total_num_tokens, 2)
@@ -106,6 +129,7 @@ class SchedulerStatsMixin:
             f"#running-req: {num_running_reqs}, "
             f"#used page num: {num_used_pages}, "
             f"page usage: {num_used_pages / self.max_total_page_num:.2f}, "
+            f"itl: {gap_latency}, "
         )
 
         if self.spec_algorithm.is_none():
@@ -122,6 +146,16 @@ class SchedulerStatsMixin:
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+            # Calculate decode cache hit rate for display
+            decode_cache_hit_rate = 0.0
+            if self.disagg_decode_prealloc_queue.total_decode_tokens > 0:
+                decode_cache_hit_rate = (
+                    self.disagg_decode_prealloc_queue.total_decode_hit_tokens /
+                    self.disagg_decode_prealloc_queue.total_decode_tokens
+                )
+            msg += f"decode cache hit rate: {decode_cache_hit_rate:.2%}, "
+            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
+            msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
 
         msg += (
             f"avg_seq_len: {avg_seq_len}, "
@@ -154,6 +188,10 @@ class SchedulerStatsMixin:
                 )
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
+                )
+                # Get decode cache hit rate
+                self.stats.decode_cache_hit_rate = (
+                    self.disagg_decode_prealloc_queue.get_and_reset_decode_cache_hit_rate()
                 )
             self.metrics_collector.log_stats(self.stats)
 
@@ -194,6 +232,10 @@ class SchedulerStatsMixin:
         self.metrics_collector.log_stats(self.stats)
 
     def check_memory(self):
+
+        if GPU_MEMORY_TYPE_KV_CACHE in self.offload_tags:
+            return
+
         # available_size is total num of free page id
         available_size = (
             self.kv_allocator.available_size() + self.tree_cache.evictable_size()
@@ -216,8 +258,8 @@ class SchedulerStatsMixin:
             unique_elems, counts = torch.unique(free_slots, return_counts=True)
             if free_slots.shape[0] != unique_elems.shape[0]:
                 duplicates = unique_elems[counts > 1]
-                warnings.warn(f"Dup Free! free_slots: {free_slots.shape[0]} unique: {unique_elems.shape[0]} {duplicates=}")
-            warnings.warn(msg)
+                logger.warning(f"Dup Free! free_slots: {free_slots.shape[0]} unique: {unique_elems.shape[0]} {duplicates=}")
+            logger.warning(msg)
             if crash_on_warnings():
                 raise ValueError(msg)
 
@@ -229,7 +271,7 @@ class SchedulerStatsMixin:
                     f"total_size={self.req_to_token_pool.size}\n"
                     f"free_slots={self.req_to_token_pool.free_slots}"
                 )
-                warnings.warn(msg)
+                logger.warning(msg)
                 if crash_on_warnings():
                     raise ValueError(msg)
             else:

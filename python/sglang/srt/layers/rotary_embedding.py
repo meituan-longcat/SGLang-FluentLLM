@@ -321,6 +321,18 @@ class RotaryEmbedding(CustomOp):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
+    def forward_npu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-npu implementation of forward()."""
+        from sglang.srt.env import ENV
+        return self.forward_native(positions, query, key, offsets)
+
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"
@@ -755,6 +767,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
+        self.is_prepare_for_npu = False
 
         # Re-dispatch
         if _is_hip:
@@ -798,6 +811,18 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos() * self.mscale
         sin = freqs.sin() * self.mscale
+        if _is_npu:
+            if self.is_neox_style:
+                # NOTE(woosuk): Here we assume that the positions tensor has the
+                # shape [batch_size, seq_len].
+                cos = cos.repeat(1, 2)
+                sin = sin.repeat(1, 2)
+            else:
+                cos = cos.repeat_interleave(2, dim=-1)
+                sin = sin.repeat_interleave(2, dim=-1)
+            # 统一增加维度
+            cos = cos.unsqueeze(-2)  # [seq_len, 1, d*2]
+            sin = sin.unsqueeze(-2)
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
@@ -899,6 +924,25 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
         return self.forward_native(positions, query, key, offsets)
+
+    def prepare_for_npu(self):
+        if not _is_npu or self.is_prepare_for_npu:
+            return
+        self.is_prepare_for_npu = True
+        self.cos_sin_cache = torch.squeeze(self.cos_sin_cache, dim = 1) # [seq_len, 1, d*2] -> # [seq_len, d*2]
+        half_dim = self.cos_sin_cache.shape[1]//2
+        cos_cached, sin_cached = torch.split(self.cos_sin_cache, [half_dim, half_dim], dim = -1)
+        cos_cached = cos_cached.contiguous()
+        sin_cached = sin_cached.contiguous()
+        delattr(self, 'cos_sin_cache')
+        self.register_buffer("cos_cached", cos_cached, persistent=False)
+        self.register_buffer("sin_cached", sin_cached, persistent=False)
+
+    def get_cos_sin(self, x=None, seq_len=None):
+        return (
+            self.cos_cached.to(x.dtype),
+            self.sin_cached.to(x.dtype)
+        )
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
@@ -1704,6 +1748,9 @@ class DualChunkRotaryEmbedding(CustomOp):
         return s
 
 
+    def get_cos_sin(self, x=None, seq_len=None):
+        return self.forward(x, seq_len)
+
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 
@@ -2145,3 +2192,6 @@ class RotaryEmbeddingCosSinCache(torch.nn.Module):
             self.cos_cached[:seq_len].to(dtype=x.dtype),
             self.sin_cached[:seq_len].to(dtype=x.dtype)
         )
+
+    def get_cos_sin(self, x=None, seq_len=None):
+        return self.forward(x, seq_len)

@@ -88,6 +88,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
 )
+from sglang.srt.managers.req import ABORT_CODE
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -406,8 +407,20 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                     cached_tokens[index] = meta_info.get("cached_tokens", 0)
                     spec_verify_tokens[index] = meta_info.get("spec_verify_ct", 0)
                     
-                    # For streaming, check if this is the last chunk (has finish_reason)
                     finish_reason = meta_info.get("finish_reason")
+                    # For streaming, check if is an abort request
+                    finish_reason_type = finish_reason["type"] if finish_reason else None
+                    if finish_reason_type:
+                        if finish_reason_type == "abort" and \
+                                finish_reason["err_type"] in [ABORT_CODE.TransferFailed]:
+                            out = {"error": {"message": str(finish_reason["message"])}}
+                            logger.warning(f"[http_server] Abort request for reason: {str(finish_reason['message'])}")
+                            yield b"data: " + orjson.dumps(
+                                out, option=orjson.OPT_NON_STR_KEYS
+                            ) + b"\n\n"
+                            break
+
+                    # For streaming, check if this is the last chunk (has finish_reason)
                     if finish_reason is not None:
                         # This is the final chunk, add usage information
                         usage = UsageProcessor.calculate_streaming_usage(

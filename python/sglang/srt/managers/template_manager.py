@@ -23,6 +23,8 @@ import os
 import re
 from typing import Optional
 
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.server_args import ServerArgs, PortArgs
 from sglang.srt.utils import get_colorful_logger
 from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
@@ -50,11 +52,33 @@ class TemplateManager:
     interface for template management.
     """
 
-    def __init__(self):
+    def __init__(self, server_args: ServerArgs, port_args: PortArgs):
         self._chat_template_name: Optional[str] = None
         self._completion_template_name: Optional[str] = None
         self._jinja_template_content_format: Optional[str] = "openai"
-        self._force_reasoning: bool = False
+        self._override_chat_template: Optional[str] = None
+
+        # Launch tokenizer process
+        self.tokenizer_manager = TokenizerManager(server_args, port_args)
+
+        logger.warning(f"{server_args.chat_template=} {server_args.model_path=}")
+        if server_args.chat_template:
+            self._load_explicit_chat_template(server_args.chat_template)
+        else:
+            # If no pre-defined template was found, fallback to HuggingFace template
+            if self._chat_template_name is None:
+                # Default to string content format if no template was found
+                self._jinja_template_content_format = "string"
+                logger.warning("chat template will be detected by hf in function _apply_jinja_template")
+
+        # Detect reasoning pattern from chat template
+        self._force_reasoning = self._detect_reasoning_pattern(
+            self.tokenizer_manager.query_actual_chat_template()
+        )
+
+        # Load completion template
+        if server_args.completion_template:
+            self.load_completion_template(server_args.completion_template)
 
     @property
     def chat_template_name(self) -> Optional[str]:
@@ -81,7 +105,7 @@ class TemplateManager:
         """
         return self._force_reasoning
 
-    def _detect_reasoning_pattern(self, template: str) -> bool:
+    def _detect_reasoning_pattern(self, template: Optional[str]) -> bool:
         """
         Detect if the chat template contains reasoning/thinking patterns.
         """
@@ -101,38 +125,11 @@ class TemplateManager:
 
         return has_reasoning
 
-    def load_chat_template(
-        self, tokenizer_manager, chat_template_arg: Optional[str], model_path: str
-    ) -> None:
-        """
-        Load a chat template from various sources.
-
-        Args:
-            tokenizer_manager: The tokenizer manager instance
-            chat_template_arg: Template name, file path, or None to auto-detect
-            model_path: Path to the model
-        """
-        logger.warning(f"{chat_template_arg=} {model_path=}")
-        if chat_template_arg:
-            self._load_explicit_chat_template(tokenizer_manager, chat_template_arg)
-        else:
-            # If no pre-defined template was found, fallback to HuggingFace template
-            if self._chat_template_name is None:
-                # Default to string content format if no template was found
-                self._jinja_template_content_format = "string"
-                logger.warning("chat template will be detected by hf in function _apply_jinja_template")
-
-        # Detect reasoning pattern from chat template
-        if tokenizer_manager.tokenizer:
-            self._force_reasoning = self._detect_reasoning_pattern(
-                tokenizer_manager.tokenizer.chat_template
-            )
-
-    def _load_jinja_template(self, tokenizer_manager, template_path: str) -> None:
+    def _load_jinja_template(self, template_path: str) -> None:
         """Load a Jinja template file."""
         with open(template_path, "r") as f:
             chat_template = "".join(f.readlines()).strip("\n")
-        tokenizer_manager.tokenizer.chat_template = chat_template.replace("\\n", "\n")
+        self._override_chat_template = chat_template.replace("\\n", "\n")
         self._chat_template_name = None
         # Detect content format from the loaded template
         self._jinja_template_content_format = detect_jinja_template_content_format(
@@ -143,7 +140,7 @@ class TemplateManager:
         )
 
     def _load_explicit_chat_template(
-        self, tokenizer_manager, chat_template_arg: str
+        self, chat_template_arg: str
     ) -> None:
         """Load explicitly specified chat template."""
         logger.warning(f"Loading chat template from argument: {chat_template_arg}")
@@ -159,7 +156,7 @@ class TemplateManager:
             )
 
         if chat_template_arg.endswith(".jinja"):
-            self._load_jinja_template(tokenizer_manager, chat_template_arg)
+            self._load_jinja_template(chat_template_arg)
         else:
             self._load_json_chat_template(chat_template_arg)
 
@@ -182,29 +179,6 @@ class TemplateManager:
             self._load_json_completion_template(completion_template_arg)
         else:
             self._completion_template_name = completion_template_arg
-
-    def initialize_templates(
-        self,
-        tokenizer_manager,
-        model_path: str,
-        chat_template: Optional[str] = None,
-        completion_template: Optional[str] = None,
-    ) -> None:
-        """
-        Initialize all templates based on provided configuration.
-
-        Args:
-            tokenizer_manager: The tokenizer manager instance
-            model_path: Path to the model
-            chat_template: Optional chat template name/path
-            completion_template: Optional completion template name/path
-        """
-        # Load chat template
-        self.load_chat_template(tokenizer_manager, chat_template, model_path)
-
-        # Load completion template
-        if completion_template:
-            self.load_completion_template(completion_template)
 
     def _load_json_chat_template(self, template_path: str) -> None:
         """Load a JSON chat template file."""

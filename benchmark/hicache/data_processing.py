@@ -24,9 +24,26 @@ from sglang.bench_serving import (
     gen_prompt,
     get_gen_prefix_cache_path,
 )
-from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
+
+# Try to import chat_template functions, but make them optional
+try:
+    from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
+    CHAT_TEMPLATE_AVAILABLE = True
+except ImportError:
+    # Fallback: these are only needed for video benchmarks
+    CHAT_TEMPLATE_AVAILABLE = False
+    get_chat_template = None
+    get_chat_template_by_model_path = None
+
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionMessageContentPart
-from sglang.utils import encode_video_base64
+
+# Try to import video encoding utility
+try:
+    from sglang.utils import encode_video_base64
+    VIDEO_ENCODING_AVAILABLE = True
+except ImportError:
+    VIDEO_ENCODING_AVAILABLE = False
+    encode_video_base64 = None
 
 # type of content fields, can be only prompts or with images/videos
 MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
@@ -672,6 +689,12 @@ def sample_nextqa_requests(
             # NOTE: Chat Template is a must for video benchmark because we have to
             # add special image token for later expansion
             if backend == "sglang" or backend == "sglang-native":
+                if not CHAT_TEMPLATE_AVAILABLE:
+                    raise ImportError(
+                        "Chat template functions are not available. "
+                        "This is required for video benchmarks. "
+                        "Please ensure sglang.lang.chat_template module is available."
+                    )
                 if "chat_template" in tokenizer.init_kwargs:
                     chat_template = get_chat_template(tokenizer.get_chat_template())
                 elif chat_template_name is not None:
@@ -685,6 +708,12 @@ def sample_nextqa_requests(
             output_len = fixed_output_len  # max output len, not real output len
 
             # video input
+            if not VIDEO_ENCODING_AVAILABLE:
+                raise ImportError(
+                    "Video encoding function (encode_video_base64) is not available. "
+                    "This is required for video benchmarks. "
+                    "Please ensure sglang.utils module has encode_video_base64 function."
+                )
             base64_data = encode_video_base64(video.path, video.num_frames)
 
             # NOTE: This will be replaced by the expanded length from the server

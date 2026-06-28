@@ -121,7 +121,6 @@ class FLASHConfig(PretrainedConfig):
         oe_vocab_size_ratio=None,
         oe_neighbor_num=None,
         oe_split_num=None,
-        embP=None,
         ignored_token_ids=None,
         ngram_vocab_size_ratio=None,
         emb_neighbor_num=None,

@@ -4,12 +4,12 @@ from typing import Optional, List, Tuple
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, PageTransferMetadata
 from sglang.srt.server_args import ServerArgs
 
 
 class KVArgs:
-    engine_rank: int
+    tp_rank: int
     kv_data_ptrs: list[int]
     kv_data_lens: list[int]
     kv_item_lens: list[int]
@@ -21,6 +21,11 @@ class KVArgs:
     gpu_id: int
     target_layer_num: int
     draft_layer_num: int
+
+    # for pp prefill
+    pp_rank: int
+    prefill_start_layer: int
+    prefill_end_layer: int
 
 
 class KVPoll:
@@ -47,7 +52,7 @@ class BaseKVManager(ABC):
     def send_decode_prefix_info(self, bootstrap_room: int, decode_prefix_len: int):
         """Optional method to send decode prefix info to prefill side"""
         pass  # Default implementation does nothing
-    
+
     def receive_decode_prefix_info(self, bootstrap_room: int) -> int:
         """Optional method to receive decode prefix info from decode side"""
         return 0  # Default implementation returns 0
@@ -64,14 +69,23 @@ class BaseKVSender(ABC):
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None, decode_prefix_len: Optional[int] = 0):
         """
         Notify the decoder server about the kv indices length and aux index,
-        and receive decode prefix length from decoder side
+        and receive decode prefix length from decoder server
         """
         ...
 
     @abstractmethod
-    def send(self, kv_indices: npt.NDArray[np.int64],start_idx: Optional[int] = 0):
+    def send(
+        self,
+        kv_indices: npt.NDArray[np.int64],
+        start_idx: Optional[int] = 0,
+        mla_l1_5_args: Optional[PageTransferMetadata] = None,
+    ):
         """
         Send the kv cache at the given kv indices to the decoder server
+        mla_l1_5_args: optional PageTransferMetadata
+            - indices_are_local: whether the given kv_indices are already remapped to local indices
+            - page_transfer_mask: boolean mask to determine which pages current prefill rank holds that will be sent to decode ranks
+            - page_local_indices: remapped local page indices that this prefill rank will send
         """
         ...
 
@@ -101,9 +115,19 @@ class BaseKVReceiver(ABC):
     ): ...
 
     @abstractmethod
-    def init(self, kv_indices: npt.NDArray[np.int64], aux_index: Optional[int] = None, decode_prefix_len: Optional[int] = 0):
+    def init(
+        self,
+        kv_indices: npt.NDArray[np.int64],
+        aux_index: Optional[int] = None,
+        decode_prefix_len: Optional[int] = 0,
+        mla_l1_5_args: Optional[PageTransferMetadata] = None,
+    ):
         """
         Notify the prefill server about the kv indices and aux index
+        mla_l1_5_args: optional PageTransferMetadata
+            - indices_are_local: whether the given kv_indices are already remapped to local indices
+            - page_transfer_mask: boolean mask to determine which pages current decode rank needs to receive
+            - page_local_indices: remapped local page indices that this decode rank will receive
         """
         ...
 

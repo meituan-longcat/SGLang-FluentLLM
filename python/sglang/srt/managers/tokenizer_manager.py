@@ -14,10 +14,12 @@
 """TokenizerManager is a process that tokenizes the text."""
 
 import asyncio
+import concurrent.futures
 import copy
 import dataclasses
-from enum import Enum
+import inspect
 import logging
+import multiprocessing as mp
 import os
 import pickle
 import signal
@@ -27,6 +29,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime
+from enum import Enum
 from http import HTTPStatus
 from typing import (
     Any,
@@ -42,6 +45,8 @@ from typing import (
 )
 
 import fastapi
+import setproctitle
+import transformers
 import uvloop
 import zmq
 import zmq.asyncio
@@ -97,6 +102,96 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = get_colorful_logger(__name__)
 
+global global_tokenizer
+
+
+def init_global_tokenizer(server_args: ServerArgs):
+    """Init the global tokenizer for process pool."""
+    global global_tokenizer
+    setproctitle.setproctitle("sglang::tokenizer_worker")
+    global_tokenizer = get_tokenizer(
+        server_args.tokenizer_path,
+        tokenizer_mode=server_args.tokenizer_mode,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+    )
+
+
+def tokenizer_encode_task(
+    input_text: str | list[str],
+    encode_kwargs: dict[str, Any] | None = None,
+    remove_bos: bool = False,
+    /, *,
+    tokenizer: transformers.PreTrainedTokenizerBase | None = None
+) -> List[int]:
+    global global_tokenizer
+    if tokenizer is None:
+        tokenizer = global_tokenizer
+    if encode_kwargs is None:
+        encode_kwargs = {}
+    encoded = tokenizer.encode(input_text, **encode_kwargs)
+    if remove_bos and encoded and encoded[0] == tokenizer.bos_token_id:
+        encoded = encoded[1:]
+    return encoded
+
+
+def tokenizer_apply_chat_template_task(
+    openai_compatible_messages: List[dict],
+    tools: Optional[List[dict]],
+    reasoning_effort: Optional[str],
+    chat_template_kwargs: Optional[dict],
+    /, *,
+    tokenizer: Optional[transformers.PreTrainedTokenizerBase] = None
+):
+    global global_tokenizer
+    if tokenizer is None:
+        tokenizer = global_tokenizer
+    if chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    return tokenizer.apply_chat_template(
+        openai_compatible_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        tools=tools,
+        reasoning_effort=reasoning_effort,
+        builtin_tools=[],
+        **chat_template_kwargs,
+    )
+
+
+def tokenizer_decode_task(
+    prompt_ids: List[int],
+    decode_kwargs: Optional[Dict[str, Any]] = None,
+    /, *,
+    tokenizer: Optional[transformers.PreTrainedTokenizerBase] = None
+) -> str:
+    global global_tokenizer
+    if tokenizer is None:
+        tokenizer = global_tokenizer
+    if decode_kwargs is None:
+        decode_kwargs = {}
+    return tokenizer.decode(prompt_ids, **decode_kwargs)
+
+
+def tokenizer_batch_decode_task(
+    sequences: Union[List[int], List[List[int]]],
+    decode_kwargs: Optional[Dict[str, Any]] = None,
+    /, *,
+    tokenizer: Optional[transformers.PreTrainedTokenizerBase] = None
+) -> List[str]:
+    global global_tokenizer
+    if tokenizer is None:
+        tokenizer = global_tokenizer
+    if decode_kwargs is None:
+        decode_kwargs = {}
+    return tokenizer.batch_decode(sequences, **decode_kwargs)
+
+
+def tokenizer_query_chat_template_task(*, tokenizer: Optional[transformers.PreTrainedTokenizerBase] = None) -> Optional[str]:
+    global global_tokenizer
+    if tokenizer is None:
+        tokenizer = global_tokenizer
+    return tokenizer.chat_template
 
 @dataclasses.dataclass
 class ReqState:
@@ -134,6 +229,18 @@ class ServerStatus(Enum):
 
     def is_healthy(self) -> bool:
         return self == ServerStatus.Up
+
+class TTFTCounter:
+    """Count TTFT by different input length."""
+    def __init__(self, ttft_by_input_len_list: str):
+        ttft_by_input_len_list = ttft_by_input_len_list.split(",")
+        self.ttft_by_input_len_list = [ int(input_len) for input_len in ttft_by_input_len_list]
+
+    def counter_name(self, input_len: int):
+        for i in range(len(self.ttft_by_input_len_list)):
+            if input_len <= self.ttft_by_input_len_list[i]:
+                return f"TTFT_{self.ttft_by_input_len_list[i]}"
+        return None
 
 
 class TokenizerManager(TokenizerCommunicatorMixin):
@@ -185,9 +292,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Create tokenizer
         if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
+            self.tokenizer = self.processor = self.tokenizer_executor = None
         else:
             if self.model_config.is_multimodal:
+                # Check if tokenizer executor is configured for multimodal models
+                if server_args.tokenizer_executor_num_processes is not None:
+                    raise ValueError(
+                        "Tokenizer ProcessPoolExecutor is not supported for multimodal models. "
+                        "Please remove --tokenizer-executor-num-processes for multimodal models."
+                    )
+
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -195,14 +309,30 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     revision=server_args.revision,
                 )
                 self.tokenizer = self.processor.tokenizer
+                self.tokenizer_executor = None
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
             else:
-                self.tokenizer = get_tokenizer(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                )
+                # Non-multimodal models
+                if server_args.tokenizer_executor_num_processes is not None:
+                    # Set environment variable before forking
+                    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+                    # Use process pool executor for tokenizer
+                    self.tokenizer = None
+                    self.tokenizer_executor = concurrent.futures.ProcessPoolExecutor(
+                        initializer=init_global_tokenizer,
+                        mp_context=mp.get_context("fork"),
+                        initargs=(server_args,),
+                        max_workers=server_args.tokenizer_executor_num_processes,
+                    )
+                else:
+                    # Traditional single-process tokenizer
+                    self.tokenizer = get_tokenizer(
+                        server_args.tokenizer_path,
+                        tokenizer_mode=server_args.tokenizer_mode,
+                        trust_remote_code=server_args.trust_remote_code,
+                        revision=server_args.revision,
+                    )
+                    self.tokenizer_executor = None
 
         # Store states
         self.no_create_loop = False
@@ -282,6 +412,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         self.init_communicators(server_args)
+        self.ttft_counter = None
+        if self.server_args.ttft_by_input_len_list != None:
+            self.ttft_counter = TTFTCounter(self.server_args.ttft_by_input_len_list)
 
     async def setSchedulerMaxRunningReq(self, max_running_req: int):
         """Set the maximum concurrent requests for the scheduler"""
@@ -313,7 +446,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         obj.normalize_batch_and_arguments()
-        
+
         if self.enable_metrics:
             batch_size = obj.batch_size if hasattr(obj, 'batch_size') else 1
             self.metrics_collector.observe_request_arrival(batch_size)
@@ -337,6 +470,27 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 ):
                     yield response
 
+    async def _normalize_sampling_params(self, sampling_params: SamplingParams):
+        # Process stop strings
+        if sampling_params.stop_strs is None:
+            sampling_params.stop_strs = []
+            sampling_params.stop_str_max_len = 0
+        else:
+            if isinstance(sampling_params.stop_strs, str):
+                sampling_params.stop_strs = [sampling_params.stop_strs]
+
+            stop_str_max_len = 0
+            for stop_str in sampling_params.stop_strs:
+                if not (self.tokenizer is None and self.tokenizer_executor is None):
+                    stop_str_ids = await self.run_tokenizer_task(
+                        tokenizer_encode_task,
+                        stop_str,
+                        {"add_special_tokens": False})
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
+                else:
+                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
+            sampling_params.stop_str_max_len = stop_str_max_len
+
     async def _tokenize_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -357,13 +511,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
         else:
-            if self.tokenizer is None:
-                raise ValueError(
-                    "The engine initialized with skip_tokenizer_init=True cannot "
-                    "accept text prompts. Please provide input_ids or re-initialize "
-                    "the engine with skip_tokenizer_init=False."
-                )
-            input_ids = self.tokenizer.encode(input_text)
+            input_ids = await self.run_tokenizer_task(tokenizer_encode_task, input_text)
 
         if self.is_generation:
             return_logprob = obj.return_logprob
@@ -375,10 +523,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         input_token_num = len(input_ids) if input_ids is not None else 0
-        if input_token_num >= self.context_len:
+        if input_token_num >= (self.context_len - 6):
             raise ValueError(
                 f"The input ({input_token_num} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
+                f"model's context length ({(self.context_len - 6)} tokens(todo fix))."
             )
 
         if (
@@ -400,7 +548,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # Parse sampling parameters
         sampling_params = SamplingParams(**obj.sampling_params)
-        sampling_params.normalize(self.tokenizer)
+        await self._normalize_sampling_params(sampling_params)
         sampling_params.verify(self.model_config.vocab_size)
 
         # Build return object
@@ -436,6 +584,20 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
 
         return tokenized_obj
+
+    async def run_tokenizer_task(self, task, *args):
+        if self.tokenizer_executor is not None:
+            loop = asyncio.get_event_loop()
+            input_ids = await loop.run_in_executor(self.tokenizer_executor, task, *args)
+        elif self.tokenizer is not None:
+            input_ids = task(*args, tokenizer=self.tokenizer)
+        else:
+            raise ValueError(
+                "The engine initialized with skip_tokenizer_init=True cannot "
+                "accept text prompts. Please provide input_ids or re-initialize "
+                "the engine with skip_tokenizer_init=False."
+            )
+        return input_ids
 
     def _send_one_request(
         self,
@@ -590,7 +752,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def flush_cache(self) -> FlushCacheReqOutput:
         return (await self.flush_cache_communicator(FlushCacheReqInput()))[0]
 
-    def abort_request(self, rid: str):
+    def abort_request(self, rid: str, abort_all: bool = False):
+        ## Abort all requests if abort_all is True
+        if abort_all:
+            rids = list(self.rid_to_state.keys())
+            logger.info("Abort all requests: %s", rids)
+            for rid in rids:
+                self.abort_request(rid, abort_all=False)
+            return
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
@@ -787,10 +956,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
+            dispatched = self._result_dispatcher(recv_obj)
+            if inspect.isawaitable(dispatched):
+                await dispatched
             self.last_receive_tstamp = time.time()
 
-    def _handle_batch_output(
+    async def _handle_batch_output(
         self,
         recv_obj: Union[
             BatchStrOut, BatchEmbeddingOut, BatchMultimodalOut, BatchTokenIDOut
@@ -813,7 +984,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             logprobs_info = state.logprobs_info if not state.obj.stream else {}
 
             if getattr(state.obj, "return_logprob", False):
-                self.convert_logprob_style(
+                await self.convert_logprob_style(
                     logprobs_info,
                     state.obj.top_logprobs_num,
                     state.obj.token_ids_logprob,
@@ -902,7 +1073,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
 
-    def convert_logprob_style(
+    async def convert_logprob_style(
         self,
         logprobs_info: dict,
         top_logprobs_num: int,
@@ -914,13 +1085,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         input_token_logprobs = logprobs_info.get("input_token_logprobs", [])
         output_token_logprobs = logprobs_info.get("output_token_logprobs", [])
 
-        input_token_logprobs.extend(self.detokenize_logprob_tokens(
+        input_token_logprobs.extend(await self.detokenize_logprob_tokens(
             recv_obj.input_token_logprobs_val[recv_obj_index],
             recv_obj.input_token_logprobs_idx[recv_obj_index],
             return_text_in_logprobs,
         ))
 
-        output_token_logprobs.extend(self.detokenize_logprob_tokens(
+        output_token_logprobs.extend(await self.detokenize_logprob_tokens(
             recv_obj.output_token_logprobs_val[recv_obj_index],
             recv_obj.output_token_logprobs_idx[recv_obj_index],
             return_text_in_logprobs,
@@ -933,12 +1104,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             input_top_logprobs = logprobs_info.get("input_top_logprobs", [])
             output_top_logprobs = logprobs_info.get("output_top_logprobs", [])
 
-            input_top_logprobs.extend(self.detokenize_top_logprobs_tokens(
+            input_top_logprobs.extend(await self.detokenize_top_logprobs_tokens(
                 recv_obj.input_top_logprobs_val[recv_obj_index],
                 recv_obj.input_top_logprobs_idx[recv_obj_index],
                 return_text_in_logprobs,
             ))
-            output_top_logprobs.extend(self.detokenize_top_logprobs_tokens(
+            output_top_logprobs.extend(await self.detokenize_top_logprobs_tokens(
                 recv_obj.output_top_logprobs_val[recv_obj_index],
                 recv_obj.output_top_logprobs_idx[recv_obj_index],
                 return_text_in_logprobs,
@@ -951,23 +1122,23 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             input_token_ids_logprobs = logprobs_info.get("input_token_ids_logprobs", [])
             output_token_ids_logprobs = logprobs_info.get("output_token_ids_logprobs", [])
 
-            input_token_ids_logprobs.extend(self.detokenize_top_logprobs_tokens(
+            input_token_ids_logprobs.extend(await self.detokenize_top_logprobs_tokens(
                 recv_obj.input_token_ids_logprobs_val[recv_obj_index],
                 recv_obj.input_token_ids_logprobs_idx[recv_obj_index],
                 return_text_in_logprobs,
             ))
-            output_token_ids_logprobs.extend((
-                self.detokenize_top_logprobs_tokens(
+            output_token_ids_logprobs.extend(
+                await self.detokenize_top_logprobs_tokens(
                     recv_obj.output_token_ids_logprobs_val[recv_obj_index],
                     recv_obj.output_token_ids_logprobs_idx[recv_obj_index],
                     return_text_in_logprobs,
                 )
-            ))
+            )
 
             logprobs_info["input_token_ids_logprobs"] = input_token_ids_logprobs
             logprobs_info["output_token_ids_logprobs"] = output_token_ids_logprobs
 
-    def detokenize_logprob_tokens(
+    async def detokenize_logprob_tokens(
         self,
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
@@ -979,11 +1150,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
             ]
         else:
-            assert self.tokenizer is not None
-            token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+            token_texts = await self.run_tokenizer_task(tokenizer_batch_decode_task, token_logprobs_idx)
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
-    def detokenize_top_logprobs_tokens(
+    async def detokenize_top_logprobs_tokens(
         self,
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
@@ -991,16 +1161,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
-        ret = []
-        for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
-                ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
-                    )
-                )
-            else:
-                ret.append(None)
+        ret = [None] * len(token_logprobs_val)
+        awaitables = []
+        ret_idxs = []
+        for i, (val, idx) in enumerate(zip(token_logprobs_val, token_logprobs_idx)):
+            if val:
+                awaitables.append(self.detokenize_logprob_tokens(val, idx, decode_to_text))
+                ret_idxs.append(i)
+        for i, tokens in zip(ret_idxs, await asyncio.gather(*awaitables)):
+            ret[i] = tokens
         return ret
 
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOut, i: int):
@@ -1018,6 +1187,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.metrics_collector.observe_time_to_first_token(
                 state.first_token_time - state.created_time
             )
+            if self.ttft_counter != None:
+                prompt_tokens = (recv_obj.prompt_tokens[i] if getattr(recv_obj, "prompt_tokens", None) else 0)
+                counter_name = self.ttft_counter.counter_name(prompt_tokens)
+                if counter_name != None:
+                    self.metrics_collector.observe_time_to_first_token(state.first_token_time - state.created_time, name = counter_name)
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:
@@ -1088,6 +1262,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # set future if the all results are recevied
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
+
+    def query_actual_chat_template(self) -> Optional[str]:
+        if self.tokenizer_executor is not None:
+            return self.tokenizer_executor.submit(tokenizer_query_chat_template_task).result()
+        elif self.tokenizer is not None:
+            return tokenizer_query_chat_template_task(tokenizer=self.tokenizer)
+        else:
+            return None
 
 
 async def print_exception_wrapper(func):

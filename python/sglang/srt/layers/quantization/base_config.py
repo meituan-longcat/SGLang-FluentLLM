@@ -186,17 +186,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         router_logits: torch.Tensor,
         top_k: int,
         renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-        inplace: bool = False,
-        no_combine: bool = False,
+        use_grouped_topk: bool,
     ) -> torch.Tensor:
         raise NotImplementedError
 

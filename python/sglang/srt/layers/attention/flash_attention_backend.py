@@ -26,7 +26,7 @@ except ImportError as e:
     logger.error(f"Failed to import merge_state_v2 from flashinfer: {e}")
     raise
 
-from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn_3.flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @dataclass

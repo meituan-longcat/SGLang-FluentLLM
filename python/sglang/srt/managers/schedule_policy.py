@@ -276,6 +276,11 @@ class PrefillAdder:
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
+        
+        # HiCache L1/L2/L3 statistics
+        self.log_l1_hit_tokens = 0  # GPU cache hits
+        self.log_l2_hit_tokens = 0  # Host/CPU cache hits
+        self.log_l3_hit_tokens = 0  # Storage cache hits (loaded from storage)
 
         if running_batch is not None:
             self.rem_total_token_offset += sum(
@@ -318,7 +323,8 @@ class PrefillAdder:
         return AddReqResult.CONTINUE
 
     def _prefill_one_req(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self, prefix_len: int, extend_input_len: int, max_new_tokens: int,
+        device_prefix_len: int = 0, host_hit_len: int = 0, storage_hit_len: int = 0
     ):
         self.rem_total_token_offset += extend_input_len + max_new_tokens
         self.cur_rem_token_offset += extend_input_len
@@ -328,6 +334,17 @@ class PrefillAdder:
 
         self.log_hit_tokens += prefix_len
         self.log_input_tokens += extend_input_len
+        
+        self.log_l1_hit_tokens += device_prefix_len
+        
+        self.log_l2_hit_tokens += host_hit_len
+        
+        self.log_l3_hit_tokens += storage_hit_len
+        
+        logger.debug(
+            f"[_prefill_one_req] extend_input_len={extend_input_len} prefix_len={prefix_len} device_prefix_len={device_prefix_len} host_hit_len={host_hit_len} storage_hit_len={storage_hit_len} "
+            f"log_l1={self.log_l1_hit_tokens} log_l2={self.log_l2_hit_tokens} log_l3={self.log_l3_hit_tokens} log_input={self.log_input_tokens}"
+        )
 
     def add_chunked_req(self, req: Req):
 
@@ -459,15 +476,40 @@ class PrefillAdder:
             if total_tokens > self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
+            # Calculate L1, L2, L3 hit lengths
+            # L1: Original GPU cache (device_prefix_len, already in GPU)
+            l1_hit_len = req.prefix_len
+            # L2: Host cache that will be loaded back (host native cache)
+            if req.l2_cache_hit_len:
+                l2_hit_len = req.l2_cache_hit_len
+                l3_hit_len = req.host_hit_length - req.l2_cache_hit_len
+            else:
+                l2_hit_len = 0
+                l3_hit_len = req.host_hit_length
+            
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length
                 )
-                req.prefix_page_ids = torch.cat([req.prefix_page_ids, new_indices])
+                if len(new_indices) > 0:
+                    req.prefix_page_ids = torch.cat([req.prefix_page_ids.to(new_indices.device), new_indices])
+                    prefix_len = len(req.prefix_page_ids) * self.token_to_kv_pool_allocator.page_size
+                    req.prefix_len += req.host_hit_length
+                    assert prefix_len==req.prefix_len, (
+                            f"prefix len should equal to page ids size "
+                            f"rid={req.rid}, pages_len={prefix_len}, prefix_len={req.prefix_len}"
+                        )
+                    
+                    req.extend_input_len -= req.host_hit_length
+                    input_tokens = req.extend_input_len
                 
-                # Note: This is only the physical cache length, should not change logical extend_input_len
-                prefix_len = len(req.prefix_page_ids) * self.token_to_kv_pool_allocator.page_size
-                req.cache_protected_len = prefix_len
+                    if req.sampling_params.max_new_tokens > 0:
+                        assert req.extend_input_len > 0, (
+                            f"extend_input_len should be > 0 for generation requests. "
+                            f"rid={req.rid}, extend_input_len={req.extend_input_len}, "
+                            f"prefix_len={req.prefix_len}, input_len={len(req.fill_ids)}"
+                        )
+
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
@@ -483,6 +525,9 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS_ESTIMATION,
                     ),
+                    device_prefix_len=l1_hit_len,  # L1: Original GPU cache
+                    host_hit_len=l2_hit_len,  # L2: Host cache loaded back
+                    storage_hit_len=l3_hit_len,  # L3: Storage cache loaded back
                 )
             else:
                 # Chunked prefill
@@ -504,6 +549,11 @@ class PrefillAdder:
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
                 self.tree_cache.inc_lock_ref(req.last_node)
-                self._prefill_one_req(prefix_len, trunc_len, 0)
+                self._prefill_one_req(
+                    prefix_len, trunc_len, 0,
+                    device_prefix_len=l1_hit_len,  # L1: Original GPU cache
+                    host_hit_len=l2_hit_len,  # L2: Host cache loaded back
+                    storage_hit_len=l3_hit_len,  # L3: Storage cache loaded back
+                )
 
         return self.budget_state()

@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import add_prefix, align, is_cuda, is_npu
@@ -21,7 +22,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group, get_attention_tp_rank, get_attention_tp_size, get_attn_tp_dp_convertor
 )
 from sglang.srt.layers.utils import (
-    CP_METADATA, cp_all_gather_rerange_output, 
+    CP_METADATA, cp_all_gather_rerange_output,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -111,6 +112,87 @@ class V32LayerNorm(nn.Module):
             x.float(), (self.dim,), self.weight, self.bias, self.eps
         ).type_as(x)
 
+def compute_local_lens(
+    extend_lens:     torch.Tensor,   # (B,) 当前 token 数
+    history_kv_lens: torch.Tensor,   # (B,) 历史 kv 长度
+    sp_num_tokens:   torch.Tensor,   # (cp_size,) 每个 rank 的 token 数
+    cp_rank:         int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns:
+        local_extend_lens:   (B,) 当前 rank 负责的每个请求的 token 数
+        local_total_kv_lens: (B,) 当前 rank 视角下每个请求的总 kv 长度
+    """
+    # ---- 当前 rank 负责的全局 token 范围 ----
+    rank_start = sp_num_tokens[:cp_rank].sum()          # scalar
+    rank_end   = rank_start + sp_num_tokens[cp_rank]    # scalar
+
+    # ---- 每个请求在全局 token 序号中的范围 ----
+    # req_start[b] = sum(extend_lens[:b])
+    # req_end[b]   = sum(extend_lens[:b+1])
+    cumsum    = torch.cumsum(extend_lens, dim=0)        # (B,)
+    req_end   = cumsum                                  # (B,)
+    req_start = cumsum - extend_lens                    # (B,)
+
+    # ---- 与当前 rank 范围取交集 ----
+    inter_start = torch.maximum(req_start, rank_start)  # (B,)
+    inter_end   = torch.minimum(req_end,   rank_end)    # (B,)
+
+    local_extend_lens = torch.clamp(inter_end - inter_start, min=0)  # (B,)
+
+    # ---- local_total_kv_lens ----
+    # 当前 rank 视角下，每个请求的 kv 长度 =
+    #   历史 kv 长度
+    #   + 当前 rank 之前所有 rank 处理的该请求的 token 数（已写入 kv）
+    #   + 当前 rank 负责的该请求的 token 数
+    #
+    # 即：history_kv_lens + min(req_end, rank_end) - req_start
+    #   （从请求开始到当前 rank 末尾，累计写入的 kv 数）
+    #   但不超过请求本身的总长度
+    tokens_up_to_rank_end = torch.clamp(
+        torch.minimum(req_end, rank_end) - req_start,
+        min=0
+    )                                                   # (B,)
+
+    local_total_kv_lens = history_kv_lens + tokens_up_to_rank_end  # (B,)
+
+    return local_extend_lens, local_total_kv_lens
+
+def get_local_past_key_states(past_key_states, global_cu_kv_lens_cpu, cu_local_total_kv_lens_cpu):
+    global_cu_kv_lens_cpu_list = global_cu_kv_lens_cpu.tolist()
+    cu_local_total_kv_lens_cpu_list = cu_local_total_kv_lens_cpu.tolist()
+    bs = len(global_cu_kv_lens_cpu_list) - 1
+    res_list = list()
+    for bi in range(bs):
+        global_start = global_cu_kv_lens_cpu_list[bi]
+        global_end = global_cu_kv_lens_cpu_list[bi+1]
+        cur_len = cu_local_total_kv_lens_cpu_list[bi+1] - cu_local_total_kv_lens_cpu_list[bi]
+        cur = past_key_states[global_start:global_end][:cur_len]
+        res_list.append(cur)
+    # TODO: remove contiguous()
+    return torch.cat(res_list, dim = 0).contiguous()
+
+def get_non_zero(past_key_states, global_cu_kv_lens_cpu, local_extend_lens, local_total_kv_lens):
+    global_cu_kv_lens_cpu_list = global_cu_kv_lens_cpu.tolist()
+    local_extend_lens_list = local_extend_lens.tolist()
+    local_total_kv_lens_list = local_total_kv_lens.tolist()
+    bs = len(local_extend_lens_list)
+    res_local_extend_lens_list = list()
+    res_local_total_kv_lens_list = list()
+    res_list = list()
+    for i in range(bs):
+        if local_extend_lens_list[i]>0:
+            res_local_extend_lens_list.append(local_extend_lens_list[i])
+            cur_len = local_total_kv_lens_list[i]
+            res_local_total_kv_lens_list.append(cur_len)
+            global_start = global_cu_kv_lens_cpu_list[i]
+            global_end = global_cu_kv_lens_cpu_list[i+1]
+            cur = past_key_states[global_start:global_end][:cur_len]
+            res_list.append(cur)
+
+    return torch.cat(res_list, dim = 0).contiguous(), torch.tensor(res_local_extend_lens_list, dtype =torch.int32), torch.tensor(res_local_total_kv_lens_list, dtype =torch.int32)
+
+
 
 class Indexer(CustomOp):
     def __init__(
@@ -128,7 +210,9 @@ class Indexer(CustomOp):
         scale_fmt: Optional[str],
         block_size: int = 128,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        is_neox_style: bool = True,
         prefix: str = "",
+        config: Optional[PretrainedConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
@@ -144,8 +228,9 @@ class Indexer(CustomOp):
 
         self.cp_size = get_attention_tp_size()
         self.cp_rank = get_attention_tp_rank()
-        self.comm_convertor = get_attn_tp_dp_convertor()
-        assert self.comm_convertor is not None
+        if CP_METADATA:
+            self.comm_convertor = get_attn_tp_dp_convertor()
+            assert self.comm_convertor is not None
 
         if is_cuda():
             self.sm_count = deep_gemm_oss.get_num_sms()
@@ -180,12 +265,17 @@ class Indexer(CustomOp):
             max_position=max_position_embeddings,
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
-            is_neox_style=True,
+            is_neox_style=is_neox_style,
             device="cuda" if not is_npu() else "npu",
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+        self.kv_block_size = getattr(config, "kv_block_size", 1)
+        self.q_block_size = getattr(config, "q_block_size", 1)
+        self.num_init_tokens = getattr(config, "index_init_tokens", 0)
+        self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
     def _forward_fake(
         self,
@@ -495,7 +585,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        comm_manager: Optional[DecoderCommMananger] = None
+        **kwargs, # comm_manager: Optional[DecoderCommMananger] = None
     ) -> Optional[torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
@@ -581,45 +671,31 @@ class Indexer(CustomOp):
     ) -> torch.Tensor:
         import torch_npu
 
-        from sglang.srt.layers.dp_attention import (
-            get_attention_tp_rank,
-            get_attention_tp_size,
+        from sglang.srt.distributed import (
+            get_attn_tp_world_size,
+            get_attn_tp_group,
         )
+        from sglang.srt.env import global_server_args_dict
         from sglang.srt.utils import get_bool_env_var
 
-        if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
-        else:
-            actual_seq_lengths_kv = (
-                forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int
-            )
-        enable_index_cp = (
-            get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA") and layer_id >= 4
+        is_prefill = (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_draft_extend()
+            and not forward_batch.forward_mode.is_target_verify()
         )
-        is_prefill = forward_batch.forward_mode.is_extend()
 
-        attention_tp_rank = get_attention_tp_rank()
-        attention_tp_size = get_attention_tp_size()
+        if hasattr(self.rotary_emb, 'cos_sin_cache'):
+            cos_sin = self.rotary_emb.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+            sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+        else:
+            cos, sin = self.rotary_emb.cos_cached[positions], self.rotary_emb.sin_cached[positions]
+            cos = cos.view(-1, 1, 1, self.rope_head_dim)
+            sin = sin.view(-1, 1, 1, self.rope_head_dim)
 
-        cos_sin = self.rotary_emb.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-        sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-        if is_prefill and enable_index_cp:
-            slice_length = cos.shape[0] // attention_tp_size
-            cos = cos[
-                slice_length
-                * attention_tp_rank : slice_length
-                * (attention_tp_rank + 1)
-            ]
-            sin = sin[
-                slice_length
-                * attention_tp_rank : slice_length
-                * (attention_tp_rank + 1)
-            ]
-
-        slot_mapping = forward_batch.out_cache_loc
-        block_table = forward_batch.attn_backend.forward_metadata.block_tables
+        slot_mapping = forward_batch.attn_metadata.slot_mapping
+        block_table = forward_batch.attn_metadata.block_table
 
         bs = x.shape[0]
 
@@ -651,87 +727,275 @@ class Indexer(CustomOp):
         )  # [bs, 1, d]
         k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
 
-        if is_prefill and enable_index_cp:
-            k, local_k = (
-                torch.empty(
-                    (k.shape[0] * attention_tp_size, k.shape[1], k.shape[2]),
-                    dtype=k.dtype,
-                    device=k.device,
-                ),
-                k,
-            )
-            get_attention_tp_group().all_gather_into_tensor(k, local_k)
+        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(layer_id, slot_mapping, k)
 
-        forward_batch.token_to_kv_pool.set_index_k_buffer(layer_id, slot_mapping, k)
-
-        indexer_input = {}
+        layout_key = "PA_BSND"
         if is_prefill:
-            actual_seq_lengths_kv = forward_batch.seq_lens.to(device=q.device)
-            actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0).to(
+            actual_seq_lengths_kv = torch.tensor(forward_batch.attn_metadata.actual_seq_lengths_kv).to(device=q.device)
+            actual_seq_lengths_q = torch.tensor(forward_batch.attn_metadata.actual_seq_lengths).to(
                 device=q.device
             )
-            if enable_index_cp:
-                actual_seq_lengths_q -= bs * attention_tp_rank
-                actual_seq_lengths_q = torch.max(
-                    actual_seq_lengths_q,
-                    torch.zeros_like(actual_seq_lengths_q).to(
-                        device=actual_seq_lengths_q.device
-                    ),
-                )
-                actual_seq_lengths_q = torch.min(
-                    actual_seq_lengths_q,
-                    torch.full(actual_seq_lengths_q.shape, bs).to(
-                        device=actual_seq_lengths_q.device
-                    ),
-                )
-
         else:
-            if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
+            if forward_batch.attn_metadata.query_len_tensor is None:
                 actual_seq_lengths_q = torch.tensor(
                     [1 + i * 1 for i in range(bs)], dtype=torch.int32, device=k.device
                 )
             else:
                 actual_seq_lengths_q = (
-                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
+                    forward_batch.attn_metadata.query_len_tensor
                 )
+            actual_seq_lengths_kv = forward_batch.attn_metadata.seq_lens_tensor.cumsum(dim=0)
 
-        past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
-
-        x = x.view(-1, self.hidden_size)
-        weights = self.weights_proj(x)[0]
+        past_key_states = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
         block_table = (
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
         )
+        x = x.view(-1, self.hidden_size)
+        weights = self.weights_proj(x)[0]
+        if is_prefill and global_server_args_dict.get("enable_mla_l1_5_cache", False):
+            # pcp
+            attn_metadata = forward_batch.attn_metadata
+            past_key_state_local = past_key_states.reshape(-1, self.head_dim).index_select(0, attn_metadata.kv_index_list)
+            rank_counts = attn_metadata.per_rank_count
+            inv_perm = attn_metadata.inv_perm
 
-        topk_indices = torch.ops.custom.npu_lightning_indexer(
-            query=q.view(-1, self.n_heads, self.head_dim),
-            key=past_key_states,
-            weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-            actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(torch.int32),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
+            attn_tp_group = get_attn_tp_group()
+            tp_size = attn_tp_group.world_size
+            device_group = attn_tp_group.device_group
 
-        if is_prefill and enable_index_cp:
-            topk_indices, local_topk_indices = (
-                torch.empty(
-                    (
-                        topk_indices.shape[0] * attention_tp_size,
-                        topk_indices.shape[1],
-                        topk_indices.shape[2],
-                    ),
-                    dtype=topk_indices.dtype,
-                    device=topk_indices.device,
-                ),
-                topk_indices,
+            past_key_state_gathered = [
+                torch.empty(rank_counts[r], self.head_dim,
+                            dtype=past_key_state_local.dtype, device=past_key_state_local.device)
+                for r in range(tp_size)
+            ]
+
+            torch.distributed.all_gather(past_key_state_gathered, past_key_state_local, group=device_group)
+
+            past_key_states = torch.cat(past_key_state_gathered, dim=0)[inv_perm].view(-1, 1, self.head_dim)
+            block_table = None
+            layout_key = "TND"
+
+        use_dcp = (global_server_args_dict["kvp_size"] > 1)
+        if not is_prefill and use_dcp:
+            #dcp
+            block_table = forward_batch.attn_metadata.kvp_block_table
+            kvp_group = get_attn_tp_group()
+            kvp_rank = kvp_group.rank_in_group
+            kvp_size = global_server_args_dict["kvp_size"]
+            actual_seq_lengths_query=actual_seq_lengths_q.to(k.device).to(torch.int32)
+            actual_seq_lengths_key=forward_batch.attn_metadata.kvp_context_lens_tensor.to(k.device).to(torch.int32)
+            cur_seq_lengths_query = torch.concat((torch.tensor([0], device=k.device, dtype=torch.int32), actual_seq_lengths_q.to(k.device).to(torch.int32)))
+            sparse_mode = 0
+            if kvp_rank == 0:
+                sparse_mode = 3
+            init_cnt_req = forward_batch.attn_metadata.init_cnt_req
+            local_cnt_req = forward_batch.attn_metadata.local_cnt_req
+            topk_indices_local, topk_values = torch_npu.npu_lightning_indexer(
+                q.view(-1, self.n_heads, self.head_dim), 
+                past_key_states, weights.to(torch.bfloat16),
+                actual_seq_lengths_query=actual_seq_lengths_query,   # (B+1,)
+                actual_seq_lengths_key=actual_seq_lengths_key,       # (B+1,)
+                block_table=block_table,                        # (B, max_blocks)
+                layout_query="TND",
+                layout_key=layout_key,
+                sparse_count=self.index_topk,
+                sparse_mode=sparse_mode,
+                return_value=True,
             )
-            get_attention_tp_group().all_gather_into_tensor(
-                topk_indices, local_topk_indices
+
+            q_len = cur_seq_lengths_query[1:] - cur_seq_lengths_query[:-1]
+            kv_len = forward_batch.attn_metadata.kvp_context_lens_tensor
+            T, D = topk_values.shape[0], topk_values.shape[2]
+            seq_range = torch.arange(T).to(k.device)                 
+            cumsum = torch.cumsum(q_len, dim=0)         
+            batch_id  = (seq_range.unsqueeze(1) >= cumsum.unsqueeze(0)).sum(dim=1)  # [T]
+            token_kv_len = kv_len[batch_id]                 # [T]
+
+            mask = torch.arange(D).to(k.device)[None,:]>=token_kv_len[:,None]
+            mask = mask[:,None,:]
+            topk_values.masked_fill_(mask, float('-inf'))
+ 
+            sparse_topk = self.index_topk - self.num_init_tokens - self.num_local_tokens
+            idx = topk_indices_local.squeeze(1).to(torch.int64)   # [T, D]
+            val = topk_values.squeeze(1)                    # [T, D]
+            T, D = idx.shape
+            device = idx.device
+            q_lens = (cur_seq_lengths_query[1:] - cur_seq_lengths_query[:-1]).to(torch.int64) 
+            global_hist_lens = forward_batch.attn_metadata.seq_lens_tensor - q_lens
+            q_cumsum = actual_seq_lengths_q.to(k.device).to(torch.int32)
+            q_start  = torch.cat([torch.tensor([0]).to(k.device).to(torch.int32), q_cumsum[:-1]])
+            kv_len = forward_batch.attn_metadata.kvp_context_lens_tensor
+            seq_id = torch.zeros(T, dtype=torch.int32).to(k.device)
+            seq_id.scatter_(0, q_start.to(torch.int64), torch.ones(len(q_lens), dtype=torch.int32).to(k.device))
+            seq_id = seq_id.cumsum(0) - 1
+            # 计算每个token对应的kv len.
+            if kvp_rank == 0:
+                token_kv_len = kv_len[seq_id]
+                token_q_len = q_lens[seq_id]
+                token_start = q_start[seq_id]
+                local_pos = torch.arange(T).to(k.device) - token_start
+                kv_pos = token_kv_len - token_q_len + local_pos + 1 # 每个token对应的kv len
+                local_curr = local_cnt_req[seq_id] + local_pos + 1 # 每个token对应的local token数
+                kv_local_start = kv_pos - local_curr # 每个token对应的local开始的index
+                kv_init_end = init_cnt_req[seq_id] # 每个token对应的init的个数
+            else:
+                kv_pos = kv_len[seq_id]
+                kv_local_start = kv_pos - local_cnt_req[seq_id]
+                kv_init_end = init_cnt_req[seq_id]
+            
+            # mask
+            # init&local
+            valid_idx = idx >= 0
+            val = val.masked_fill_(~valid_idx, float("-inf"))
+            forced = (
+                (idx < kv_init_end.unsqueeze(1)) |
+                (idx >= kv_local_start.unsqueeze(1))
             )
+            forced = forced & valid_idx
+            val = val.masked_fill_(forced, float("-inf"))
+
+            val_flat = val.contiguous().view(-1)
+            idx_flat = idx.contiguous().view(-1)
+            gather_flat = torch.empty(
+                kvp_size*val_flat.numel(),
+                dtype=topk_values.dtype,
+                device=topk_values.device,
+            )
+            gather_flat_idx = torch.empty(
+                kvp_size*idx_flat.numel(),
+                dtype=idx.dtype,
+                device=idx.device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                gather_flat,
+                val_flat,
+                group=kvp_group.device_group,
+            )
+            torch.distributed.all_gather_into_tensor(
+                gather_flat_idx,
+                idx_flat,
+                group=kvp_group.device_group,
+            )
+            all_val = (
+                gather_flat.view(kvp_size, T, D)
+                .transpose(0, 1)            # [T, kvp_size, D]
+                .contiguous()
+                .view(T, kvp_size * D)      # [T, kvp_size*D]
+            )
+            all_idx = (
+                gather_flat_idx.view(kvp_size, T, D)
+                .transpose(0, 1)            # [T, kvp_size, D]
+                .contiguous()
+                .view(T, kvp_size * D)      # [T, kvp_size*D]
+            )
+            #计算 非init和非local的值
+            _, indcies = all_val.topk(sparse_topk, dim=1)
+            gather_idx = torch.gather(all_idx, dim=1, index=indcies)
+            mask_indcies = (indcies//self.index_topk == kvp_rank)
+            gather_idx = gather_idx.masked_fill_(~mask_indcies,-1)
+
+            #合并
+            base_init = torch.arange(self.num_init_tokens).unsqueeze(0).expand(T, -1).to(k.device)
+            mask_init = (base_init < kv_init_end.unsqueeze(1)).to(k.device)
+            # 超出部分填-1
+            init_res = torch.where(mask_init, base_init, -1)
+
+            offset = torch.arange(self.num_local_tokens).unsqueeze(0).expand(T, -1).to(k.device)
+            values = kv_local_start.unsqueeze(1) + offset
+            local_lens = kv_pos - kv_local_start 
+            mask_local = offset < local_lens.unsqueeze(1)
+            init_local = torch.where(mask_local, values, torch.tensor(-1))
+            # init+local+sparse
+            topk_indices = torch.cat([init_res, init_local, gather_idx], dim=1)
+            mask_res = (topk_indices == -1).to(torch.float32).to(k.device)
+            _, order = torch.sort(mask_res, dim=1)
+            topk_indices = topk_indices.gather(1, order)
+      
+
+            if global_server_args_dict["npu_kvp_accuracy_fix"] and kvp_rank == 0:
+                assert global_server_args_dict["npu_disable_kv_nz"]
+                from sglang.srt.env import ENV
+                torchair_enable = forward_batch.all_decode_or_idle and ENV.npu_enable_graph
+                import torchair as tng
+                if torchair_enable:
+                    tng.scope.npu_wait_tensor(past_key_states, topk_indices_local)
+                slot_mapping = forward_batch.attn_metadata.kvp_current_slots_mapping
+                torch_npu.npu_scatter_nd_update_(past_key_states.view(-1, 1, self.head_dim), slot_mapping.reshape(-1, 1), k)
+            return topk_indices.to(torch.int32).unsqueeze(1)
+
+
+        enable_sp_for_indexer = is_prefill and global_server_args_dict.get("enable_mla_l1_5_cache", False) and global_server_args_dict["npu_enable_sp_for_indexer"]
+
+        if not enable_sp_for_indexer:
+            cur_seq_lengths_query = torch.concat((torch.tensor([0], device=k.device, dtype=torch.int32), actual_seq_lengths_q.to(k.device).to(torch.int32)))
+            cur_seq_lengths_key = torch.concat((torch.tensor([0], device=k.device, dtype=torch.int32), actual_seq_lengths_kv.to(k.device).to(torch.int32)))
+            topk_indices, _ = torch_npu.mlp_lightning_indexer(
+                q.view(-1, self.n_heads, self.head_dim),
+                past_key_states, weights.to(torch.float32),
+                cur_seq_lengths_query=cur_seq_lengths_query,   # (B+1,)
+                cur_seq_lengths_key=cur_seq_lengths_key,       # (B+1,)
+                block_table=block_table,                        # (B, max_blocks)
+                layout_query="TND",
+                layout_key=layout_key,
+                sparse_count=self.index_topk,
+                kv_block_len=self.kv_block_size,
+                q_block_len=self.q_block_size,
+                init_num=self.num_init_tokens,
+                local_num=self.num_local_tokens,
+                sparse_mode=3,
+            )
+        else:
+            attn_sp_token_nums = get_attn_tp_group().get_local_sp_token_num(forward_batch.global_sp_num_tokens)
+            cu_start_cpu = torch.tensor([0], dtype = torch.int32)
+            global_cu_kv_lens_cpu = torch.concat((cu_start_cpu, torch.tensor(forward_batch.attn_metadata.actual_seq_lengths_kv, dtype =torch.int32)))
+            cur_cu_extend_lens_cpu = torch.concat((cu_start_cpu, torch.tensor(forward_batch.attn_metadata.actual_seq_lengths, dtype = torch.int32)))
+            attn_sp_token_nums_cpu = torch.tensor(attn_sp_token_nums, dtype =torch.int32)
+            cu_attn_sp_token_nums_cpu = torch.concat((cu_start_cpu, torch.cumsum(attn_sp_token_nums_cpu, dim = 0)))
+            global_kv_lens_cpu = global_cu_kv_lens_cpu[1:] - global_cu_kv_lens_cpu[:-1]
+            cur_extend_lens_cpu = cur_cu_extend_lens_cpu[1:] - cur_cu_extend_lens_cpu[:-1]
+            cp_rank = get_attn_tp_group().rank_in_group
+            cp_size = get_attn_tp_group().world_size
+            local_extend_lens_with_zero, local_total_kv_lens_with_zero = compute_local_lens(cur_extend_lens_cpu, global_kv_lens_cpu - cur_extend_lens_cpu, attn_sp_token_nums_cpu, cp_rank)
+            
+            forward_batch.local_extend_lens_with_zero = local_extend_lens_with_zero
+            forward_batch.local_total_kv_lens_with_zero = local_total_kv_lens_with_zero
+            forward_batch.global_cu_kv_lens_cpu = global_cu_kv_lens_cpu
+            forward_batch.cu_attn_sp_token_nums_cpu = cu_attn_sp_token_nums_cpu
+
+            if local_extend_lens_with_zero.sum().item() > 0:
+                past_key_states, local_extend_lens, local_total_kv_lens = get_non_zero(past_key_states, global_cu_kv_lens_cpu, local_extend_lens_with_zero, local_total_kv_lens_with_zero)
+                cur_seq_lengths_query_cpu = torch.concat((cu_start_cpu, torch.cumsum(local_extend_lens, dim = 0)))
+                cu_local_total_kv_lens_cpu = torch.concat((cu_start_cpu, torch.cumsum(local_total_kv_lens, dim = 0)))
+                slice_start = cu_attn_sp_token_nums_cpu[cp_rank].item()
+                slice_end = cu_attn_sp_token_nums_cpu[cp_rank+1].item()
+                q = q.view(-1, self.n_heads, self.head_dim)[slice_start:slice_end].contiguous()
+                weights = weights[slice_start:slice_end].contiguous()
+                #past_key_states = get_local_past_key_states(past_key_states, global_cu_kv_lens_cpu, cu_local_total_kv_lens_cpu)
+
+                cur_seq_lengths_query = cur_seq_lengths_query_cpu.to(k.device).to(torch.int32)
+                cur_seq_lengths_key = cu_local_total_kv_lens_cpu.to(k.device).to(torch.int32)
+
+                forward_batch.cur_seq_lengths_query = cur_seq_lengths_query
+                forward_batch.cur_seq_lengths_key = cur_seq_lengths_key
+
+                topk_indices, _ = torch_npu.mlp_lightning_indexer(
+                    q.view(-1, self.n_heads, self.head_dim),
+                    past_key_states, weights.to(torch.float32),
+                    cur_seq_lengths_query=cur_seq_lengths_query,   # (B+1,)
+                    cur_seq_lengths_key=cur_seq_lengths_key,       # (B+1,)
+                    block_table=block_table,                        # (B, max_blocks)
+                    layout_query="TND",
+                    layout_key=layout_key,
+                    sparse_count=self.index_topk,
+                    kv_block_len=self.kv_block_size,
+                    q_block_len=self.q_block_size,
+                    init_num=self.num_init_tokens,
+                    local_num=self.num_local_tokens,
+                    sparse_mode=3,
+                )
+            else:
+                topk_indices = torch.empty((0, 1, self.index_topk), dtype = torch.int32, device = k.device)
+            #topk_indices = get_attn_tp_group().all_gather(topk_indices, dim=0, output_split_sizes=attn_sp_token_nums)
 
         return topk_indices
 
@@ -751,8 +1015,9 @@ class IndexerBf16(nn.Module):
         scale_fmt: Optional[str],
         block_size: int = 128,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        is_rope_neox_style = False,
+        is_neox_style = False,
         prefix: str = "",
+        config: Optional[PretrainedConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
@@ -801,13 +1066,17 @@ class IndexerBf16(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
-            is_neox_style=is_rope_neox_style,
+            is_neox_style=is_neox_style,
             device="cuda" if not is_npu() else "npu",
         )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
         self.topk = 2048
+        self.kv_block_size = getattr(config, "kv_block_size", 1)
+        self.q_block_size = getattr(config, "q_block_size", 1)
+        self.num_init_tokens = getattr(config, "index_init_tokens", 0)
+        self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
     def _get_topk_ragged(
         self,
@@ -843,7 +1112,7 @@ class IndexerBf16(nn.Module):
             all_qk_logits[q_st:q_ed, :index_score.shape[1]] = index_score
 
         return all_qk_logits
-    
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -856,7 +1125,7 @@ class IndexerBf16(nn.Module):
             assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
         page_size = 64
         block_tables = metadata.get_page_table_64()
-        seqlens_32 = metadata.get_seqlens_int32()
+        seqlens_32 = metadata.get_seqlens_expanded()
         index_k_cache = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
             layer_id=layer_id
         )
@@ -900,10 +1169,11 @@ class IndexerBf16(nn.Module):
         self,
         x: torch.Tensor,
         q_lora: torch.Tensor,
+        index_k: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
-        unit_test: bool = False
+        **kwargs,
     ):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
@@ -926,7 +1196,7 @@ class IndexerBf16(nn.Module):
         q_rope, _ = torch.split(
             query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
         )
-        key, _ = self.wk(x)
+        key = index_k
         key = self.k_norm(key)
         k_rope, _ = torch.split(
             key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -947,7 +1217,11 @@ class IndexerBf16(nn.Module):
         weights = weights.unsqueeze(-1) * self.softmax_scale
 
         if is_cuda():
-            if forward_batch.forward_mode.is_decode_or_idle():
+            if (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            ):
                 qk_logits = self._get_topk_paged(
                     forward_batch, layer_id, query, weights, metadata
                 )
@@ -961,8 +1235,11 @@ class IndexerBf16(nn.Module):
                     qk_logits = self._get_topk_paged_extend(
                         forward_batch, layer_id, query, weights, metadata
                     )
-        topk_result = metadata.topk_transform(qk_logits, self.index_topk)
-        if unit_test:
+        topk_result = metadata.topk_transform(
+            qk_logits, self.index_topk,
+            num_init_and_local_tokens=[self.num_init_tokens, self.num_local_tokens],
+        )
+        if kwargs.get("unit_test", False):
             return qk_logits, topk_result
         return topk_result
 
@@ -1007,7 +1284,7 @@ def triton_mqa_logits_kernel(
     w = tl.load(
         w_ptr + pid_b * w_stride_b + off_m
     )
-    
+
     for i in range(0, tl.cdiv(cur_seq_len, BLOCK_N)):
         page_id = tl.load(block_table+i)
         k_st = i * BLOCK_N
@@ -1090,7 +1367,7 @@ def triton_mqa_extend_logits_kernel(
     w = tl.load(
         w_ptr + pid * w_stride_s + off_m
     )
-    
+
     for i in range(0, tl.cdiv(cur_seq_len, BLOCK_N)):
         page_id = tl.load(block_table+i)
         k_st = i * BLOCK_N

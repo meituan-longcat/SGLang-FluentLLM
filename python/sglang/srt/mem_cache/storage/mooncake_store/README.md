@@ -89,7 +89,7 @@ This service is responsible for centralized metadata management including intern
 
 Deployment of the `metadata service` can be skipped in the following cases:
 * Mooncake supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.
-* Mooncake also supports embedding `mededata service` into `master service`. In this case, only the `master service` needs to be started.
+* Mooncake also supports embedding `metadata service` into `master service`. In this case, only the `master service` needs to be started.
 
 **Launch Mooncake `master service`:**
 

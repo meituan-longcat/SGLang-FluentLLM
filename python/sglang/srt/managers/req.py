@@ -360,6 +360,7 @@ class Req:
         self.already_computed = 0
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        self.l2_cache_hit_len = None  # Track L2 cache hits (before prefetch)
 
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
@@ -466,8 +467,10 @@ class Req:
             (self.prefix_page_ids, self.prefix_len, self.last_node, self.last_host_node, self.host_hit_length) = (
                 match_result.device_indices, match_result.device_prefix_length, match_result.last_device_node, match_result.last_host_node, match_result.host_hit_length
             )
+            if self.l2_cache_hit_len == None:
+                self.l2_cache_hit_len = self.host_hit_length
             logger.debug(
-                f"init_next_round_input after  match rid={self.rid} req_pool_idx={self.req_pool_idx} prefix_len={self.prefix_len} prefix_page_ids={self.prefix_page_ids}"
+                f"init_next_round_input after  match rid={self.rid} req_pool_idx={self.req_pool_idx} prefix_len={self.prefix_len} prefix_page_ids={self.prefix_page_ids} {self.host_hit_length=} {self.l2_cache_hit_len=}"
             )
         self.extend_input_len = len(self.fill_ids) - self.prefix_len
 
@@ -505,7 +508,6 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
-    # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
         first_iter = self.surr_offset is None or self.read_offset is None
 
@@ -516,9 +518,16 @@ class Req:
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
             # self.surr_offset = self.read_offset
+            self.surr_and_decode_ids = (
+                    self.origin_input_ids_unpadded[self.surr_offset :] + self.output_ids
+                )
+            self.cur_decode_ids_len = len(self.output_ids)
+        else:
+            # copied from https://github.com/sgl-project/sglang/pull/10412/ to optimize post-processing performance
+            self.surr_and_decode_ids.extend(self.output_ids[self.cur_decode_ids_len :])
+            self.cur_decode_ids_len = len(self.output_ids)
 
-        all_ids = self.origin_input_ids_unpadded + self.output_ids
-        return all_ids[self.surr_offset :], self.read_offset - self.surr_offset
+        return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
     def check_finished(self):
         if self.finished():
@@ -579,7 +588,7 @@ class Req:
         offload_len = len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
         # The allocated slots may be more than origin_input_ids + output_ids - 1
         token_indices = req_page_info.alloced_slots[:offload_len]
-        logger.debug(f"[Req] {self} offload page_indices: {len(token_indices)}")
+        logger.info(f"[Req] {self} offload page_indices: {len(token_indices)}")
         self.kv_cache_cpu = token_to_kv_pool.get_cpu_copy(token_indices)
 
     def load_kv_cache(
@@ -587,7 +596,7 @@ class Req:
     ):
         req_page_info = req_to_token_pool.get_req_pool_info(self.req_pool_idx)
         token_indices = req_page_info.alloced_slots
-        logger.debug(f"[Req] {self} load page_indices: {len(token_indices)}")
+        logger.info(f"[Req] {self} load page_indices: {len(token_indices)}")
         token_to_kv_pool.load_cpu_copy(self.kv_cache_cpu, token_indices)
         del self.kv_cache_cpu
 

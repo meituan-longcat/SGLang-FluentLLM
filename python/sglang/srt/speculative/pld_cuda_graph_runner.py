@@ -92,20 +92,29 @@ class PLDCudaGraphRunner:
             self.positions = torch.arange(0, self.max_num_token, dtype=torch.int64)
             self.seq_lens = torch.full((self.max_bs,), 1, dtype=torch.int32)
 
-            # Sampling tensors if needed
-            if self.capture_sample_graph:
-                self.temperature_buffer = torch.zeros((self.max_bs, 1), dtype=torch.float32)
-                self.topk_buffer = torch.zeros((self.max_bs,), dtype=torch.int32)
-                self.topp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
-                self.minp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
+            # Sampling tensors
+            self.temperature_buffer = torch.zeros((self.max_bs, 1), dtype=torch.float32)
+            self.topk_buffer = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.topp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
+            self.minp_buffer = torch.zeros((self.max_bs,), dtype=torch.float32)
 
             # DP attention tensors if needed
             if self.enable_dp_attention:
                 self.gathered_buffer = torch.zeros(
-                    (self.max_num_token * self.tp_size,
-                     self.target_worker.model_runner.model_config.hidden_size),
+                    (
+                        self.max_num_token * self.tp_size,
+                        self.target_worker.model_runner.model_config.hidden_size,
+                    ),
                     dtype=self.target_worker.model_runner.dtype,
                 )
+            self.scaling_penalties = torch.ones(
+                (self.max_bs,),
+                dtype=torch.float32
+            )
+            self.cumulated_scaling_penalties = torch.ones(
+                (self.max_bs, self.target_worker.model_runner.model_config.vocab_size),
+                dtype=torch.float32
+            )
             if self.use_over_embedding:
                 self.oe_column_starts = torch.empty([self.max_bs], dtype=torch.int32)
                 self.oe_req_lens = torch.empty([self.max_bs], dtype=torch.int32)
@@ -242,8 +251,10 @@ class PLDCudaGraphRunner:
         elif self.grammar_backend:
             self.grammar_backend.reset_vocab_masks(self.vocab_masks[:raw_num_token])
 
+        sampling_info = forward_batch.sampling_info
+        self.scaling_penalties[: raw_bs].copy_(sampling_info.repetition_penalties)
+        self.cumulated_scaling_penalties[: raw_bs].copy_(forward_batch.spec_info.cumulated_scaling_penalties)
         if self.capture_sample_graph:
-            sampling_info = forward_batch.sampling_info
             self.temperature_buffer[:raw_bs].copy_(sampling_info.temperatures)
             self.topk_buffer[:raw_bs].copy_(sampling_info.top_ks)
             self.topp_buffer[:raw_bs].copy_(sampling_info.top_ps)
@@ -438,16 +449,16 @@ class PLDCudaGraphRunner:
             global_batch_size=global_batch_size,
         )
 
-        if self.capture_sample_graph:
-            forward_batch.sampling_info = SamplingBatchInfo(
-                temperatures=self.temperature_buffer[:bs],
-                top_ks=self.topk_buffer[:bs],
-                top_ps=self.topp_buffer[:bs],
-                min_ps=self.minp_buffer[:bs],
-                is_all_greedy=False,
-                need_min_p_sampling=False,
-                vocab_size=self.target_worker.model_runner.model_config.vocab_size,
-            )
+        forward_batch.sampling_info = SamplingBatchInfo(
+            temperatures=self.temperature_buffer[:bs],
+            top_ks=self.topk_buffer[:bs],
+            top_ps=self.topp_buffer[:bs],
+            min_ps=self.minp_buffer[:bs],
+            repetition_penalties=self.scaling_penalties[:bs],
+            is_all_greedy=False if self.capture_sample_graph else True,
+            need_min_p_sampling=False,
+            vocab_size=self.target_worker.model_runner.model_config.vocab_size,
+        )
 
         return forward_batch
 
@@ -467,6 +478,7 @@ class PLDCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             is_all_greedy=False if self.capture_sample_graph else True,
             grammar=grammar,
+            cumulated_scaling_penalties=self.cumulated_scaling_penalties[:bs, :],
         )
         return spec_info
 

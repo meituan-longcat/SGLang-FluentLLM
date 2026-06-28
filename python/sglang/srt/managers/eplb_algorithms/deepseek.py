@@ -3,6 +3,9 @@ from typing import Tuple
 
 import torch
 
+from sglang.srt.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 
 def balanced_packing(
@@ -204,7 +207,7 @@ def rebalance_experts(
         )
     maxlogcnt = logcnt.max().item()
     log2phy: torch.Tensor = torch.full(
-        (num_layers, num_logical_experts, maxlogcnt),
+        (num_layers, num_logical_experts + 1, maxlogcnt),
         -1,
         dtype=torch.int64,
         device=logcnt.device,
@@ -216,6 +219,7 @@ def rebalance_experts(
             num_layers, -1
         ),
     )
+    log2phy[:, num_logical_experts, 0] = num_replicas
     return phy2log, log2phy, logcnt
 
 

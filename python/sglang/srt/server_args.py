@@ -21,13 +21,13 @@ from typing import List, Optional, Literal
 
 import torch
 
-from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.distributed.parallel_strategy import (
     AttnParallelStrategy,
     DenseParallelStategy,
     MoeParallelStrategy,
 )
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -43,6 +43,7 @@ from sglang.srt.utils import (
 )
 
 logger = get_colorful_logger(__name__)
+__is_npu__ = is_npu()
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
@@ -57,6 +58,7 @@ class ServerArgs:
     trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
+    index_k_dtype: str = "fp8_e4m3"
     kv_cache_quant_method: str = "none"
     quantization: Optional[str] = None
     quantization_param_path: nullable_str = None
@@ -83,6 +85,7 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     cpu_offload_gb: int = 0
     page_size: int = 64
+    enable_mla_l1_5_cache: bool = False
     # special kv cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: str = "float32"
@@ -141,6 +144,11 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
 
+    # Pipeline parallelism
+    pp_size: int = 1
+    pp_max_micro_batch_size: Optional[int]=None
+    pp_async_batch_depth: int=0
+
     # Hierarchical cache
     radix_eviction_policy: str = "lru"
     enable_hierarchical_cache: bool = False
@@ -176,13 +184,14 @@ class ServerArgs:
     speculative_draft_model_path: Optional[str] = None
     speculative_num_steps: int = 5
     speculative_eagle_topk: int = 4
-    speculative_num_draft_tokens: int = 8
+    speculative_num_draft_tokens: int = 1
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     prompt_lookup_min: int = 0
     prompt_lookup_max: int = 0
     eagle3_layers_to_capture: Optional[str] = None
+    is_multi_head_eagle: Optional[bool] = False
 
     # Optimization/debug options
     disable_pdl: bool = False
@@ -202,7 +211,7 @@ class ServerArgs:
     force_deterministic_rsag: bool = False
     low_latency_max_num_tokens_per_gpu: int = 256
     enable_torch_compile: bool = False
-    torch_compile_max_bs: int = 32
+    torch_compile_max_bs: int = 4
     cuda_graph_max_bs: Optional[int] = None
     disable_prefill_graph: Optional[bool] = False
     prefill_graph_max_tokens: Optional[int] = 128
@@ -233,6 +242,7 @@ class ServerArgs:
     nprocs_per_node: int = 1
     world_size: int = 1
     attn_tp_size: int = 1
+    kvp_size: int = 1
     dense_tp_size: int = -1
     moe_parallel_strategy: str = "tp"
     attn_parallel_strategy: str = "tp"
@@ -259,12 +269,35 @@ class ServerArgs:
 
     # For NPU
     npu_enable_weight_nz: bool = False
-    npu_enable_mc2: bool = False
-    npu_enable_mlp_matmul: bool = False
     npu_enable_opt_rope: bool = False
+    npu_hccl_buffsize_a2a: int = 200
+    npu_o_proj_tp_size: int = 0
+    npu_smooth_quant: bool = False
+    npu_kvp_accuracy_fix: bool = False
+    npu_enable_super_kernel: bool = False
+    npu_disable_kv_nz: bool = False
+    npu_enable_graph_cache: bool = False
+    npu_graph_cache_path: Optional[str] = None
+    npu_compile_bs: Optional[str] = None
+    npu_disable_all_gather: bool = False
+    npu_scheduler_comm: bool = False
+    npu_enable_sp_for_indexer: bool = False
+    npu_disable_dsa_head_parallel: bool = False
+    npu_enable_a2_dispatch_combine_opt: bool = False
+    npu_lmhead_tp_size: int = 0
+    npu_enable_oe_cpu_offload: bool = False
+    pp_layer_nums: Optional[List[int]] = None
+    ret_first_token_no_waiting: bool = False
+    ttft_by_input_len_list: Optional[str] = None # e.g. "16384,32768,49152,65536,81920,98304,114688,131072"
+    npu_moe_chunked_prefill_size: int = -1
+    npu_limit_max_new_tokens: Optional[int] = None
 
     # For flashinfer reduce norm fusion
     flashinfer_comm_max_num_tokens: int = 64
+    # For Tokenizer ProcessPoolExecutor
+    tokenizer_executor_num_processes: Optional[int] = None
+
+    draft_use_oe: bool = False
 
     def __post_init__(self):
         self.model_path = maybe_model_redirect(self.model_path)
@@ -345,52 +378,62 @@ class ServerArgs:
         if self.chunker_backend is None:
             self.chunker_backend = "fa3"
 
+        if self.max_running_requests is None:
+            self.max_running_requests = 48
+
         assert (
-            self.dp_size * self.attn_tp_size == self.world_size
-        ), f"{self.dp_size} * {self.attn_tp_size} == {self.world_size}"
+            self.pp_size * self.dp_size * self.attn_tp_size == self.world_size
+        ), f"{self.pp_size} * {self.dp_size} * {self.attn_tp_size} == {self.world_size}"
+
+        if self.kvp_size > 1:
+            assert (
+                self.kvp_size == self.attn_tp_size
+            ), f"kvp_size({self.kvp_size}) should equal to attn_tp_size({self.attn_tp_size}) when kvp_size > 1"
 
         assert self.max_running_requests >= self.dp_size, f"{self.max_running_requests=} < {self.dp_size=}"
 
         FLLM_IS_CP = os.environ.get("FLLM_IS_CP", "0") in ["True", "true", "1"]
         assert not FLLM_IS_CP or self.max_running_requests == 1, "FLLM DSA CP enable, only support batchsize=1"
 
-        if self.dp_size == self.world_size:
+        self.tp_size = self.attn_tp_size * self.dp_size
+
+        if self.dp_size == self.tp_size:
             self.enable_dp_attention = True
             self.attn_parallel_strategy = AttnParallelStrategy.DATA_PARALLEL
+        elif self.attn_tp_size == self.tp_size:
+            if not __is_npu__:
+                self.attn_parallel_strategy = AttnParallelStrategy.TENSOR_PARALLEL
+            self.enable_dp_attention = False
         else:
             self.attn_parallel_strategy = AttnParallelStrategy.TENSOR_PARALLEL
-            if self.attn_tp_size == self.world_size:
-                self.enable_dp_attention = False
-            else:
-                self.enable_dp_attention = True
+            self.enable_dp_attention = True
 
-        # Currently equals world_size
-        self.tp_size = self.attn_tp_size * self.dp_size
         # dense parallel
         if self.world_size == 1:
             self.dense_parallel_strategy = DenseParallelStategy.REPLICATED
 
-        if self.dense_parallel_strategy == DenseParallelStategy.REPLICATED:
-            self.dense_tp_size = 1
-        else:
-            # Default dense_tp_size == attn_tp_size, if dense_tp_size is 1, then modify to nprocs_per_node and raise a warning
-            if self.dense_tp_size <= 0:
-                self.dense_tp_size = self.attn_tp_size
-            if self.dense_tp_size == 1:
-                # attn is pure dp
-                self.dense_tp_size = self.nprocs_per_node
-                logger.warning(
-                    f"TP dense is enabled. The dense tp size must be greater than 1, but got dense_tp_size={self.dense_tp_size}." + \
-                    f"The final dense tp size will be changed to {self.nprocs_per_node}."
-                )
+        if not __is_npu__:
+            if self.dense_parallel_strategy == DenseParallelStategy.REPLICATED:
+                self.dense_tp_size = 1
             else:
-                if self.attn_tp_size > 1:
-                    # attn is dp tp combination, dense dp tp must be the same as attn
-                    assert self.dense_tp_size == self.attn_tp_size, \
-                        f"When attn is not only dp," + \
-                        f"the dp tp of dense must be the same as that of attn," + \
-                        f"does not support the hybrid communication mode for the time being:" + \
-                        f"{self.dense_tp_size=} | {self.attn_tp_size=}"
+                # Default dense_tp_size == attn_tp_size, if dense_tp_size is 1, then modify to nprocs_per_node and raise a warning
+                if self.dense_tp_size <= 0:
+                    self.dense_tp_size = self.attn_tp_size
+                if self.dense_tp_size == 1:
+                    # attn is pure dp
+                    self.dense_tp_size = self.nprocs_per_node
+                    logger.warning(
+                        f"TP dense is enabled. The dense tp size must be greater than 1, but got dense_tp_size={self.dense_tp_size}." + \
+                        f"The final dense tp size will be changed to {self.nprocs_per_node}."
+                    )
+                else:
+                    if self.attn_tp_size > 1:
+                        # attn is dp tp combination, dense dp tp must be the same as attn
+                        assert self.dense_tp_size == self.attn_tp_size, \
+                            f"When attn is not only dp," + \
+                            f"the dp tp of dense must be the same as that of attn," + \
+                            f"does not support the hybrid communication mode for the time being:" + \
+                            f"{self.dense_tp_size=} | {self.attn_tp_size=}"
 
         if self.attn_parallel_strategy == AttnParallelStrategy.DATA_PARALLEL or self.attn_tp_size != self.world_size:
             # Originally divided by 2, not sure why yet, leave it for now
@@ -419,7 +462,7 @@ class ServerArgs:
 
         # Expert parallelism
         if self.enable_ep_moe:
-            self.ep_size = self.world_size
+            self.ep_size = self.tp_size
             logger.info(
                 f"EP MoE is enabled. The expert parallel size is adjusted to be the same as the world size[{self.world_size}]."
             )
@@ -430,16 +473,12 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
-        if (self.enable_eplb or (self.init_expert_location is not None)) and (
-            self.ep_dispatch_algorithm is None
-        ):
-            self.ep_dispatch_algorithm = "static"
-            logger.info(
-                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
-            )
+        if (self.enable_eplb or (self.init_expert_location != "trivial")):
+            assert self.ep_dispatch_algorithm is not None, \
+            f"EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
 
         logger.info(
-            f"Model layout configs: world_size: {self.world_size} attn_tp: {self.attn_tp_size} dp: {self.dp_size} ep: {self.ep_size}"
+            f"Model layout configs: world_size: {self.world_size} pp: {self.pp_size} attn_tp: {self.attn_tp_size} dp: {self.dp_size} ep: {self.ep_size}"
         )
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
@@ -484,9 +523,6 @@ class ServerArgs:
                 self.flashinfer_comm_max_num_tokens = self.low_latency_max_num_tokens_per_gpu
                 logger.info("self.flashinfer_comm_max_num_tokens has been changed to low_latency_max_num_tokens_per_gpu!")
 
-        if self.enable_sbo:
-            assert self.dp_size == 1, "dp not supported yet for sbo"
-
         # PD disaggregation
         if self.disaggregation_mode == "prefill":
             self.disable_cuda_graph = True
@@ -495,7 +531,12 @@ class ServerArgs:
             # Enable RadixCache for decode server to support prefix sharing
             self.disable_radix_cache = self.disable_radix_cache
             logger.info(f"{self.disable_radix_cache=} for decode server to support prefix sharing")
-            
+
+        if self.attn_tp_size == 1:
+            if self.enable_mla_l1_5_cache:
+                logger.warning("MLA l1.5 cache not enabled unless attn_tp_size > 1")
+            self.enable_mla_l1_5_cache = False
+
         if self.attention_backend != "flashinfer":
             self.disable_prefill_graph = True
             logger.warning("Prefill graph is disabled for non-flashinfer backend")
@@ -508,7 +549,18 @@ class ServerArgs:
 
         if self.disaggregation_mode == "prefill" and self.load_balance_method != "round_robin":
             assert self.dp_size == 1, (f"Not Supported when {self.disaggregation_mode=} {self.load_balance_method=} {self.dp_size=}")
-            
+
+
+        if not self.disaggregation_mode == "decode":
+            assert self.num_continuous_decode_steps == 1
+
+        if self.num_continuous_decode_steps > 1:
+            assert self.disaggregation_mode == "decode"
+            assert not self.disable_overlap_schedule
+            assert self.dp_size > 1
+
+        if self.pp_layer_nums is not None:
+            assert len(self.pp_layer_nums) == self.pp_size, f"len(self.pp_layer_nums) != self.pp_size, {self.pp_layer_nums=}"
 
 
     def _handle_hicache(self):
@@ -659,6 +711,12 @@ class ServerArgs:
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3"],
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" and "fp8_e4m3" is supported for CUDA 11.8+.',
+        )
+        parser.add_argument(
+            "--index-k-dtype",
+            type=str,
+            default=ServerArgs.index_k_dtype,
+            choices=["fp8_e4m3", "bf16"],
         )
         parser.add_argument(
             "--kv-cache-quant-method",
@@ -1190,6 +1248,7 @@ class ServerArgs:
                 "flashinfer_mla",
                 "duo_attn",
                 "hybrid_linear_attn",
+                "npu",
             ],
             help="Attention backend for drafter model in speculative decoding. "
                  "If not specified, uses the same backend as the main model (attention_backend). "
@@ -1252,7 +1311,7 @@ class ServerArgs:
             type=int,
             help="The maximum number of tokens to lookup in the prompt embedding table.",
             default=ServerArgs.prompt_lookup_max,
-        )        
+        )
         parser.add_argument(
             "--speculative-draft-model-path",
             type=str,
@@ -1301,6 +1360,11 @@ class ServerArgs:
             help="The layers of Eagle3 to capture.",
             default=ServerArgs.eagle3_layers_to_capture,
         )
+        parser.add_argument(
+            "--is-multi-head-eagle",
+            action="store_true",
+            help="Use Multi-HEAD Eagle/MTP"
+        )
 
         # Optimization/debug options
         parser.add_argument(
@@ -1322,6 +1386,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--disable-cuda-graph",
+            action="store_true",
+            help="Disable cuda graph.",
+        )
+        parser.add_argument(
+            "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable cuda graph.",
         )
@@ -1481,7 +1550,12 @@ class ServerArgs:
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
         )
-        
+
+        parser.add_argument(
+            "--enable-mla-l1-5-cache",
+            action="store_true",
+            help="Enable MLA L1.5 cache. Split kv cache of sequecne into whole tp group."
+        )
         parser.add_argument(
             "--force-reasoning",
             action="store_true",
@@ -1552,10 +1626,37 @@ class ServerArgs:
             help="Specify tp size for attn part",
         )
         parser.add_argument(
+            "--kvp-size",
+            type=int,
+            default=ServerArgs.kvp_size,
+            help="指定 dcp 时的 kvp size, 当前仅支持和 --attn-tp-size 相等",
+        )
+        parser.add_argument(
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
             help="Specify tp size for dense part, default equals nprocs-per-node, if non dp_attn && combine_dense mode, this parameter will be overridden by attn_tp_size",
+        )
+        parser.add_argument(
+            "--pipeline-parallel-size",
+            "--pp-size",
+            type=int,
+            default=ServerArgs.pp_size,
+            dest="pp_size",  # 明确指定目标属性名
+            help="指定 pipeline size",
+        )
+        parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            dest="pp_async_batch_depth",  # 明确指定目标属性名
+            help="pp_async_batch_depth",
+        )
+        parser.add_argument(
+            "--pp-layer-nums",
+            type=int,
+            nargs="+",
+            help="Set the list of pp layer nums.",
         )
         parser.add_argument(
             "--nprocs-per-node",
@@ -1635,7 +1736,7 @@ class ServerArgs:
             "--disaggregation-transfer-backend",
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
-            choices=["mooncake", "mooncake_async", "nixl"],
+            choices=["mooncake", "mooncake_async"],
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
         parser.add_argument(
@@ -1659,6 +1760,11 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
+        parser.add_argument(
+            "--draft-use-oe",
+            action="store_true"
+        )
+
         # Multi-modal inference mode
         parser.add_argument("--mm-mode", type=str, default=ServerArgs.mm_mode)
 
@@ -1669,19 +1775,135 @@ class ServerArgs:
             help="[NPU] enable weight nz",
         )
         parser.add_argument(
-            "--npu-enable-mc2",
-            action="store_true",
-            help="[NPU] enable mc2",
-        )
-        parser.add_argument(
-            "--npu-enable-mlp-matmul",
-            action="store_true",
-            help="[NPU] enable mlp_matmul",
-        )
-        parser.add_argument(
             "--npu-enable-opt-rope",
             action="store_true",
             help="[NPU] enable optimization on rope",
+        )
+
+        parser.add_argument(
+            "--npu-hccl-buffsize-a2a",
+            type=int,
+            default=ServerArgs.npu_hccl_buffsize_a2a,
+            help="Hccl buffer size for npu dispatch combine",
+        )
+
+        parser.add_argument(
+            "--npu-o-proj-tp-size",
+            type=int,
+            default=ServerArgs.npu_o_proj_tp_size,
+            help="npu o_proj tp_size, default is 1",
+        )
+        parser.add_argument(
+            "--npu-kvp-accuracy-fix",
+            action="store_true",
+            help="[NPU] enable kvp accurary fix",
+        )
+
+        parser.add_argument(
+            "--npu-smooth-quant",
+            action="store_true",
+            help="[NPU] enable smooth quant",
+        )
+        parser.add_argument(
+            "--npu-enable-super-kernel",
+            action="store_true",
+            help="[NPU] enable npu super kernel in graph mode",
+        )
+        parser.add_argument(
+            "--npu-disable-kv-nz",
+            action="store_true",
+            help="[NPU] disable npu kv cache store as nz format",
+        )
+        parser.add_argument(
+            "--npu-compile-bs",
+            type=str,
+            default=None,
+            help="[NPU] the compile bs in npu graph mode",
+        )
+        parser.add_argument(
+            "--npu-enable-graph-cache",
+            action="store_true",
+            help="[NPU] enable npu graph cache in graph mode",
+        )
+        parser.add_argument(
+            "--npu-graph-cache-path",
+            type=str,
+            default=None,
+            help="[NPU] the path of npu compile graph cache in graph mode",
+        )
+        parser.add_argument(
+            "--npu-disable-all-gather",
+            action="store_true",
+            help="[NPU] disable all gather",
+        )
+
+        # Tokenizer ProcessPoolExecutor
+        parser.add_argument(
+            "--tokenizer-executor-num-processes",
+            type=int,
+            default=ServerArgs.tokenizer_executor_num_processes,
+            help="The number of processes for Tokenizer ProcessPoolExecutor. If not specified, ProcessPoolExecutor will not be used.",
+        )
+
+        parser.add_argument(
+            "--npu-scheduler-comm",
+            action="store_true",
+            help="[NPU] npu scheduler comm",
+        )
+
+        parser.add_argument(
+            "--npu-enable-sp-for-indexer",
+            action="store_true",
+            help="[NPU] use sequence parallelism for dsa indexer",
+        )
+
+        parser.add_argument(
+            "--npu-disable-dsa-head-parallel",
+            action="store_true",
+            help="[NPU] disable head parallel when using sequence parallelism for dsa",
+        )
+
+        parser.add_argument(
+            "--npu-enable-a2-dispatch-combine-opt",
+            action="store_true",
+            help="[NPU] npu_enable_a2_dispatch_combine_opt",
+        )
+
+        parser.add_argument(
+            "--npu-lmhead-tp-size",
+            type=int,
+            default=ServerArgs.npu_lmhead_tp_size,
+            help="npu lmhead tp size",
+        )
+
+        parser.add_argument(
+            "--npu-enable-oe-cpu-offload",
+            action="store_true",
+            help="npu-enable-oe-cpu-offload",
+        )
+
+        parser.add_argument(
+            "--ret-first-token-no-waiting",
+            action="store_true",
+            help="Return first token when decode receive it",
+        )
+        parser.add_argument(
+            "--ttft-by-input-len-list",
+            type=str,
+            default=None,
+            help="Count TTFT by different input length",
+        )
+        parser.add_argument(
+            "--npu-limit-max-new-tokens",
+            type=int,
+            default=ServerArgs.npu_limit_max_new_tokens,
+            help="The model's maximum new tokens on NPU",
+        )
+        parser.add_argument(
+            "--npu-moe-chunked-prefill-size",
+            type=int,
+            default=ServerArgs.npu_moe_chunked_prefill_size,
+            help="Moe chunk size for npu prefill",
         )
 
     @classmethod
@@ -1742,13 +1964,13 @@ class PortArgs:
 
     # The port for nccl initialization (torch.dist)
     nccl_port: int
-    
+
     # The ipc filename for rpc call between Engine and Scheduler
     rpc_ipc_name: str
-    
+
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
-    
+
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 

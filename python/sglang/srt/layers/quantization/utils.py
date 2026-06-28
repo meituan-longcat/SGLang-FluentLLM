@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import re
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union, Iterable
 
 import numpy
 import torch
-import re
 from torch.nn import Module
-from types import MappingProxyType
-from typing import Iterable, List, Mapping, Optional
 
 # from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import scaled_fp8_quant
 

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 from typing import Any, AsyncGenerator, Dict, List, Union
@@ -23,7 +24,7 @@ from sglang.srt.entrypoints.openai.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager, tokenizer_decode_task
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "cmpl-"
 
-    def _convert_to_internal_request(
+    async def _convert_to_internal_request(
         self,
         request: CompletionRequest,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
@@ -176,7 +177,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Handle echo for first chunk
                 if not stream_buffer:  # The first chunk
                     if request.echo:
-                        echo_text = self._get_echo_text(request, index)
+                        echo_text = await self._get_echo_text(request, index)
                         text = echo_text + text
 
                 # Handle logprobs
@@ -237,12 +238,24 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         else None
                     ),
                 )
+                usage=None
+                if finish_reason_type:
+                    # Internal streaming interface requires finish_reason && usage in same package return, also keep logic for subsequent usage separate return
+                    usage=UsageProcessor.calculate_streaming_usage(
+                        prompt_tokens,
+                        completion_tokens,
+                        cached_tokens,
+                        spec_verify_tokens,
+                        n_choices=request.n,
+                        enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=created,
                     object="text_completion",
                     choices=[choice_data],
                     model=request.model,
+                    usage=usage,
                 )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -322,7 +335,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_completion_response(
+        response = await self._build_completion_response(
             request,
             ret,
             int(time.time()),
@@ -330,7 +343,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         return response
 
-    def _build_completion_response(
+    async def _build_completion_response(
         self,
         request: CompletionRequest,
         ret: List[Dict[str, Any]],
@@ -343,7 +356,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Prepare echo prompts if needed
         echo_prompts = []
         if request.echo:
-            echo_prompts = self._prepare_echo_prompts(request)
+            echo_prompts = await self._prepare_echo_prompts(request)
             echo = True
 
         for idx, ret_item in enumerate(ret):
@@ -415,7 +428,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             usage=usage,
         )
 
-    def _get_echo_text(self, request: CompletionRequest, index: int) -> str:
+    async def _get_echo_text(self, request: CompletionRequest, index: int) -> str:
         """Get echo text for streaming response"""
         if isinstance(request.prompt, str):
             # for the case of single str prompts
@@ -426,20 +439,21 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 return request.prompt[index // request.n]
             elif isinstance(request.prompt[0], int):
                 # for the case of single token ids prompt
-                return self.tokenizer_manager.tokenizer.decode(
-                    request.prompt, skip_special_tokens=True
-                )
+                return await self.tokenizer_manager.run_tokenizer_task(
+                    tokenizer_decode_task,
+                    request.prompt,
+                    {"skip_special_tokens": True})
             elif isinstance(request.prompt[0], list) and isinstance(
                 request.prompt[0][0], int
             ):
                 # for the case of multiple token ids prompts
-                return self.tokenizer_manager.tokenizer.decode(
+                return await self.tokenizer_manager.run_tokenizer_task(
+                    tokenizer_decode_task,
                     request.prompt[index // request.n],
-                    skip_special_tokens=True,
-                )
+                    {"skip_special_tokens": True})
         return ""
 
-    def _prepare_echo_prompts(self, request: CompletionRequest) -> List[str]:
+    async def _prepare_echo_prompts(self, request: CompletionRequest) -> List[str]:
         """Prepare echo prompts for non-streaming response"""
         # TODO: handle the case prompt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
@@ -447,18 +461,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return request.prompt
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], list):
             # for the case of multiple token ids prompts
-            return [
-                self.tokenizer_manager.tokenizer.decode(
-                    prompt, skip_special_tokens=True
-                )
+            return await asyncio.gather(*(
+                self.tokenizer_manager.run_tokenizer_task(tokenizer_decode_task, prompt, {"skip_special_tokens": True})
                 for prompt in request.prompt
-            ]
+            ))
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], int):
             # for the case of single token ids prompt
             return [
-                self.tokenizer_manager.tokenizer.decode(
-                    request.prompt, skip_special_tokens=True
-                )
+                await self.tokenizer_manager.run_tokenizer_task(
+                    tokenizer_decode_task,
+                    request.prompt,
+                    {"skip_special_tokens": True})
             ]
         else:
             # for the case of single str prompt

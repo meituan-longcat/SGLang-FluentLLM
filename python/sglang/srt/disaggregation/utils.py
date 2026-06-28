@@ -10,6 +10,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
+import numpy.typing as npt
+
 import requests
 import torch
 import torch.distributed as dist
@@ -33,8 +35,9 @@ class DisaggregationMode(Enum):
     DECODE = "decode"
 
 
-def poll_and_all_reduce(pollers, gloo_group):
+def poll_and_all_reduce(pollers, gloo_group, device=None):
     # at a certain prob, the poll is failed to simulate failure
+    device = 'cpu' if device is None else device
     if FAILURE_PROB > 0:
         from sglang.srt.disaggregation.base import KVPoll
 
@@ -44,7 +47,7 @@ def poll_and_all_reduce(pollers, gloo_group):
         ]
     else:
         polls = [int(poller.poll()) for poller in pollers]
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    tensor_to_reduce=torch.tensor(polls, dtype=torch.uint8, device=device)
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
 
@@ -75,7 +78,6 @@ class ReqToMetadataIdxAllocator:
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     MOONCAKE_ASYNC = "mooncake_async"
-    NIXL = "nixl"
     FAKE = "fake"
     COMMON = "common"
 
@@ -89,22 +91,6 @@ class KVClassType(Enum):
 
 def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
-
-    if transfer_backend == TransferBackend.COMMON:
-        from sglang.srt.disaggregation.common import (
-            CommonKVBootstrapServer,
-            CommonKVManager,
-            CommonKVReceiver,
-            CommonKVSender,
-        )
-
-        class_mapping = {
-            KVClassType.MANAGER: CommonKVManager,
-            KVClassType.SENDER: CommonKVSender,
-            KVClassType.RECEIVER: CommonKVReceiver,
-            KVClassType.BOOTSTRAP_SERVER: CommonKVBootstrapServer,
-        }
-        return class_mapping.get(class_type)
 
     if transfer_backend == TransferBackend.MOONCAKE:
         from sglang.srt.disaggregation.mooncake import (
@@ -138,21 +124,6 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         }
         return class_mapping.get(class_type)
 
-    if transfer_backend == TransferBackend.NIXL:
-        from sglang.srt.disaggregation.nixl import (
-            NixlKVBootstrapServer,
-            NixlKVManager,
-            NixlKVReceiver,
-            NixlKVSender,
-        )
-
-        class_mapping = {
-            KVClassType.MANAGER: NixlKVManager,
-            KVClassType.SENDER: NixlKVSender,
-            KVClassType.RECEIVER: (NixlKVReceiver),
-            KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
-        }
-        return class_mapping.get(class_type)
     if transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.fake import FakeKVManager, FakeKVReceiver, FakeKVSender
 
@@ -416,14 +387,20 @@ class StepCounter:
         return target_step != current_step and \
             (target_step + cls.COUNT_NUM_MAX - current_step) % cls.COUNT_NUM_MAX > cls.COUNT_NUM_MAX / 2
 
-    def __init__(self, gpu_id: int):
+    def __init__(self, device: str, gpu_id: int):
         # utilities for cache step
-        self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
+        if device == "npu":
+            self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).to(f"npu:{gpu_id}")
+        else:
+            self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
         self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.cache_step: int = 0
 
         # utilities for aux step
-        self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
+        if device == "npu":
+            self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64).to(f"npu:{gpu_id}")
+        else:
+            self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
         self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.aux_step: int = 0
 
@@ -447,3 +424,9 @@ class StepCounter:
 
     def query_ready_aux_step(self) -> int:
         return ctypes.c_int64.from_address(self.h_ready_aux_step.data_ptr()).value
+
+@dataclasses.dataclass
+class PageTransferMetadata:
+    indices_are_local: bool
+    page_transfer_mask: npt.NDArray[np.bool_]
+    page_local_indices: Optional[npt.NDArray[np.int64]] = None

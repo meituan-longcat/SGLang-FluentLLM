@@ -1,0 +1,121 @@
+From c9a0b021d664484447605b303473840fe83283a0 Mon Sep 17 00:00:00 2001
+From: Chl_SolaAir <Chl_SolaAir@noreply.gitcode.com>
+Date: Mon, 26 Jan 2026 15:41:24 +0800
+Subject: [PATCH 3/7] split swiglu
+
+---
+ op_plugin/config/op_plugin_functions.yaml     |  6 ++-
+ .../ops/opapi/MlpSplitSwigluKernelNpu.cpp     | 51 +++++++++++++++++++
+ op_plugin/python/meta/_meta_registrations.py  | 14 +++++
+ 3 files changed, 70 insertions(+), 1 deletion(-)
+ create mode 100644 op_plugin/ops/opapi/MlpSplitSwigluKernelNpu.cpp
+
+diff --git a/op_plugin/config/op_plugin_functions.yaml b/op_plugin/config/op_plugin_functions.yaml
+index 4cbba8af..0e411067 100644
+--- a/op_plugin/config/op_plugin_functions.yaml
++++ b/op_plugin/config/op_plugin_functions.yaml
+@@ -5493,7 +5493,7 @@ custom:
+     op_api: [v2.6, newest]
+     exposed: [v2.6, newest]
+     tags: nondeterministic_seeded
+-    
++
+   - func: _conv_depthwise2d_backward(Tensor grad_output, Tensor self, Tensor weight, int[2] kernel_size, int[2] stride, int[2] padding, int[2] dilation, bool[2] output_mask) -> (Tensor grad_input, Tensor grad_weight)
+     acl_op: all_version
+ 
+@@ -6376,6 +6376,10 @@ custom:
+     exposed: all_version
+     internal_format_opapi: all_version
+ 
++  - func: mlp_split_swiglu(Tensor x, Tensor group_list, *, int local_exp_start=0, int local_exp_end=-1) -> Tensor
++    op_api: all_version
++    exposed: all_version
++
+   - func: npu_kronecker_quant(Tensor x, Tensor kronecker_p1, Tensor kronecker_p2, float? clip_ratio=None, ScalarType? dst_dtype=None) -> (Tensor out, Tensor quant_scale)
+     op_api: all_version
+     gen_opapi:
+diff --git a/op_plugin/ops/opapi/MlpSplitSwigluKernelNpu.cpp b/op_plugin/ops/opapi/MlpSplitSwigluKernelNpu.cpp
+new file mode 100644
+index 00000000..e4614204
+--- /dev/null
++++ b/op_plugin/ops/opapi/MlpSplitSwigluKernelNpu.cpp
+@@ -0,0 +1,51 @@
++#include "op_plugin/OpApiInterface.h"
++#include "op_plugin/AclOpsInterface.h"
++#include "op_plugin/utils/op_api_common.h"
++
++namespace op_api {
++using npu_preparation = at_npu::native::OpPreparation;
++
++at::Tensor mlp_split_swiglu(const at::Tensor& x, const at::Tensor& group_list, int64_t local_exp_start, int64_t local_exp_end) {
++  if (x.dim() != 2) {
++    throw std::runtime_error("x must be a 2-D tensor.");
++  }
++  if (group_list.dim() != 1) {
++    throw std::runtime_error("group_list must be a 1-D tensor.");
++  }
++
++  int expertNum = group_list.sizes()[0];
++  if (local_exp_end == -1) {
++    local_exp_start = 0; 
++    local_exp_end = expertNum;
++  }
++  if (local_exp_end <= local_exp_start) {
++      throw std::runtime_error("Local expert start-end pos invalid.");
++  }
++
++  int xRows = x.sizes()[0];
++  int xCols = x.sizes()[1];
++  if ((xCols % 2) != 0) {
++    throw std::runtime_error("Input hidden must be divided by 2.");
++  }
++
++  auto outputSize = op_infer::array_to_small_vector({xRows, xCols / 2});
++  at::Tensor out = npu_preparation::apply_tensor_without_format(outputSize, x.options());
++  EXEC_NPU_CMD(aclnnMlpSplitSwiglu, x, group_list, local_exp_start, local_exp_end, out);
++  return out;
++}
++
++
++at::Tensor mlp_split_swiglu_dense(const at::Tensor& x) {
++  TORCH_CHECK(x.dim() == 2 , "x must be a 2d tensor.");
++
++  int xRows = x.sizes()[0];
++  int xCols = x.sizes()[1];
++  TORCH_CHECK((xCols % 2) == 0 , "Input hidden must be divided by 2.");
++
++  auto outputSize = op_infer::array_to_small_vector({xRows, xCols / 2});
++  at::Tensor out = npu_preparation::apply_tensor_without_format(outputSize, x.options());
++  EXEC_NPU_CMD(aclnnMlpSplitSwigluDense, x, out);
++  return out;
++}
++
++}  // namespace op_api
+diff --git a/op_plugin/python/meta/_meta_registrations.py b/op_plugin/python/meta/_meta_registrations.py
+index c1bddd9a..81a824c8 100644
+--- a/op_plugin/python/meta/_meta_registrations.py
++++ b/op_plugin/python/meta/_meta_registrations.py
+@@ -17,6 +17,20 @@ ATTR_DIM_LIMIT_QUANTCONV2D = 2
+ m = Library("npu", "IMPL", "Meta")
+ m_aten = Library("aten", "IMPL", "Meta")
+ 
++@impl(m, "mlp_split_swiglu")
++def meta_mlp_split_swiglu(
++    x, group_list, *, local_exp_start=0, local_exp_end=-1
++):
++    if x.dim() != 2:
++        raise RuntimeError(f"[{meta_mlp_split_swiglu.__name__}] Dim of x must be 2, got {x.dim()}D")
++    
++    token, hidden = x.shape
++
++    if hidden % 2 != 0:
++        raise RuntimeError(f"[{meta_mlp_split_swiglu.__name__}] Hidden size ({hidden}) must be divisible by 2")
++    
++    output_shape = [token, hidden // 2]
++    return torch.empty(output_shape, dtype=x.dtype, device="meta")      
+ 
+ def _is_pytorch_version_ge(min_version):
+     def parse_version(v):
+-- 
+2.39.5 (Apple Git-154)
+

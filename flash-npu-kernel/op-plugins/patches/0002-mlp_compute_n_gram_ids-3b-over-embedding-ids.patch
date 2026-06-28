@@ -1,0 +1,107 @@
+From 6df0476f702bd211b8c1328293c1d87d64b9b2b9 Mon Sep 17 00:00:00 2001
+From: Chl_SolaAir <Chl_SolaAir@noreply.gitcode.com>
+Date: Sun, 23 Nov 2025 22:50:26 +0800
+Subject: [PATCH 2/7] =?UTF-8?q?mlp=5Fcompute=5Fn=5Fgram=5Fids=203b?=
+ =?UTF-8?q?=E8=AE=A1=E7=AE=97over=20embedding=20ids=E4=BD=BF=E7=94=A8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ op_plugin/config/op_plugin_functions.yaml     |  4 ++
+ .../opapi/ComputeNGramIdsKernelNpuOpApi.cpp   | 42 +++++++++++++++++++
+ op_plugin/python/meta/_meta_registrations.py  | 16 +++++++
+ 3 files changed, 62 insertions(+)
+ create mode 100644 op_plugin/ops/opapi/ComputeNGramIdsKernelNpuOpApi.cpp
+
+diff --git a/op_plugin/config/op_plugin_functions.yaml b/op_plugin/config/op_plugin_functions.yaml
+index d6ba5249..4cbba8af 100644
+--- a/op_plugin/config/op_plugin_functions.yaml
++++ b/op_plugin/config/op_plugin_functions.yaml
+@@ -7055,6 +7055,10 @@ custom:
+   - func: npu_rearrange_accept_index(Tensor accept_index, Tensor accept_length, int bs, Tensor(a!) output) -> ()
+     op_api: all_version
+ 
++  - func: mlp_compute_n_gram_ids(Tensor oe_weights, Tensor oe_mods, Tensor over_embedding_input_ids, Tensor ignore_token_flags, Tensor oe_exclusive_req_len_sums, Tensor oe_exclusive_oe_info_len_sums, Tensor oe_exclusive_embeder_size_sums, int seq_len, int batch_size, int over_embedding_n, int over_embedding_k) -> Tensor
++    op_api: all_version
++    exposed: all_version
++
+ symint:
+   - func: npu_gather_sparse_index_backward(Tensor grad, SymInt[] self_sizes, Tensor index) -> Tensor
+     op_api: all_version
+diff --git a/op_plugin/ops/opapi/ComputeNGramIdsKernelNpuOpApi.cpp b/op_plugin/ops/opapi/ComputeNGramIdsKernelNpuOpApi.cpp
+new file mode 100644
+index 00000000..e3b7abb7
+--- /dev/null
++++ b/op_plugin/ops/opapi/ComputeNGramIdsKernelNpuOpApi.cpp
+@@ -0,0 +1,42 @@
++#include "op_plugin/OpApiInterface.h"
++#include "op_plugin/utils/op_api_common.h"
++
++namespace op_api {
++
++at::Tensor mlp_compute_n_gram_ids(
++  const at::Tensor& oe_weights,
++  const at::Tensor& oe_mods,
++  const at::Tensor& over_embedding_input_ids,
++  const at::Tensor& ignore_token_flags,
++  const at::Tensor& oe_exclusive_req_len_sums,
++  const at::Tensor& oe_exclusive_oe_info_len_sums,
++  const at::Tensor& oe_exclusive_embeder_size_sums,
++  int64_t seq_len,
++  int64_t batch_size,
++  int64_t over_embedding_n,
++  int64_t over_embedding_k)
++{
++  // 构造输出tensor
++  std::vector<int64_t> shape = {seq_len, (over_embedding_n - 1) * over_embedding_k};
++  at::Tensor result = at_npu::native::OpPreparation::apply_tensor_with_format(
++    shape, oe_weights.options(), ACL_FORMAT_ND);
++
++  // 调用NPU算子接口，完成输出结果的计算
++  EXEC_NPU_CMD(aclnnMlpComputeNGramIds,
++               oe_weights,
++               oe_mods,
++               over_embedding_input_ids,
++               ignore_token_flags,
++               oe_exclusive_req_len_sums,
++               oe_exclusive_oe_info_len_sums,
++               oe_exclusive_embeder_size_sums,
++               seq_len,
++               batch_size,
++               over_embedding_n,
++               over_embedding_k,
++               result);
++
++  return result;
++}
++
++}  // namespace op_api
+\ No newline at end of file
+diff --git a/op_plugin/python/meta/_meta_registrations.py b/op_plugin/python/meta/_meta_registrations.py
+index 47dc0a40..c1bddd9a 100644
+--- a/op_plugin/python/meta/_meta_registrations.py
++++ b/op_plugin/python/meta/_meta_registrations.py
+@@ -3517,3 +3517,19 @@ def npu_repeat_interleave_backward_int_meta(grad, x, repeats, dim=None):
+     result = torch.empty_like(x)
+ 
+     return result
++
++@impl(m, "mlp_compute_n_gram_ids")
++def meta_mlp_compute_n_gram_ids(
++        oe_weights,
++        oe_mods,
++        over_embedding_input_ids,
++        ignore_token_flags,
++        oe_exclusive_req_len_sums,
++        oe_exclusive_oe_info_len_sums,
++        oe_exclusive_embeder_size_sums,
++        seq_len,
++        batch_size,
++        over_embedding_n,
++        over_embedding_k):
++    output_shape = [seq_len, (over_embedding_n - 1) * over_embedding_k]
++    return torch.empty(output_shape, dtype=oe_weights.dtype, device="meta")
+-- 
+2.39.5 (Apple Git-154)
+

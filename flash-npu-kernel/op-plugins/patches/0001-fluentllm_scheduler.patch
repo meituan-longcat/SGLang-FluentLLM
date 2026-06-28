@@ -1,0 +1,177 @@
+From 36bac206d4b18e2bb6f365723d64f5dee246f19a Mon Sep 17 00:00:00 2001
+From: Chl_SolaAir <Chl_SolaAir@noreply.gitcode.com>
+Date: Sun, 4 Jan 2026 14:47:17 +0800
+Subject: [PATCH 1/7] =?UTF-8?q?fluentllm=5Fscheduler=E4=BD=BF=E7=94=A8?=
+ =?UTF-8?q?=E7=9A=84=E7=AE=97=E5=AD=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ op_plugin/config/op_plugin_functions.yaml     |  9 ++++
+ .../AssignReqToTokenPoolKernleNpuOpApi.cpp    | 46 +++++++++++++++++++
+ .../opapi/GetOutCacheLocKernleNpuOpApi.cpp    | 45 ++++++++++++++++++
+ .../RearrangeAcceptIndexKernelNpuOpApi.cpp    | 23 ++++++++++
+ 4 files changed, 123 insertions(+)
+ create mode 100644 op_plugin/ops/opapi/AssignReqToTokenPoolKernleNpuOpApi.cpp
+ create mode 100644 op_plugin/ops/opapi/GetOutCacheLocKernleNpuOpApi.cpp
+ create mode 100644 op_plugin/ops/opapi/RearrangeAcceptIndexKernelNpuOpApi.cpp
+
+diff --git a/op_plugin/config/op_plugin_functions.yaml b/op_plugin/config/op_plugin_functions.yaml
+index 574de03d..d6ba5249 100644
+--- a/op_plugin/config/op_plugin_functions.yaml
++++ b/op_plugin/config/op_plugin_functions.yaml
+@@ -7046,6 +7046,15 @@ custom:
+   - func: fused_linear_cross_entropy_loss_with_max_sum_grad(Tensor grad, Tensor input, Tensor weight, Tensor target_mask, Tensor masked_target, float label_smoothing=0.0, Tensor? logits_max=None, Tensor? sum_exp_logits=None, Tensor? softmax=None) -> (Tensor, Tensor)
+     op_api: all_version
+ 
++  - func: npu_assign_req_to_token_pool(Tensor req_pool_indices, Tensor extend_lens, Tensor alloced_lens, Tensor out_cache_loc, Tensor(a!) req_to_token_pool, int bs) -> ()
++    op_api: all_version
++
++  - func: npu_get_out_cache_loc(Tensor req_to_token, Tensor req_pool_indices, Tensor new_compute_lens, Tensor cache_lens, Tensor(a!) out_cache_loc, int bs) -> ()
++    op_api: all_version
++
++  - func: npu_rearrange_accept_index(Tensor accept_index, Tensor accept_length, int bs, Tensor(a!) output) -> ()
++    op_api: all_version
++
+ symint:
+   - func: npu_gather_sparse_index_backward(Tensor grad, SymInt[] self_sizes, Tensor index) -> Tensor
+     op_api: all_version
+diff --git a/op_plugin/ops/opapi/AssignReqToTokenPoolKernleNpuOpApi.cpp b/op_plugin/ops/opapi/AssignReqToTokenPoolKernleNpuOpApi.cpp
+new file mode 100644
+index 00000000..d4d67204
+--- /dev/null
++++ b/op_plugin/ops/opapi/AssignReqToTokenPoolKernleNpuOpApi.cpp
+@@ -0,0 +1,46 @@
++// Copyright (c) 2025 Huawei Technologies Co., Ltd
++// All rights reserved.
++//
++// Licensed under the BSD 3-Clause License  (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://opensource.org/licenses/BSD-3-Clause
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "op_plugin/AclOpsInterface.h"
++#include "op_plugin/OpApiInterface.h"
++#include "op_plugin/utils/op_api_common.h"
++
++namespace op_api {
++using npu_preparation = at_npu::native::OpPreparation;
++
++void npu_assign_req_to_token_pool(
++    const at::Tensor &req_pool_indices,
++    const at::Tensor &extend_lens,
++    const at::Tensor &alloced_lens,
++    const at::Tensor &out_cache_loc,
++    at::Tensor &req_to_token_pool,
++    int64_t bs
++)
++{
++    TORCH_CHECK(req_pool_indices.dim() == 1,
++        "npu_assign_req_to_token_pool: Input req_pool_indices should be 1D tensor"
++        + OPS_ERROR(ErrCode::PARAM));
++    TORCH_CHECK(extend_lens.dim() == alloced_lens.dim(),
++        "npu_assign_req_to_token_pool: extend_lens and alloced_lens must have same dim");
++    TORCH_CHECK(out_cache_loc.dim() == 1,
++        "npu_assign_req_to_token_pool: Input out_cache_loc should be 1D tensor"
++        + OPS_ERROR(ErrCode::PARAM));
++    TORCH_CHECK(req_to_token_pool.dim() == 2,
++        "npu_assign_req_to_token_pool: Input req_to_token_pool should be 2D tensor"
++        + OPS_ERROR(ErrCode::PARAM));
++    EXEC_NPU_CMD(aclnnAssignReqToTokenPool, req_pool_indices, extend_lens, alloced_lens, out_cache_loc,
++       bs, req_to_token_pool);
++}
++} // namespace op_api
+\ No newline at end of file
+diff --git a/op_plugin/ops/opapi/GetOutCacheLocKernleNpuOpApi.cpp b/op_plugin/ops/opapi/GetOutCacheLocKernleNpuOpApi.cpp
+new file mode 100644
+index 00000000..d7a9e0e5
+--- /dev/null
++++ b/op_plugin/ops/opapi/GetOutCacheLocKernleNpuOpApi.cpp
+@@ -0,0 +1,45 @@
++// Copyright (c) 2025 Huawei Technologies Co., Ltd
++// All rights reserved.
++//
++// Licensed under the BSD 3-Clause License  (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// https://opensource.org/licenses/BSD-3-Clause
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "op_plugin/AclOpsInterface.h"
++#include "op_plugin/OpApiInterface.h"
++#include "op_plugin/utils/op_api_common.h"
++
++namespace op_api {
++using npu_preparation = at_npu::native::OpPreparation;
++
++void npu_get_out_cache_loc(
++    const at::Tensor &req_to_token,
++    const at::Tensor &req_pool_indices,
++    const at::Tensor &new_compute_lens,
++    const at::Tensor &cache_lens,
++    at::Tensor &out_cache_loc,
++    int64_t bs
++)
++{
++    TORCH_CHECK(req_to_token.dim() == 2,
++        "npu_get_out_cache_loc: Input req_to_token should be 2D tensor"
++        + OPS_ERROR(ErrCode::PARAM));
++    TORCH_CHECK(req_pool_indices.dim() == cache_lens.dim(),
++        "npu_get_out_cache_loc: req_pool_indices and cache_lens must have same dimension");
++    TORCH_CHECK(cache_lens.dim() == 1,
++        "npu_get_out_cache_loc: Input cache_lens should be 1D tensor"
++        + OPS_ERROR(ErrCode::PARAM));
++    TORCH_CHECK(out_cache_loc.dim() == 1,
++        "npu_get_out_cache_loc: Input out_cache_loc should be 1D tensor"
++        + OPS_ERROR(ErrCode::PARAM));
++    EXEC_NPU_CMD(aclnnGetOutCacheLoc, req_to_token, req_pool_indices, new_compute_lens, cache_lens, bs, out_cache_loc);
++}
++} // namespace op_api
+\ No newline at end of file
+diff --git a/op_plugin/ops/opapi/RearrangeAcceptIndexKernelNpuOpApi.cpp b/op_plugin/ops/opapi/RearrangeAcceptIndexKernelNpuOpApi.cpp
+new file mode 100644
+index 00000000..533d2b8c
+--- /dev/null
++++ b/op_plugin/ops/opapi/RearrangeAcceptIndexKernelNpuOpApi.cpp
+@@ -0,0 +1,23 @@
++#include "op_plugin/AclOpsInterface.h"
++#include "op_plugin/OpApiInterface.h"
++#include "op_plugin/utils/op_api_common.h"
++
++namespace op_api {
++using npu_preparation = at_npu::native::OpPreparation;
++
++void npu_rearrange_accept_index(
++    const at::Tensor &accept_index,
++    const at::Tensor &accept_length,
++    int64_t bs,
++    at::Tensor &output
++) 
++{
++    TORCH_CHECK(accept_index.dim() == 2,
++                "npu_rearrange_accept_index: accept_index must be 2D tensor");
++    TORCH_CHECK(accept_length.dim() == 1,
++        "npu_rearrange_accept_index: Input accept_length should be 1D tensor"
++        + OPS_ERROR(ErrCode::PARAM));
++    EXEC_NPU_CMD(aclnnRearrangeAcceptIndex, accept_index, accept_length, bs, output);
++}
++
++}
+\ No newline at end of file
+-- 
+2.39.5 (Apple Git-154)
+

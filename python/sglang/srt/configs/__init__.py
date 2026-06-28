@@ -6,12 +6,10 @@ from sglang.srt.configs.configuration_deepseek_mha_nsa import DeepseekMhaNsaConf
 from sglang.srt.configs.configuration_glm4_moe import Glm4MoeConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.configuration_glm_moe_dsa import GlmMoeDsaConfig
 
 
 __all__ = [
-    "ExaoneConfig",
-    "ChatGLMConfig",
-    "DbrxConfig",
     "ShortcutConfig",
     "Qwen3MoeConfig",
     "FLASHConfig",
@@ -19,5 +17,6 @@ __all__ = [
     "Qwen3Config",
     "DeepseekMhaNsaConfig",
     "Qwen3NextConfig",
-    "KimiLinearConfig"
+    "KimiLinearConfig",
+    "GlmMoeDsaConfig",
 ]

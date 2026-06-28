@@ -133,6 +133,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index = topk_index.reshape(b, topk) # shape: (b, topk)
                 token_list.append(topk_index)
 
+            if self.num_continous_decode_steps > 1:
+                self.prealloc_for_multi_step_decode()
+
             # local import to avoid circular importx
             from sglang.srt.speculative.eagle_utils import EagleDraftOutput
 

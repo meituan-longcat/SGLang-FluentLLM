@@ -328,3 +328,6 @@ class PLDWorkerOverlapped:
         self.input_queue.put(None)  # Shutdown signal
         if self.forward_thread.is_alive():
             self.forward_thread.join(timeout=5.0)
+
+    def renew_scaling_penalty(self, req_pool_indices: torch.Tensor):
+        self.worker.renew_scaling_penalty(req_pool_indices)

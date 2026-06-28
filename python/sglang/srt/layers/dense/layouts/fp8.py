@@ -19,7 +19,6 @@ def dummy_func(*args, **kwargs):
 apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
 
-from sglang.srt.layers.dense.gemms.fp8 import dispatch_w8a8_block_fp8_linear
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.parameter import (
@@ -100,6 +99,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.block_quant = self.quant_config.weight_block_size is not None
 
+        from sglang.srt.layers.dense.gemms.fp8 import dispatch_w8a8_block_fp8_linear
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     def create_weights(

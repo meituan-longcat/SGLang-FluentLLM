@@ -10,13 +10,10 @@ import torch
 from huggingface_hub import snapshot_download
 
 
-from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
-    HybridLinearAttnBackend,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode
+    ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_utils import (
@@ -24,9 +21,13 @@ from sglang.srt.speculative.eagle_utils import (
     EagleDraftOutput,
     EagleVerifyInput,
     generate_token_bitmask,
+    cumulate_output_tokens_kernel,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_available_gpu_memory, get_colorful_logger
+from sglang.srt.utils import is_npu
+from sglang.srt.env import ENV
+from sglang.srt.env import global_server_args_dict
 
 from sglang.srt.configs.model_config import AttentionArch
 
@@ -39,6 +40,15 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import KVAllocator
 
 logger = get_colorful_logger(__name__)
+
+__is_npu__ = is_npu()
+
+if __is_npu__:
+    from sglang.srt.speculative.npu_draft_graph_runner import (
+        NpuDraftGraphRunner,
+    )
+else:
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import HybridLinearAttnBackend
 
 
 class BaseSpecDeocdingWorker(ABC):
@@ -92,6 +102,7 @@ class BaseSpecDeocdingWorker(ABC):
         self.topk = server_args.speculative_eagle_topk
         assert self.topk == 1, "Tree Attention is abandoned for now."
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.drafter_use_oe = drafter_use_oe
         self.use_over_embedding = (
             drafter_use_oe or self.target_worker.use_over_embedding
         )
@@ -101,6 +112,42 @@ class BaseSpecDeocdingWorker(ABC):
         )
         self.kv_allocator: KVAllocator = self.target_worker.model_runner.kv_allocator
         self.oe_token_table = self.target_worker.model_runner.oe_token_table
+        self.vocab_size = self.target_worker.model_config.vocab_size
+        self._init_penalties()
+
+        self.npu_graph_runner_for_draft_extend = None
+        self.npu_graph_runner_for_draft_extends = []
+
+    @property
+    def draft_model_runner(self):
+        return self.model_runner
+
+    def init_npu_graphs(self):
+        """Capture npu graphs."""
+        self.npu_graph_runner_for_draft_extend = None
+
+        def create_npu_graph_runner(idx=0):
+            tic=time.perf_counter()
+            before_mem=get_available_gpu_memory(self.device, self.model_runner.gpu_id)
+            logger.info(
+                f"Capture draft extend npu graph {idx} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            )
+            npu_graph_runner_for_draft_extend=NpuDraftGraphRunner(self, draft_model_idx=idx)
+
+            after_mem=get_available_gpu_memory(self.device, self.model_runner.gpu_id)
+            logger.info(
+                f"Capture draft extend npu graph {idx} end. Time elapsed: {time.perf_counter()-tic:.2f} s. mem usage={(before_mem-after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
+            return npu_graph_runner_for_draft_extend
+
+        self.npu_graph_runner_for_draft_extend = create_npu_graph_runner()
+
+        if self.server_args.is_multi_head_eagle:
+            self.npu_graph_runner_for_draft_extends.append(self.npu_graph_runner_for_draft_extend)
+            for idx in range(1, self.speculative_num_steps):
+                npu_graph_runner_for_draft_extend = create_npu_graph_runner(idx)
+                self.npu_graph_runner_for_draft_extends.append(npu_graph_runner_for_draft_extend)
+
 
     def init_cuda_graphs(self, graph_runner_cls):
         """
@@ -183,10 +230,6 @@ class BaseSpecDeocdingWorker(ABC):
         else:
             self.hot_token_id = None
 
-        self.use_over_embedding = (
-            self.use_over_embedding or self.target_worker.use_over_embedding
-        )
-
         if self.speculative_algorithm.is_eagle3():
             if self.target_worker.use_over_embedding:
                 word_embed = embed.word_embeder.weight
@@ -197,10 +240,15 @@ class BaseSpecDeocdingWorker(ABC):
                 word_embed.device
             )
         else:
-            if self.use_over_embedding:
+            if self.drafter_use_oe:
+                assert self.target_worker.use_over_embedding
                 drafter_model_runner.model.set_oe_and_head(embed, head)
             else:
-                drafter_model_runner.model.set_embed_and_head(embed, head)
+                if self.target_worker.use_over_embedding:
+                    word_embed = embed.word_embeder.weight
+                else:
+                    word_embed = embed
+                drafter_model_runner.model.set_embed_and_head(word_embed, head)
 
     def init_drafter_attention_backends(self, draft_model_runner: ModelRunner) -> None:
         """
@@ -285,11 +333,20 @@ class BaseSpecDeocdingWorker(ABC):
             self.draft_attn_backend = DpskSparseAttnMultiStepBackend(
                 draft_model_runner, self.topk, self.speculative_num_steps
             )
+        elif drafter_backend == "npu":
+            logger.info("========eagle select NpuAttnBackend=============")
+            from sglang.srt.layers.attention.npu_mla_backend import NPUMultiStepDecodeBackend
+            self.draft_attn_backend = NPUMultiStepDecodeBackend(draft_model_runner, self.topk, self.speculative_num_steps)
+        elif self.server_args.attention_backend == "npu_mla":
+            logger.info("========eagle select NpuMLAAttnBackend=============")
+            from sglang.srt.layers.attention.npu_mla_backend import NPUMLAMultiStepDecodeBackend
+            self.draft_attn_backend = NPUMLAMultiStepDecodeBackend(draft_model_runner, self.topk, self.speculative_num_steps)
         else:
             raise ValueError(
                 f"EAGLE is not supported with drafter attention backend {drafter_backend}"
             )
 
+    @torch.inference_mode()
     def rejection_sampling(
         self,
         forward_batch: ForwardBatch,
@@ -319,15 +376,19 @@ class BaseSpecDeocdingWorker(ABC):
         predict, logits_output, accept_length, accept_index = (
             forward_batch.spec_info.verify(forward_batch, logits_output, vocab_masks)
         )
+        # TODO: NPU暂不支持triton，无法支持重复惩罚。
+        if not __is_npu__:
+            self._cumulate_output_tokens(forward_batch, predict, accept_length)
         return predict, logits_output, accept_length, accept_index
 
+    @torch.inference_mode()
     def preprocess_for_draft_after_decode(
         self,
         forward_batch: ForwardBatch,
         accept_length: torch.Tensor,
         accept_index: torch.Tensor,
         target_predict: torch.Tensor,
-        with_draft_model: bool = True
+        with_draft_model: bool = True,
     ):
         """
         Preprocess the forward batch for draft model execution after token verification.
@@ -416,12 +477,74 @@ class BaseSpecDeocdingWorker(ABC):
         )
 
         vocab_masks = self._generate_vocab_mask(forward_batch, verify_spec_info)
+        verify_spec_info.cumulated_scaling_penalties = self._generate_penalties(
+            forward_batch
+        )
         forward_batch.spec_info = verify_spec_info
         forward_batch.input_ids = forward_batch.spec_info.draft_token
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         forward_batch.positions = forward_batch.spec_info.positions
-
+        if __is_npu__:
+            forward_batch.set_npu_ep_metadata(self.target_worker.model_runner)
         return vocab_masks
+
+    def _init_penalties(self):
+        self.cumulated_scaling_penalty = torch.ones(
+            (self.req_to_token_pool.size, self.vocab_size),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def _cumulate_output_tokens(
+        self,
+        forward_batch: ForwardBatch,
+        output_ids: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ):
+        """
+        Cumulate output tokens for penalty calculation in speculative decoding.
+
+        In speculative decoding, the output_ids tensor contains accepted tokens followed by padding.
+        We need to extract only the accepted tokens for each request and update the penalty state.
+
+        Args:
+            forward_batch: The forward batch containing request pool indices
+            output_ids: Flattened tensor of output tokens [a, b, x, x, c, x, x, x]
+                       where x represents padding/rejected tokens
+            accept_lens: Number of accepted tokens per request [1, 0, ...]
+
+        Example:
+            If we have 2 requests with speculative_num_draft_tokens=4:
+            - output_ids: [a, b, x, x, c, x, x, x] (8 elements)
+            - accept_lens: [1, 0] (request 0 accepted 1 draft token 'a' and 'b' is bouns token, request 1 accepted 0 draft tokens)
+            We should only update penalties for token 'a' and 'b' in request 0's penalty state.
+        """
+        # Early return if no tokens were accepted
+        batch_size = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        tokens_per_request = self.server_args.speculative_num_draft_tokens
+        scaling_penalties = forward_batch.sampling_info.repetition_penalties
+
+        # Call the Triton kernel to update penalties
+        cumulate_output_tokens_kernel[(batch_size,)](
+            output_ids,
+            accept_lens,
+            req_pool_indices,
+            self.cumulated_scaling_penalty,
+            scaling_penalties,
+            tokens_per_request,
+            self.vocab_size,
+        )
+
+    def renew_scaling_penalty(self, req_pool_indices):
+        # When a new req arrives, renew it's penalty
+        self.cumulated_scaling_penalty[req_pool_indices] = 1.0
+
+    def _generate_penalties(self, forward_batch: ForwardBatch):
+        scaling_penalties = self.cumulated_scaling_penalty[
+            forward_batch.req_pool_indices
+        ]
+        return scaling_penalties
 
     def _generate_vocab_mask(
         self, forward_batch: ForwardBatch, verify_spec_info: EagleVerifyInput
@@ -505,7 +628,7 @@ class BaseSpecDeocdingWorker(ABC):
             model_worker_batch, self.target_worker.model_runner
         )
         vocab_masks = None
-        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
+        if (not __is_npu__) and self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
             vocab_masks = None
             if forward_batch.forward_mode.is_target_verify():
                 vocab_masks = self.preprocess_for_verify(forward_batch)
@@ -518,6 +641,53 @@ class BaseSpecDeocdingWorker(ABC):
                 forward_batch.attn_backend.update_mamba_state_after_mtp_verify(
                     accept_length, None
                 )
+        elif bool(
+            __is_npu__ and self.npu_graph_runner_for_draft_extend and (forward_batch.all_decode_or_idle or global_server_args_dict["npu_disable_all_gather"])
+        ):
+            # 图模式和单算子模式无法进行集合通信
+            # prefill + idle 场景：大小模型都走eager
+            # decode + idle 场景：大小模型都走图
+            self.req_to_token_pool.verified_lens[0] = 0
+            if forward_batch.forward_mode.is_target_verify():
+                vocab_masks = self.preprocess_for_verify(forward_batch)
+            if global_server_args_dict["npu_disable_all_gather"]:
+                padding_size = max(self.npu_graph_runner_for_draft_extend.compile_bs)
+            else:
+                max_input_bs = max(forward_batch.global_num_tokens) / self.model_runner.server_args.speculative_num_draft_tokens
+                padding_size = self.multi_batch_select(max_input_bs, self.npu_graph_runner_for_draft_extend.compile_bs)
+            forward_batch.padding_for_graph_mtp(self.draft_model_runner, padding_size)
+            forward_batch.can_run_all2all = ENV.npu_enable_all2all_comm
+            self.init_attn_backends(forward_batch)
+            out = self.forward_decode_spec(forward_batch, vocab_masks)
+
+            bs = getattr(forward_batch, "ori_bs", forward_batch.batch_size)
+            (
+                logits_output,
+                next_token_ids,
+                accept_length,
+                new_verified_id,
+                token_list,
+            ) = out
+
+            def unpad(ori, bs):
+                if isinstance(ori, torch.Tensor):
+                    return ori[:bs]
+                if isinstance(ori, list):
+                    tmp = []
+                    for i in ori:
+                        tmp.append(i[:bs])
+                    return tmp
+            mtpn_factor = self.target_worker.model_runner.server_args.speculative_num_steps + 1
+            logits_output.next_token_logits = unpad(logits_output.next_token_logits, bs*mtpn_factor)
+            logits_output.hidden_states = unpad(logits_output.hidden_states, bs*mtpn_factor)
+
+            out = (
+                logits_output,
+                unpad(next_token_ids, bs*mtpn_factor),
+                unpad(accept_length, bs),
+                unpad(new_verified_id, bs),
+                unpad(token_list, bs),
+            )
         elif forward_batch.forward_mode.is_target_verify():
             vocab_masks = self.preprocess_for_verify(forward_batch)
             self.init_attn_backends(forward_batch)
@@ -555,8 +725,10 @@ class BaseSpecDeocdingWorker(ABC):
             forward_batch
         )
         # This is a model-based algo and the model has attention module
-        if hasattr(self, "model_runner") and hasattr(self.model_runner, "attn_backend"):
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        if hasattr(self, "model_runner_list"):
+            for runner in self.model_runner_list:
+                if hasattr(runner, "attn_backend"):
+                    runner.attn_backend.init_forward_metadata(forward_batch)
 
     @abstractmethod
     def propose(self):

@@ -2,10 +2,11 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_npu
 
-
-from flashinfer import fp8_blockwise_scaled_mm
+__is_npu__ = is_npu()
+if not __is_npu__:
+    from flashinfer import fp8_blockwise_scaled_mm
 
 # use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 # use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")

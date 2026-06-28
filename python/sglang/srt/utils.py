@@ -84,9 +84,9 @@ from triton.runtime.cache import (
 from pathlib import Path
 from pydantic import BaseModel
 
-
 show_time_cost = False
 time_infos = {}
+
 
 def is_hip() -> bool:
     """Return whether it is HIP on the AMD ROCm platform."""
@@ -759,40 +759,41 @@ def broadcast_wrapper(tensor_size, group_src, dist_group):
     if not _is_npu:
         return dist.broadcast(tensor_size, group_src=group_src, group=dist_group)
     else:
-        return dist.broadcast(tensor_size, src=group_src, group=dist_group)
+        return dist.broadcast(tensor_size, src=dist.get_global_rank(dist_group, group_src), group=dist_group)
 
 def broadcast_pyobj(
     data: List[Any],
     group_rank: int,
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     group_src: int = 0,
+    device=None,
 ):
     """Broadcast inputs from group_rank=0 to all other ranks with torch.dist backend."""
-
+    device = device or 'cpu'
     if group_rank == 0:
         if len(data) == 0:
-            tensor_size = torch.tensor([0], dtype=torch.long)
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             broadcast_wrapper(tensor_size, group_src, dist_group)
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            )
-            tensor_size = torch.tensor([size], dtype=torch.long)
+            ).to(device=device)
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             broadcast_wrapper(tensor_size, group_src, dist_group)
             broadcast_wrapper(tensor_data, group_src, dist_group)
         return data
     else:
-        tensor_size = torch.tensor([0], dtype=torch.long)
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
         broadcast_wrapper(tensor_size, group_src, dist_group)
         size = tensor_size.item()
 
         if size == 0:
             return []
 
-        tensor_data = torch.empty(size, dtype=torch.uint8)
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         broadcast_wrapper(tensor_data, group_src, dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
@@ -1157,6 +1158,20 @@ def get_device_name(device_id: int = 0) -> str:
         return torch.npu.get_device_name(device_id)
 
 
+def device_synchronize(device_id: int = 0) -> None:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+
+def get_device_module():
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu
+
 def get_device_core_count(device_id: int = 0) -> int:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
@@ -1188,21 +1203,16 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     return major, minor
 
 
-def get_compiler_backend() -> str:
-    if hasattr(torch, "hpu") and torch.hpu.is_available():
-        return "hpu_backend"
-
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        import torchair
-
-        config = torchair.CompilerConfig()
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
-        return npu_backend
-
-    return "inductor"
-
-
-sglang_lib = Library("sglang", "FRAGMENT")  # noqa
+npu_compile_config = {
+    "experimental_config": {
+        "frozen_parameter": True,
+        "tiling_schedule_optimize": True,
+        "topology_sorting_strategy": "StableRDFS",
+    },
+    "inference_config": {"dynamic_gears_merge_policy": "zip"},
+    "mode": os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune"),
+}
+npu_backend = None
 
 
 # Some backends use pytorch version < 2.4.0 which doesn't
@@ -1573,6 +1583,11 @@ def rank0_print(msg: str):
     if get_tensor_model_parallel_rank() == 0:
         print(msg, flush=True)
 
+def rank0_log(msg: str):
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    if get_tensor_model_parallel_rank() == 0:
+        logger.info(msg)
 
 def launch_dummy_health_check_server(host, port):
     import uvicorn
@@ -1777,6 +1792,10 @@ class Withable(Generic[T]):
     @property
     def value(self) -> T:
         return self._value
+
+    @value.setter
+    def value(self, new_value: T):
+        self._value = new_value
 
     @contextmanager
     def with_value(self, new_value: T):
@@ -2007,3 +2026,10 @@ def align(x: int, y: int) -> int:
 # COPIED FROM DeepGEMM
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
+
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source

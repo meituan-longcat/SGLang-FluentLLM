@@ -129,6 +129,7 @@ class TreeNode:
             return []
 
         return node.get_prefix_hash_values(node.parent) + node.hash_value
+
     @property
     def evicted(self):
         return self.value is None
@@ -282,11 +283,14 @@ class RadixCache(BasePrefixCache):
             ]
         else:
             paged_token_ids = key
+
         if len(paged_token_ids) == 0:
             return self._empty_match_result()
+
         value = []
         last_node = [self.root_node]
         self._match_prefix_helper(self.root_node, paged_token_ids, value, last_node)
+
         if value and isinstance(value[0], list):
             flat_value = [e for arr in value for e in arr]
             value = torch.concat(flat_value)
@@ -320,6 +324,7 @@ class RadixCache(BasePrefixCache):
 
         if token_ids is None:
             token_ids = (req.origin_input_ids + req.output_ids)[:-1]
+
         # Radix Cache takes one ref in memory pool
         req_pool_idx = req.req_pool_idx
         page_size = self.token_to_kv_pool_allocator.page_size
@@ -372,8 +377,8 @@ class RadixCache(BasePrefixCache):
         if token_ids is None:
             token_ids = req.fill_ids
 
-        page_size = self.token_to_kv_pool_allocator.page_size
         req_pool_idx = req.req_pool_idx
+        page_size = self.token_to_kv_pool_allocator.page_size
         seq_len = len(token_ids)
         # without last not full page
         full_page_num = seq_len // page_size
@@ -381,15 +386,16 @@ class RadixCache(BasePrefixCache):
             tuple(token_ids[i * page_size : (i + 1) * page_size])
             for i in range(0, full_page_num)
         ]
-
         page_ids = self.token_to_kv_pool_allocator.req_to_page[
             req_pool_idx, :full_page_num
         ].clone()
         _ = self.insert(paged_token_ids, page_ids)
+
         # After insert, perform matching, use page_id in radix tree to replace the allocated
         # page before insert, release diff part, and write to req_to_token_pool
         match_result = self.match_prefix(paged_token_ids)
         (new_prefix_page_ids, new_last_node) = (match_result.device_indices, match_result.last_device_node)
+
         if new_prefix_page_ids.numel() > 0:
             diff = self.token_to_kv_pool_allocator.free_with_diff(
                 new_prefix_page_ids, page_ids
@@ -496,6 +502,7 @@ class RadixCache(BasePrefixCache):
             last_device_node=self.root_node,
             last_host_node=self.root_node,
         )
+
     def _match_prefix_helper(
         self, node: TreeNode, key: List, value, last_node: TreeNode
     ):

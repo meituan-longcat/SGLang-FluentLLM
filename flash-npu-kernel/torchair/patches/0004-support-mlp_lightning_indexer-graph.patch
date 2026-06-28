@@ -1,0 +1,535 @@
+From cd4c9a44816c3f3f81c1f9e47831607fcf011ba8 Mon Sep 17 00:00:00 2001
+From: dongshixian <dongshixian@MBP-KYL097XF14-2114.local>
+Date: Thu, 30 Apr 2026 14:18:16 +0800
+Subject: [PATCH 4/4] support mlp_lightning_indexer graph
+
+---
+ codegen/custom_op/custom_reg_op.h             |  43 +++++-
+ .../auto_generated_ge_raw_ops.py              |  91 +++++++++++++
+ .../_ge_concrete_graph/fx2ge_converter.py     |  25 ++++
+ .../ge_converter/custom/lightning_indexer.py  |   0
+ .../custom/mlp_lightning_indexer.py           |  70 ++++++++++
+ .../external/acl/error_codes/ge_error_codes.h |  74 ++++++++++-
+ .../external/acl/error_codes/rt_error_codes.h | 125 +++++++++++++++++-
+ 7 files changed, 425 insertions(+), 3 deletions(-)
+ mode change 100644 => 100755 codegen/custom_op/custom_reg_op.h
+ mode change 100644 => 100755 python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+ mode change 100644 => 100755 python/torchair/_ge_concrete_graph/fx2ge_converter.py
+ mode change 100644 => 100755 python/torchair/_ge_concrete_graph/ge_converter/custom/lightning_indexer.py
+ create mode 100755 python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_lightning_indexer.py
+ mode change 120000 => 100644 third_party/ascend/include/ascendcl/external/acl/error_codes/ge_error_codes.h
+ mode change 120000 => 100644 third_party/ascend/include/ascendcl/external/acl/error_codes/rt_error_codes.h
+
+diff --git a/codegen/custom_op/custom_reg_op.h b/codegen/custom_op/custom_reg_op.h
+old mode 100644
+new mode 100755
+index 197df85f..74e36419
+--- a/codegen/custom_op/custom_reg_op.h
++++ b/codegen/custom_op/custom_reg_op.h
+@@ -18,7 +18,48 @@ REG_OP(ComputeNGramIds)
+     .REQUIRED_ATTR(oe_k, Int)
+     .REQUIRED_ATTR(max_context_len, Int)
+     .OP_END_FACTORY_REG(ComputeNGramIds);
+-
++REG_OP(MlpLightningIndexer)
++    .INPUT(query, ge::TensorType::ALL())
++    .INPUT(key, ge::TensorType::ALL())
++    .INPUT(weights, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(cur_seq_lengths_query, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(cur_seq_lengths_key, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(block_table, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(init_tensor, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(local_tensor, ge::TensorType::ALL())
++    .OUTPUT(sparse_indices, ge::TensorType::ALL())
++    .OUTPUT(sparse_values, ge::TensorType::ALL())
++    .ATTR(layout_query, String, "BSND")
++    .ATTR(layout_key, String, "PA_BSND")
++    .ATTR(sparse_count, Int, 2048)
++    .ATTR(block_len, Int, 1)
++    .ATTR(q_block_len, Int, 1)
++    .ATTR(init_num, Int, 0)
++    .ATTR(local_num, Int, 0)
++    .ATTR(sparse_mode, Int, 3)
++    .ATTR(pre_tokens, Int, 9223372036854775807)
++    .ATTR(next_tokens, Int, 9223372036854775807)
++    .ATTR(return_value, Bool, false)
++    .OP_END_FACTORY_REG(MlpLightningIndexer);
++REG_OP(LightningIndexer)
++    .INPUT(query, ge::TensorType::ALL())
++    .INPUT(key, ge::TensorType::ALL())
++    .INPUT(weights, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(actual_seq_lengths_query, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(actual_seq_lengths_key, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(block_table, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(init_tensor, ge::TensorType::ALL())
++    .OPTIONAL_INPUT(local_tensor, ge::TensorType::ALL())
++    .OUTPUT(sparse_indices, ge::TensorType::ALL())
++    .OUTPUT(sparse_values, ge::TensorType::ALL())
++    .ATTR(layout_query, String, "BSND")
++    .ATTR(layout_key, String, "BSND")
++    .ATTR(sparse_count, Int, 2048)
++    .ATTR(sparse_mode, Int, 3)
++    .ATTR(pre_tokens, Int, 9223372036854775807)
++    .ATTR(next_tokens, Int, 9223372036854775807)
++    .ATTR(return_values, Bool, false)
++    .OP_END_FACTORY_REG(LightningIndexer);
+ }
+ 
+ #endif  // ASCENDADAPTER2_CUSTOM_REG_OP_H
+diff --git a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+old mode 100644
+new mode 100755
+index 869ce4ff..94c40f14
+--- a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
++++ b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+@@ -137,6 +137,97 @@ def MlpSplitSwiglu(x: Tensor, group_list: Tensor, *, local_expert_start: int, lo
+         .output("out" , "")
+     )
+ 
++# This api is auto-generated from IR MlpLightningIndexer
++@auto_convert_to_tensor([False, False, False, False, False, False, False, False], [False, False, False, True, True, True, True, True], inputs_tensor_type=[TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL])
++def MlpLightningIndexer(query: Tensor, key: Tensor, weights: Tensor, cur_seq_lengths_query: Optional[Tensor], cur_seq_lengths_key: Optional[Tensor], block_table: Optional[Tensor], init_tensor: Optional[Tensor], local_tensor: Optional[Tensor], *, layout_query: str="BSND", layout_key: str="PA_BSND", sparse_count: int=2048, block_len: int=1, q_block_len: int=1, init_num: int=0, local_num: int=0, sparse_mode: int=3, pre_tokens: int=-1, next_tokens: int=-1, return_value: bool=False, dependencies=[], node_name=None):
++    """REG_OP(MlpLightningIndexer)\n
++.INPUT(query, ge::TensorType::ALL())\n
++.INPUT(key, ge::TensorType::ALL())\n
++.INPUT(weights, ge::TensorType::ALL())\n
++.OPTIONAL_INPUT(cur_seq_lengths_query, ge::TensorType::ALL())\n
++.OPTIONAL_INPUT(cur_seq_lengths_key, ge::TensorType::ALL())\n
++.OPTIONAL_INPUT(block_table, ge::TensorType::ALL())\n
++.OPTIONAL_INPUT(init_tensor, ge::TensorType::ALL())\n
++.OPTIONAL_INPUT(local_tensor, ge::TensorType::ALL())\n
++.OUTPUT(sparse_indices, ge::TensorType::ALL())\n
++.OUTPUT(sparse_values, ge::TensorType::ALL())\n
++.ATTR(layout_query, String, "BSND")\n
++.ATTR(layout_key, String, "PA_BSND")\n
++.ATTR(sparse_count, Int, 2048)\n
++.ATTR(block_len, Int, 1)\n
++.ATTR(q_block_len, Int, 1)\n
++.ATTR(init_num, Int, 0)\n
++.ATTR(local_num, Int, 0)\n
++.ATTR(sparse_mode, Int, 3)\n
++.ATTR(pre_tokens, Int, 9223372036854775807)\n
++.ATTR(next_tokens, Int, 9223372036854775807)\n
++.ATTR(return_value, Bool, false)\n
++"""
++
++    # process inputs
++    inputs = {
++        "query": query,
++        "key": key,
++        "weights": weights,
++        "cur_seq_lengths_query": cur_seq_lengths_query,
++        "cur_seq_lengths_key": cur_seq_lengths_key,
++        "block_table": block_table,
++        "init_tensor": init_tensor,
++        "local_tensor": local_tensor,
++    }
++
++    # process attrs
++    attrs = {
++        "layout_query": attr.Str(layout_query),
++        "layout_key": attr.Str(layout_key),
++        "sparse_count": attr.Int(sparse_count),
++        "block_len": attr.Int(block_len),
++        "q_block_len": attr.Int(q_block_len),
++        "init_num": attr.Int(init_num),
++        "local_num": attr.Int(local_num),
++        "sparse_mode": attr.Int(sparse_mode),
++        "pre_tokens": attr.Int(pre_tokens),
++        "next_tokens": attr.Int(next_tokens),
++        "return_value": attr.Bool(return_value),
++    }
++
++    # process outputs
++    outputs = [
++    "sparse_indices",
++    "sparse_values",
++    ]
++
++    return ge_op(
++        op_type="MlpLightningIndexer",
++        inputs=inputs,
++        attrs=attrs,
++        outputs=outputs,
++        dependencies=dependencies,
++        ir=IrDef("MlpLightningIndexer") \
++        .input("query", "") \
++        .input("key", "") \
++        .input("weights", "") \
++        .optional_input("cur_seq_lengths_query", "") \
++        .optional_input("cur_seq_lengths_key", "") \
++        .optional_input("block_table", "") \
++        .optional_input("init_tensor", "") \
++        .optional_input("local_tensor", "") \
++        .attr("layout_query", attr.Str("BSND")) \
++        .attr("layout_key", attr.Str("PA_BSND")) \
++        .attr("sparse_count", attr.Int(2048)) \
++        .attr("block_len", attr.Int(1)) \
++        .attr("q_block_len", attr.Int(1)) \
++        .attr("init_num", attr.Int(0)) \
++        .attr("local_num", attr.Int(0)) \
++        .attr("sparse_mode", attr.Int(3)) \
++        .attr("pre_tokens", attr.Int(-1)) \
++        .attr("next_tokens", attr.Int(-1)) \
++        .attr("return_value", attr.Bool(False)) \
++        .output("sparse_indices" , "") \
++        .output("sparse_values" , "")
++    )
++
++
+ # This api is auto-generated from IR Aipp
+ @auto_convert_to_tensor([False, False], [False, True])
+ def Aipp(images: Tensor, params: Optional[Tensor], *, aipp_config_path: str="./aipp.cfg", dependencies=[], node_name=None):
+diff --git a/python/torchair/_ge_concrete_graph/fx2ge_converter.py b/python/torchair/_ge_concrete_graph/fx2ge_converter.py
+old mode 100644
+new mode 100755
+index 21412d2a..43255282
+--- a/python/torchair/_ge_concrete_graph/fx2ge_converter.py
++++ b/python/torchair/_ge_concrete_graph/fx2ge_converter.py
+@@ -1456,6 +1456,26 @@ class GeConcreteGraph(ConcreteGraphBase):
+         self._auto_tune_times += 1
+         logger.info(f"End auto tune for round {self._auto_tune_times - 1}")
+ 
++    def _graph_output_ref_input_has_cpu_memory(self) -> bool:
++            """
++            True if any input-output reuse pair in ``_graph_output_ref_input`` uses CPU (host) memory,
++            or if placement cannot be verified (conservative). GE must not receive ``outputReuseInputMemIndexes``
++            in those cases. Logs only when CPU memory is explicitly detected on an input or output.
++            """
++            placements_attr = self.graph.attr.get("_input_placements")
++            input_placements = list(placements_attr.list.i) if placements_attr is not None else []
++            for output_idx, input_idx in self._graph_output_ref_input.items():
++                if input_idx >= len(input_placements):
++                    return True
++                if input_placements[input_idx] == Placement.HOST:
++                    logger.info(
++                        "Skip outputReuseInputMemIndexes: reuse pair (output=%s, input=%s) uses host input.",
++                        output_idx,
++                        input_idx,
++                    )
++                    return True
++            return False
++
+     def _normalize_ge_option(self):
+         # Initialize based on global options
+         local_compile_options, global_compile_options = self.config.as_dict()
+@@ -1470,6 +1490,11 @@ class GeConcreteGraph(ConcreteGraphBase):
+         if len(output_reuse_indexes) != 0:
+             # support output memory reuse while output is not ref to input
+             local_compile_options["ge.exec.outputReuseMemIndexes"] = ",".join(str(x) for x in output_reuse_indexes)
++        if self._graph_output_ref_input and not self._graph_output_ref_input_has_cpu_memory():
++ 	             local_compile_options["ge.exec.outputReuseInputMemIndexes"] = "|".join(
++ 	                 f"{input_idx},{output_idx}"
++ 	                 for output_idx, input_idx in self._graph_output_ref_input.items()
++ 	             )
+         local_compile_options["ge.deterministic"] = "1" if torch.are_deterministic_algorithms_enabled() else "0"
+         local_compile_options["ge.exec.atomicCleanPolicy"] = "1"
+         local_compile_options.update(generate_dynamic_dims_option(self.graph.named_inputs_info,
+diff --git a/python/torchair/_ge_concrete_graph/ge_converter/custom/lightning_indexer.py b/python/torchair/_ge_concrete_graph/ge_converter/custom/lightning_indexer.py
+old mode 100644
+new mode 100755
+diff --git a/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_lightning_indexer.py b/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_lightning_indexer.py
+new file mode 100755
+index 00000000..54dfcf0f
+--- /dev/null
++++ b/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_lightning_indexer.py
+@@ -0,0 +1,70 @@
++import torch
++from torch.library import Library, impl
++import torch_npu
++import torchair
++from typing import Any, Dict, List, Tuple, Union, Callable, Optional
++from torchair._ge_concrete_graph.ge_ir_pb2 import GraphDef, OpDef, TensorDescriptor, TensorDef
++from torchair.ge._ge_graph import get_default_ge_graph, next_unique_name
++from torchair.ge._ge_graph import auto_convert_to_tensor
++from torchair.ge._ge_graph import Tensor, TensorSpec, DataType, TensorType
++from torchair.ge._ge_graph import compat_as_bytes, compat_as_bytes_list
++from torchair.ge._ge_graph import trans_to_list_list_int, trans_to_list_list_float
++from torchair.ge._ge_graph import get_invalid_desc
++from torchair._ge_concrete_graph.fx2ge_converter import register_fx_node_ge_converter
++from torchair._ge_concrete_graph import ge_apis as ge
++from torchair.ge import attr
++
++
++@register_fx_node_ge_converter(torch.ops.npu.mlp_lightning_indexer.default)
++def convert_mlp_lightning_indexer(
++    query: Tensor,
++    key: Tensor,
++    weights: Tensor,
++    *,
++    cur_seq_lengths_query: Optional[Tensor] = None,
++    cur_seq_lengths_key: Optional[Tensor] = None,
++    block_table: Optional[Tensor] = None,
++    init_tensor: Optional[Tensor] = None,
++    local_tensor: Optional[Tensor] = None,
++    layout_query: str = "BSND",
++    layout_kv: str = "PA_BSND",
++    sparse_count: int = 2048,
++    block_len: int = 1,
++    q_block_len: int = 1,
++    init_num: int = 0,
++    local_num: int = 0,
++    sparse_mode: int = 3,
++    pre_tokens: int = 2147483647,
++    next_tokens: int = 2147483647,
++    return_value: bool = False,
++    meta_outputs: TensorSpec = None,
++):
++    cur_seq_lengths_query  = ge.Cast(cur_seq_lengths_query, dst_type=DataType.DT_INT64)
++    cur_seq_lengths_key  = ge.Cast(cur_seq_lengths_key, dst_type=DataType.DT_INT64)
++    return torchair.ge.custom_op(
++        "MlpLightningIndexer",
++        inputs={"query": query,
++                "key": key,
++                "weights": weights,
++                "cur_seq_lengths_query": cur_seq_lengths_query,
++                "cur_seq_lengths_key": cur_seq_lengths_key,
++                "block_table": block_table,
++                "init_tensor": init_tensor,
++                "local_tensor": local_tensor,
++               },
++        attrs={"layout_query": attr.Str(layout_query),
++               "layout_kv": attr.Str(layout_kv),
++               "sparse_count": attr.Int(sparse_count),
++               "block_len": attr.Int(block_len),
++               "q_block_len": attr.Int(q_block_len),
++               "init_num": attr.Int(init_num),
++               "local_num": attr.Int(local_num),
++               "sparse_mode": attr.Int(sparse_mode),
++               "pre_tokens": attr.Int(pre_tokens),
++               "next_tokens": attr.Int(next_tokens),
++               "return_values": attr.Bool(return_value),
++               },
++        outputs=['sparse_indices',
++                 "sparse_values",
++                ]
++    )
+\ No newline at end of file
+diff --git a/third_party/ascend/include/ascendcl/external/acl/error_codes/ge_error_codes.h b/third_party/ascend/include/ascendcl/external/acl/error_codes/ge_error_codes.h
+deleted file mode 120000
+index 16fea795..00000000
+--- a/third_party/ascend/include/ascendcl/external/acl/error_codes/ge_error_codes.h
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../../air/external/ge/ge_error_codes.h
+\ No newline at end of file
+diff --git a/third_party/ascend/include/ascendcl/external/acl/error_codes/ge_error_codes.h b/third_party/ascend/include/ascendcl/external/acl/error_codes/ge_error_codes.h
+new file mode 100644
+index 00000000..3da45862
+--- /dev/null
++++ b/third_party/ascend/include/ascendcl/external/acl/error_codes/ge_error_codes.h
+@@ -0,0 +1,73 @@
++/* Copyright (c) 2024 Huawei Technologies Co., Ltd.
++ * This file is a part of the CANN Open Software.
++ * Licensed under CANN Open Software License Agreement Version 1.0 (the "License").
++ * Please refer to the License for details. You may not use this file except in compliance with the License.
++ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
++ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
++ * See LICENSE in the root of the software repository for the full text of the License.
++ * ===================================================================================================================*/
++
++#ifndef INC_EXTERNAL_GE_GE_ERROR_CODES_H_
++#define INC_EXTERNAL_GE_GE_ERROR_CODES_H_
++
++#if defined(_MSC_VER)
++#ifdef FUNC_VISIBILITY
++#define GE_FUNC_VISIBILITY _declspec(dllexport)
++#else
++#define GE_FUNC_VISIBILITY
++#endif
++#else
++#ifdef FUNC_VISIBILITY
++#define GE_FUNC_VISIBILITY __attribute__((visibility("default")))
++#else
++#define GE_FUNC_VISIBILITY
++#endif
++#endif
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++static const uint32_t ACL_ERROR_GE_PARAM_INVALID = 145000U;
++static const uint32_t ACL_ERROR_GE_EXEC_NOT_INIT = 145001U;
++static const uint32_t ACL_ERROR_GE_EXEC_MODEL_PATH_INVALID = 145002U;
++static const uint32_t ACL_ERROR_GE_EXEC_MODEL_ID_INVALID = 145003U;
++static const uint32_t ACL_ERROR_GE_EXEC_MODEL_DATA_SIZE_INVALID = 145006U;
++static const uint32_t ACL_ERROR_GE_EXEC_MODEL_ADDR_INVALID = 145007U;
++static const uint32_t ACL_ERROR_GE_EXEC_MODEL_QUEUE_ID_INVALID = 145008U;
++static const uint32_t ACL_ERROR_GE_EXEC_LOAD_MODEL_REPEATED = 145009U;
++static const uint32_t ACL_ERROR_GE_DYNAMIC_INPUT_ADDR_INVALID = 145011U;
++static const uint32_t ACL_ERROR_GE_DYNAMIC_INPUT_LENGTH_INVALID = 145012U;
++static const uint32_t ACL_ERROR_GE_DYNAMIC_BATCH_SIZE_INVALID = 145013U;
++static const uint32_t ACL_ERROR_GE_AIPP_BATCH_EMPTY = 145014U;
++static const uint32_t ACL_ERROR_GE_AIPP_NOT_EXIST = 145015U;
++static const uint32_t ACL_ERROR_GE_AIPP_MODE_INVALID = 145016U;
++static const uint32_t ACL_ERROR_GE_OP_TASK_TYPE_INVALID = 145017U;
++static const uint32_t ACL_ERROR_GE_OP_KERNEL_TYPE_INVALID = 145018U;
++static const uint32_t ACL_ERROR_GE_PLGMGR_PATH_INVALID = 145019U;
++static const uint32_t ACL_ERROR_GE_FORMAT_INVALID = 145020U;
++static const uint32_t ACL_ERROR_GE_SHAPE_INVALID = 145021U;
++static const uint32_t ACL_ERROR_GE_DATATYPE_INVALID = 145022U;
++static const uint32_t ACL_ERROR_GE_MEMORY_ALLOCATION = 245000U;
++static const uint32_t ACL_ERROR_GE_MEMORY_OPERATE_FAILED = 245001U;
++static const uint32_t ACL_ERROR_GE_DEVICE_MEMORY_OPERATE_FAILED = 245002U;
++static const uint32_t ACL_ERROR_GE_SUBHEALTHY = 345102U;
++static const uint32_t ACL_ERROR_GE_INTERNAL_ERROR = 545000U;
++static const uint32_t ACL_ERROR_GE_LOAD_MODEL = 545001U;
++static const uint32_t ACL_ERROR_GE_EXEC_LOAD_MODEL_PARTITION_FAILED = 545002U;
++static const uint32_t ACL_ERROR_GE_EXEC_LOAD_WEIGHT_PARTITION_FAILED = 545003U;
++static const uint32_t ACL_ERROR_GE_EXEC_LOAD_TASK_PARTITION_FAILED = 545004U;
++static const uint32_t ACL_ERROR_GE_EXEC_LOAD_KERNEL_PARTITION_FAILED = 545005U;
++static const uint32_t ACL_ERROR_GE_EXEC_RELEASE_MODEL_DATA = 545006U;
++static const uint32_t ACL_ERROR_GE_COMMAND_HANDLE = 545007U;
++static const uint32_t ACL_ERROR_GE_GET_TENSOR_INFO = 545008U;
++static const uint32_t ACL_ERROR_GE_UNLOAD_MODEL = 545009U;
++static const uint32_t ACL_ERROR_GE_MODEL_EXECUTE_TIMEOUT = 545601U;
++static const uint32_t ACL_ERROR_GE_REDEPLOYING = 545602U;
++
++#ifdef __cplusplus
++}  // namespace ge
++#endif
++#endif  // INC_EXTERNAL_GE_GE_ERROR_CODES_H_
+diff --git a/third_party/ascend/include/ascendcl/external/acl/error_codes/rt_error_codes.h b/third_party/ascend/include/ascendcl/external/acl/error_codes/rt_error_codes.h
+deleted file mode 120000
+index 9ba93eb0..00000000
+--- a/third_party/ascend/include/ascendcl/external/acl/error_codes/rt_error_codes.h
++++ /dev/null
+@@ -1 +0,0 @@
+-../../../../runtime/external/runtime/rt_error_codes.h
+\ No newline at end of file
+diff --git a/third_party/ascend/include/ascendcl/external/acl/error_codes/rt_error_codes.h b/third_party/ascend/include/ascendcl/external/acl/error_codes/rt_error_codes.h
+new file mode 100644
+index 00000000..cb1913d5
+--- /dev/null
++++ b/third_party/ascend/include/ascendcl/external/acl/error_codes/rt_error_codes.h
+@@ -0,0 +1,124 @@
++/**
++* @file rt_error_codes.h
++*
++* Copyright (C) Huawei Technologies Co., Ltd. 2019-2020. All Rights Reserved.
++*
++* This program is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++*/
++
++#ifndef __INC_EXTERNEL_RT_ERROR_CODES_H__
++#define __INC_EXTERNEL_RT_ERROR_CODES_H__
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define  ACL_RT_SUCCESS    0                               // success
++#define  ACL_ERROR_RT_PARAM_INVALID              107000 // param invalid
++#define  ACL_ERROR_RT_INVALID_DEVICEID           107001 // invalid device id
++#define  ACL_ERROR_RT_CONTEXT_NULL               107002 // current context null
++#define  ACL_ERROR_RT_STREAM_CONTEXT             107003 // stream not in current context
++#define  ACL_ERROR_RT_MODEL_CONTEXT              107004 // model not in current context
++#define  ACL_ERROR_RT_STREAM_MODEL               107005 // stream not in model
++#define  ACL_ERROR_RT_EVENT_TIMESTAMP_INVALID    107006 // event timestamp invalid
++#define  ACL_ERROR_RT_EVENT_TIMESTAMP_REVERSAL   107007 // event timestamp reversal
++#define  ACL_ERROR_RT_ADDR_UNALIGNED             107008 // memory address unaligned
++#define  ACL_ERROR_RT_FILE_OPEN                  107009 // open file failed
++#define  ACL_ERROR_RT_FILE_WRITE                 107010 // write file failed
++#define  ACL_ERROR_RT_STREAM_SUBSCRIBE           107011 // error subscribe stream
++#define  ACL_ERROR_RT_THREAD_SUBSCRIBE           107012 // error subscribe thread
++#define  ACL_ERROR_RT_GROUP_NOT_SET              107013 // group not set
++#define  ACL_ERROR_RT_GROUP_NOT_CREATE           107014 // group not create
++#define  ACL_ERROR_RT_STREAM_NO_CB_REG           107015 // callback not register to stream
++#define  ACL_ERROR_RT_INVALID_MEMORY_TYPE        107016 // invalid memory type
++#define  ACL_ERROR_RT_INVALID_HANDLE             107017 // invalid handle
++#define  ACL_ERROR_RT_INVALID_MALLOC_TYPE        107018 // invalid malloc type
++#define  ACL_ERROR_RT_WAIT_TIMEOUT               107019 // wait timeout
++#define  ACL_ERROR_RT_TASK_TIMEOUT               107020 // task timeout
++#define  ACL_ERROR_RT_SYSPARAMOPT_NOT_SET        107021 // not set sysparamopt
++
++#define  ACL_ERROR_RT_FEATURE_NOT_SUPPORT        207000 // feature not support
++#define  ACL_ERROR_RT_MEMORY_ALLOCATION          207001 // memory allocation error
++#define  ACL_ERROR_RT_MEMORY_FREE                207002 // memory free error
++#define  ACL_ERROR_RT_AICORE_OVER_FLOW           207003 // aicore over flow
++#define  ACL_ERROR_RT_NO_DEVICE                  207004 // no device
++#define  ACL_ERROR_RT_RESOURCE_ALLOC_FAIL        207005 // resource alloc fail
++#define  ACL_ERROR_RT_NO_PERMISSION              207006 // no permission
++#define  ACL_ERROR_RT_NO_EVENT_RESOURCE          207007 // no event resource
++#define  ACL_ERROR_RT_NO_STREAM_RESOURCE         207008 // no stream resource
++#define  ACL_ERROR_RT_NO_NOTIFY_RESOURCE         207009 // no notify resource
++#define  ACL_ERROR_RT_NO_MODEL_RESOURCE          207010 // no model resource
++#define  ACL_ERROR_RT_NO_CDQ_RESOURCE            207011 // no cdq resource
++#define  ACL_ERROR_RT_OVER_LIMIT                 207012 // over limit
++#define  ACL_ERROR_RT_QUEUE_EMPTY                207013 // queue is empty
++#define  ACL_ERROR_RT_QUEUE_FULL                 207014 // queue is full
++#define  ACL_ERROR_RT_REPEATED_INIT              207015 // repeated init
++#define  ACL_ERROR_RT_AIVEC_OVER_FLOW            207016 // aivec over flow
++#define  ACL_ERROR_RT_OVER_FLOW                  207017 // common over flow
++#define  ACL_ERROR_RT_DEVICE_OOM                 207018 // device oom
++
++#define  ACL_ERROR_RT_INTERNAL_ERROR             507000 // runtime internal error
++#define  ACL_ERROR_RT_TS_ERROR                   507001 // ts internel error
++#define  ACL_ERROR_RT_STREAM_TASK_FULL           507002 // task full in stream
++#define  ACL_ERROR_RT_STREAM_TASK_EMPTY          507003 // task empty in stream
++#define  ACL_ERROR_RT_STREAM_NOT_COMPLETE        507004 // stream not complete
++#define  ACL_ERROR_RT_END_OF_SEQUENCE            507005 // end of sequence
++#define  ACL_ERROR_RT_EVENT_NOT_COMPLETE         507006 // event not complete
++#define  ACL_ERROR_RT_CONTEXT_RELEASE_ERROR      507007 // context release error
++#define  ACL_ERROR_RT_SOC_VERSION                507008 // soc version error
++#define  ACL_ERROR_RT_TASK_TYPE_NOT_SUPPORT      507009 // task type not support
++#define  ACL_ERROR_RT_LOST_HEARTBEAT             507010 // ts lost heartbeat
++#define  ACL_ERROR_RT_MODEL_EXECUTE              507011 // model execute failed
++#define  ACL_ERROR_RT_REPORT_TIMEOUT             507012 // report timeout
++#define  ACL_ERROR_RT_SYS_DMA                    507013 // sys dma error
++#define  ACL_ERROR_RT_AICORE_TIMEOUT             507014 // aicore timeout
++#define  ACL_ERROR_RT_AICORE_EXCEPTION           507015 // aicore exception
++#define  ACL_ERROR_RT_AICORE_TRAP_EXCEPTION      507016 // aicore trap exception
++#define  ACL_ERROR_RT_AICPU_TIMEOUT              507017 // aicpu timeout
++#define  ACL_ERROR_RT_AICPU_EXCEPTION            507018 // aicpu exception
++#define  ACL_ERROR_RT_AICPU_DATADUMP_RSP_ERR     507019 // aicpu datadump response error
++#define  ACL_ERROR_RT_AICPU_MODEL_RSP_ERR        507020 // aicpu model operate response error
++#define  ACL_ERROR_RT_PROFILING_ERROR            507021 // profiling error
++#define  ACL_ERROR_RT_IPC_ERROR                  507022 // ipc error
++#define  ACL_ERROR_RT_MODEL_ABORT_NORMAL         507023 // model abort normal
++#define  ACL_ERROR_RT_KERNEL_UNREGISTERING       507024 // kernel unregistering
++#define  ACL_ERROR_RT_RINGBUFFER_NOT_INIT        507025 // ringbuffer not init
++#define  ACL_ERROR_RT_RINGBUFFER_NO_DATA         507026 // ringbuffer no data
++#define  ACL_ERROR_RT_KERNEL_LOOKUP              507027 // kernel lookup error
++#define  ACL_ERROR_RT_KERNEL_DUPLICATE           507028 // kernel register duplicate
++#define  ACL_ERROR_RT_DEBUG_REGISTER_FAIL        507029 // debug register failed
++#define  ACL_ERROR_RT_DEBUG_UNREGISTER_FAIL      507030 // debug unregister failed
++#define  ACL_ERROR_RT_LABEL_CONTEXT              507031 // label not in current context
++#define  ACL_ERROR_RT_PROGRAM_USE_OUT            507032 // program register num use out
++#define  ACL_ERROR_RT_DEV_SETUP_ERROR            507033 // device setup error
++#define  ACL_ERROR_RT_VECTOR_CORE_TIMEOUT        507034 // vector core timeout
++#define  ACL_ERROR_RT_VECTOR_CORE_EXCEPTION      507035 // vector core exception
++#define  ACL_ERROR_RT_VECTOR_CORE_TRAP_EXCEPTION 507036 // vector core trap exception
++#define  ACL_ERROR_RT_CDQ_BATCH_ABNORMAL         507037 // cdq alloc batch abnormal
++#define  ACL_ERROR_RT_DIE_MODE_CHANGE_ERROR      507038 // can not change die mode
++#define  ACL_ERROR_RT_DIE_SET_ERROR              507039 // single die mode can not set die
++#define  ACL_ERROR_RT_INVALID_DIEID              507040 // invalid die id
++#define  ACL_ERROR_RT_DIE_MODE_NOT_SET           507041 // die mode not set
++#define  ACL_ERROR_RT_AICORE_TRAP_READ_OVERFLOW       507042 // aic trap read overflow
++#define  ACL_ERROR_RT_AICORE_TRAP_WRITE_OVERFLOW      507043 // aic trap write overflow
++#define  ACL_ERROR_RT_VECTOR_CORE_TRAP_READ_OVERFLOW  507044 // aiv trap read overflow
++#define  ACL_ERROR_RT_VECTOR_CORE_TRAP_WRITE_OVERFLOW 507045 // aiv trap write overflow
++#define  ACL_ERROR_RT_STREAM_SYNC_TIMEOUT        507046 // stream sync time out
++#define  ACL_ERROR_RT_EVENT_SYNC_TIMEOUT         507047 // event sync time out
++#define  ACL_ERROR_RT_FFTS_PLUS_TIMEOUT          507048 // ffts+ timeout
++#define  ACL_ERROR_RT_FFTS_PLUS_EXCEPTION        507049 // ffts+ exception
++#define  ACL_ERROR_RT_FFTS_PLUS_TRAP_EXCEPTION   507050 // ffts+ trap exception
++#define  ACL_ERROR_RT_SEND_MSG                   507051 // hdc send msg fail
++#define  ACL_ERROR_RT_COPY_DATA                  507052 // copy data fail
++#define  ACL_ERROR_RT_DRV_INTERNAL_ERROR         507899 // drv internal error
++#define  ACL_ERROR_RT_AICPU_INTERNAL_ERROR       507900 // aicpu internal error
++#define  ACL_ERROR_RT_SOCKET_CLOSE               507901 // hdc disconnect
++
++#ifdef __cplusplus
++}
++#endif
++#endif // __INC_EXTERNEL_RT_ERROR_CODES_H__
+-- 
+2.39.5 (Apple Git-154)
+

@@ -20,7 +20,6 @@ from sglang.srt.utils import get_colorful_logger
 from typing import Optional
 
 import torch
-import flashinfer
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,6 +31,8 @@ if is_cuda_available():
 
 if is_npu():
     import torch_npu
+else:
+    import flashinfer
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (

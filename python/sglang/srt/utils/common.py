@@ -96,6 +96,13 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+# for NPU
+_NPU_910B_NUM_GPUS_PER_NODE = int(os.popen("npu-smi info | grep 910B | wc -l").read().strip())
+
+def get_910b_num_gpus_per_node():
+    assert _NPU_910B_NUM_GPUS_PER_NODE is not None
+    return _NPU_910B_NUM_GPUS_PER_NODE
+
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
@@ -134,6 +141,8 @@ def is_xpu() -> bool:
 
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
+
+__is_npu__ = is_npu()
 
 
 def is_host_cpu_x86() -> bool:
@@ -467,7 +476,7 @@ def get_available_gpu_memory(
 def check_and_clear_cache(threshold_gb):
     reserved_gb = torch.cuda.memory_reserved() / (1024**3)
     allocated_gb = torch.cuda.memory_allocated() / (1024**3)
-    
+
     if reserved_gb >= threshold_gb:
         remained_gb = get_available_gpu_memory("cuda", torch.cuda.current_device(), empty_cache=False)
         logger.warning(
@@ -477,7 +486,7 @@ def check_and_clear_cache(threshold_gb):
         )
 
         torch.cuda.empty_cache()
-        
+
         reserved_gb_after = torch.cuda.memory_reserved() / (1024**3)
         allocated_gb_after = torch.cuda.memory_allocated() / (1024**3)
         remained_gb = get_available_gpu_memory("cuda", torch.cuda.current_device(), empty_cache=False)
@@ -501,7 +510,7 @@ def set_memory_threshold(topk : int, hidden_size: int):
     # [TODO] how many memory space should be reserved for moe
     assert space_hint < memory_remained, \
         "Not enough memory for torch allocator. Set a smaller max_prefill_tokens or mem_fraction_static."
-    
+
     return max_memory_reserved
 
 def is_pin_memory_available() -> bool:
@@ -516,24 +525,46 @@ class LayerFn(Protocol):
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
+    pp_rank: Optional[int] = None,
+    pp_size: Optional[int] = None,
     prefix: str = "",
-    offloader_kwargs: Dict[str, Any] = {},
+    return_tuple: bool = False,
+    return_index: int = 0,
+    offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
     from sglang.srt.offloader import get_offloader
+    # circula imports
+    from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.utils import PPMissingLayer
 
-    start_layer = 0
-    end_layer = num_hidden_layers
+    assert not pp_size or num_hidden_layers >= pp_size
+    start_layer, end_layer = (
+        get_pp_indices(
+            num_hidden_layers,
+            pp_rank,
+            pp_size,
+        )
+        if pp_rank is not None and pp_size is not None
+        else (0, num_hidden_layers)
+    )
     modules = torch.nn.ModuleList(
-        get_offloader().wrap_modules(
+        [PPMissingLayer(return_tuple=return_tuple, return_index=return_index) for _ in range(start_layer)]
+        + get_offloader().wrap_modules(
             (
                 layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
                 for idx in range(start_layer, end_layer)
             ),
-            **offloader_kwargs,
+            **(offloader_kwargs or {}),
         )
+        + [
+            PPMissingLayer(return_tuple=return_tuple)
+            for _ in range(end_layer, num_hidden_layers)
+        ]
     )
-    return modules
+    if pp_rank is None or pp_size is None:
+        return modules
+    return modules, start_layer, end_layer
 
 
 cmo_stream = None
@@ -587,6 +618,9 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if __is_npu__:
+        import torch_npu
+        torch_npu.npu.manual_seed_all(seed)
 
 
 def find_process_using_port(port: int) -> Optional[psutil.Process]:
@@ -1093,7 +1127,7 @@ def configure_logger(server_args, prefix: str = ""):
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
-    
+
     # Only set specified log level for sglang-related loggers
     for logger_name in logging.Logger.manager.loggerDict:
         if "sglang" in logger_name or logger_name.startswith("sglang"):
@@ -1102,7 +1136,7 @@ def configure_logger(server_args, prefix: str = ""):
                 logger_obj.setLevel(log_level)
                 for handler in logger_obj.handlers:
                     handler.setLevel(log_level)
-    
+
     # Suppress DEBUG logs from third-party libraries
     # logging.getLogger("transformers").setLevel(logging.WARNING)
     # logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
@@ -1155,6 +1189,8 @@ def broadcast_pyobj(
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
     )
+    if __is_npu__ and not force_cpu_device:
+        device = "npu"
 
     if rank == src:
         if len(data) == 0:
@@ -1194,50 +1230,68 @@ def point_to_point_pyobj(
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
+    async_send: bool = False,
 ):
-    """Send data from src to dst in group using DeviceToDevice communication."""
+    """Send data from src to dst in group."""
+    from sglang.srt.distributed.parallel_state import P2PWork
 
+    if async_send:
+        send_func = dist.isend
+    else:
+        send_func = dist.send
     if rank == src:
+        # if len(data) > 0:
+        #     if not isinstance(data[0], (List, Tuple)) or (isinstance(data[0], (List, Tuple)) and (len(data[0]) > 0)):
+        #         logger.info(f"point_to_point_send {rank=} {src=} {dst=} {data=}")
+        p2p_works = []
         if len(data) == 0:
             tensor_size = torch.tensor(
-                [0], dtype=torch.long, device=torch.cuda.current_device()
+                [0],
+                dtype=torch.long,
             )
-            dist.send(tensor_size, dst=dst, group=group)
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            ).cuda(
-                device=torch.cuda.current_device()
-            )  # Move to GPU
-            tensor_size = torch.tensor(
-                [size], dtype=torch.long, device=torch.cuda.current_device()
             )
+            tensor_size = torch.tensor([size], dtype=torch.long)
 
-            dist.send(tensor_size, dst=dst, group=group)
-            dist.send(tensor_data, dst=dst, group=group)
-        return data
+            work = send_func(tensor_size, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_size))
+            work = send_func(tensor_data, dst, group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, tensor_data))
+        return p2p_works
 
     elif rank == dst:
         tensor_size = torch.tensor(
-            [0], dtype=torch.long, device=torch.cuda.current_device()
+            [0],
+            dtype=torch.long,
         )
-        dist.recv(tensor_size, src=src, group=group)
+        work = dist.irecv(tensor_size, src=src, group=group)
+        work.wait()
         size = tensor_size.item()
 
         if size == 0:
             return []
 
         tensor_data = torch.empty(
-            size, dtype=torch.uint8, device=torch.cuda.current_device()
+            size,
+            dtype=torch.uint8,
         )
-        dist.recv(tensor_data, src=src, group=group)
+        work = dist.irecv(tensor_data, src=src, group=group)
+        work.wait()
 
-        serialized_data = bytes(
-            tensor_data.cpu().numpy()
-        )  # Move back to host for deserialization
+        serialized_data = bytes(tensor_data.cpu().numpy())
         data = pickle.loads(serialized_data)
+        # if len(data)>0:
+        #     if not isinstance(data[0], (List, Tuple)) or (isinstance(data[0], (List, Tuple)) and (len(data[0]) > 0)):
+        #         logger.info(f"point_to_point_recv {rank=} {src=} {dst=} {data=}")
         return data
 
     # Other ranks in pp_group do nothing
@@ -1774,6 +1828,19 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
     return major, minor
 
+def device_synchronize(device_id: int = 0) -> None:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+
+def get_device_module():
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda
+
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu
 
 def get_npu_compiler_config():
     config = {
@@ -1802,11 +1869,23 @@ def get_compiler_backend() -> str:
         predefined_config = get_npu_compiler_config()
         for k, v in predefined_config.items():
             setattr(compiler_config.experimental_config, k, v)
-
+        # compiler_config.debug.graph_dump.type = "pbtxt"
+        # compiler_config.debug.graph_dump.type = "py"
+        # compiler_config.debug.graph_dump.path = "./test"
+        compiler_config.ge_config.optimization_switch = "InplaceAddRmsNormFusionPass:off"
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
     return "inductor"
+
+@torch.compile(backend=get_compiler_backend(), fullgraph=True, dynamic=True)
+def print_npu_graph_tensor(prefix, x):
+    import torchair
+    # from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    # if get_tensor_model_parallel_rank() == 0:
+        # torchair.ops.npu_print("print npu graph tensor:", x)
+    torchair.ops.npu_print(prefix + " print npu graph tensor:", x)
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
@@ -2529,6 +2608,10 @@ class Withable(Generic[T]):
     @property
     def value(self) -> T:
         return self._value
+
+    @value.setter
+    def value(self, new_value: T):
+        self._value = new_value
 
     @contextmanager
     def with_value(self, new_value: T):
@@ -3700,3 +3783,9 @@ def custom_load_tensor(pt: torch.Tensor, folder: str, name: str):
     for i in range(cnt):
         ret.append(torch.load(f"{str(path)}/{name}_{i:03d}.pt"))
     return ret
+
+def get_prefix_sum(x: List[int]) -> List[int]:
+    prefix_sum = [0]
+    for i in range(len(x)):
+        prefix_sum.append(prefix_sum[-1] + x[i])
+    return prefix_sum

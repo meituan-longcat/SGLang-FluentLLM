@@ -1,6 +1,7 @@
 import gc
 
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.utils import get_colorful_logger, is_npu
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -19,12 +20,18 @@ from sglang.srt.utils import (
     init_custom_process_group,
     set_cuda_arch,
 )
+from sglang.srt.constants import (
+    GPU_MEMORY_ALL_TYPES,
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS
+)
 
 logger = get_colorful_logger(__name__)
 
 
 class WeightMixin:
-    def load_model(self):
+    def load_model(self, draft_model_idx: int = None):
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
@@ -49,9 +56,10 @@ class WeightMixin:
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
             ext_yaml=self.server_args.ext_yaml,
+            draft_model_idx=draft_model_idx
         )
 
-        with self.memory_saver_adapter.region():
+        with self.memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_WEIGHTS):
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -88,6 +96,36 @@ class WeightMixin:
             else None
         )
         self.dtype = self.model_config.dtype
+
+        def print_model_weights_memory(model):
+            """打印模型所有参数的权重占用"""
+            total_params=0
+            total_memory=0
+
+            print("="*80)
+            print(f"{'参数名':<60} {'参数量':>12} {'大小(MB)':>12}")
+            print("="*80)
+
+            for name, param in model.named_parameters():
+                param_count=param.numel()
+                param_memory=param.numel()*param.element_size()  # 字节数
+
+                total_params+=param_count
+                total_memory+=param_memory
+
+                print(f"{name:<60} {param_count:>12,} {param_memory/1024**2:>12.2f}")
+
+            print("="*80)
+            print(f"{'总计':<60} {total_params:>12,} {total_memory/1024**2:>12.2f}")
+            print(f"总参数量: {total_params:,}")
+            print(f"总显存占用: {total_memory/1024**2:.2f} MB ({total_memory/1024**3:.2f} GB)")
+            print("="*80)
+
+        if is_npu():
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+            if get_tp_group().is_first_rank:
+                print_model_weights_memory(self.model)
 
         logger.info(
             f"Load weight end. "
@@ -263,7 +301,7 @@ class WeightMixin:
         infered_device = self.device_module.current_device()
 
         named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.attn_tp_rank, device=infered_device))
+            (name, _unwrap_tensor(tensor, tp_rank=self.global_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
@@ -312,3 +350,37 @@ class LocalSerializedTensor:
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
+
+def unwrap_ipc_tensors(
+    tensors: List[Tuple[str, torch.Tensor]], tp_rank: int, device: torch.device
+) -> List[Tuple[str, torch.Tensor]]:
+    """Unwrap IPC (Inter-Process Communication) tensors and move them to the target device.
+
+    This function handles tensors that may be serialized using IPC handles and converts them
+    to regular tensors on the specified device. It's primarily used in distributed training
+    scenarios where tensors need to be shared across processes.
+
+    Args:
+        tensors: List of tuples containing tensor names and tensor objects.
+        tp_rank: Tensor parallelism rank to retrieve the correct tensor from LocalSerializedTensor.
+        device: Target device to move tensors to (e.g., 'cuda:0', 'cpu').
+
+    Returns:
+        List of tuples with the same structure as input, but with tensors moved to target device.
+    """
+    result = []
+    for name, tensor in tensors:
+        if isinstance(tensor, LocalSerializedTensor):
+            # Deserialize the IPC tensor for the current rank
+            ipc_tensor = tensor.get(tp_rank)
+            # Move the deserialized tensor to the target device
+            tensor_on_device = ipc_tensor.to(device)
+            # Explicitly delete the tensor created from the IPC handle to trigger
+            # garbage collection and release the handle, freeing IPC resources.
+            del ipc_tensor
+        else:
+            # For regular tensors, simply move them to the target device
+            tensor_on_device = tensor.to(device)
+        # Append the processed tensor to the result list
+        result.append((name, tensor_on_device))
+    return result

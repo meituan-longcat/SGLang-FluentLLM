@@ -1,103 +1,110 @@
-from sglang.srt.server_args import ServerArgs
 import os
+from sglang.srt.utils import is_npu
+
 import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from typing import Any
 
+__is_npu__ = is_npu()
 
-global_server_args_dict: dict = {
-    "attention_backend": ServerArgs.attention_backend,
-    "sampling_backend": ServerArgs.sampling_backend,
-    "triton_attention_reduce_in_fp32": ServerArgs.triton_attention_reduce_in_fp32,
-    "torchao_config": ServerArgs.torchao_config,
-    "kv_cache_dtype": ServerArgs.kv_cache_dtype,
-    "enable_nan_detection": ServerArgs.enable_nan_detection,
-    "enable_dp_attention": ServerArgs.enable_dp_attention,
-    "enable_ep_moe": ServerArgs.enable_ep_moe,
-    "enable_deep_ep": ServerArgs.enable_deep_ep,
-    "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
-    "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
-    "device": ServerArgs.device,
-    "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
-    "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
-    "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
-    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
-    "disable_pdl": ServerArgs.disable_pdl,
-    "disable_radix_cache": ServerArgs.disable_radix_cache,
-    "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
-    "dp_size": ServerArgs.dp_size,
-    "attn_tp_size": ServerArgs.attn_tp_size,
-    "dense_tp_size": ServerArgs.dense_tp_size,
-    "moe_parallel_strategy": ServerArgs.moe_parallel_strategy,
-    "attn_parallel_strategy": ServerArgs.attn_parallel_strategy,
-    "dense_parallel_strategy": ServerArgs.dense_parallel_strategy,
-    "chunked_prefill_size": ServerArgs.chunked_prefill_size,
-    "tbo_min_bs": ServerArgs.tbo_min_bs,
-    "mla_max_chunk_capacity": ServerArgs.mla_max_chunk_capacity,
-    "ep_num_redundant_experts": ServerArgs.ep_num_redundant_experts,
-    "ep_dispatch_algorithm": ServerArgs.ep_dispatch_algorithm,
-    "enable_eplb": ServerArgs.enable_eplb,
-    "mm_mode": ServerArgs.mm_mode,
-    "npu_enable_weight_nz": ServerArgs.npu_enable_weight_nz,
-    "npu_enable_mc2": ServerArgs.npu_enable_mc2,
-    "npu_enable_mlp_matmul": ServerArgs.npu_enable_mlp_matmul,
-    "npu_enable_opt_rope": ServerArgs.npu_enable_opt_rope,
-    "flashinfer_comm_max_num_tokens": ServerArgs.flashinfer_comm_max_num_tokens,
-    "enable_deep_ep": ServerArgs.enable_deep_ep,
-    "max_prefill_tokens": ServerArgs.max_prefill_tokens,
-    "chunker_backend": ServerArgs.chunker_backend,
-    "max_running_requests": ServerArgs.max_running_requests,
-}
+# NOTE: Initialized with None defaults to avoid circular import with
+# sglang.srt.server_args (server_args -> distributed -> parallel_state -> env -> server_args).
+# The real values are populated at runtime when global_server_args_dict_update() is called.
+global_server_args_dict: dict = {}
+
+class EnvVar:
+    npu_enable_all2all_comm: bool = os.getenv("NPU_ENABLE_ALL2ALL_COMM", "1") == "1"
+    npu_enable_graph: bool = os.getenv("NPU_ENABLE_GRAPH", "0") == "1"
+    npu_enable_mla_split_kv_kr: bool = __is_npu__ and os.getenv("NPU_ENABLE_MLA_SPLIT_KV_KR", "1") == "1"
+    npu_enable_get_out_cache: bool=os.getenv("NPU_ENABLE_GET_OUT_CACHE", "0")=="1"
+    npu_moe_core_num: bool = int(os.getenv("NPU_MOE_CORE_NUM", "12"))
+
+    def __init__(self):
+        """
+        logger.info(f"npu_enable_all2all_comm:{self.npu_enable_all2all_comm}")
+        logger.info(f"npu_enable_graph:{self.npu_enable_graph}")
+        logger.info(f"npu_enable_mla_split_kv_kr:{self.npu_enable_mla_split_kv_kr}")
+        """
+        pass
+
+
+
+
+ENV = EnvVar()
 
 def global_server_args_dict_update(server_args):
-        global_server_args_dict.update(
-            {
-                "attention_backend": server_args.attention_backend,
-                "sampling_backend": server_args.sampling_backend,
-                "chunker_backend": server_args.chunker_backend,
-                "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
-                "torchao_config": server_args.torchao_config,
-                "kv_cache_dtype": server_args.kv_cache_dtype,
-                "enable_nan_detection": server_args.enable_nan_detection,
-                "enable_dp_attention": server_args.enable_dp_attention,
-                "enable_ep_moe": server_args.enable_ep_moe,
-                "enable_deep_ep": server_args.enable_deep_ep,
-                "force_deterministic_rsag": server_args.force_deterministic_rsag,
-                "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
-                "device": server_args.device,
-                "draft_model_path_use_base": server_args.draft_model_path_use_base,
-                "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
-                "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
-                "speculative_algorithm": server_args.speculative_algorithm,
-                "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
-                "disable_pdl": server_args.disable_pdl,
-                "disable_radix_cache": server_args.disable_radix_cache,
-                "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
-                "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
-                "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
-                "dp_size": server_args.dp_size,
-                "attn_tp_size": server_args.attn_tp_size,
-                "attn_parallel_strategy": server_args.attn_parallel_strategy,
-                "moe_parallel_strategy": server_args.moe_parallel_strategy,
-                "dense_parallel_strategy": server_args.dense_parallel_strategy,
-                "chunked_prefill_size": server_args.chunked_prefill_size,
-                "mla_max_chunk_capacity": server_args.mla_max_chunk_capacity,
-                "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
-                "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
-                "enable_eplb": server_args.enable_eplb,
-                "mm_mode": server_args.mm_mode,
-                "npu_enable_weight_nz": server_args.npu_enable_weight_nz,
-                "npu_enable_mc2": server_args.npu_enable_mc2,
-                "npu_enable_mlp_matmul": server_args.npu_enable_mlp_matmul,
-                "npu_enable_opt_rope": server_args.npu_enable_opt_rope,
-                "flashinfer_comm_max_num_tokens": server_args.flashinfer_comm_max_num_tokens,
-                "enable_deep_ep": server_args.enable_deep_ep,
-                "max_prefill_tokens": server_args.max_prefill_tokens,
-                "max_running_requests": server_args.max_running_requests,
-            }
-        )
+    global_server_args_dict.update(
+        {
+            "attention_backend": server_args.attention_backend,
+            "sampling_backend": server_args.sampling_backend,
+            "chunker_backend": server_args.chunker_backend,
+            "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
+            "torchao_config": server_args.torchao_config,
+            "kv_cache_dtype": server_args.kv_cache_dtype,
+            "enable_nan_detection": server_args.enable_nan_detection,
+            "enable_dp_attention": server_args.enable_dp_attention,
+            "enable_ep_moe": server_args.enable_ep_moe,
+            "enable_deep_ep": server_args.enable_deep_ep,
+            "force_deterministic_rsag": server_args.force_deterministic_rsag,
+            "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
+            "device": server_args.device,
+            "draft_model_path_use_base": server_args.draft_model_path_use_base,
+            "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
+            "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
+            "speculative_algorithm": server_args.speculative_algorithm,
+            "is_multi_head_eagle": server_args.is_multi_head_eagle,
+            "draft_use_oe": server_args.draft_use_oe,
+            "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
+            "disable_pdl": server_args.disable_pdl,
+            "disable_radix_cache": server_args.disable_radix_cache,
+            "flashinfer_mla_disable_ragged": server_args.flashinfer_mla_disable_ragged,
+            "debug_tensor_dump_output_folder": server_args.debug_tensor_dump_output_folder,
+            "debug_tensor_dump_inject": server_args.debug_tensor_dump_inject,
+            "dp_size": server_args.dp_size,
+            "attn_tp_size": server_args.attn_tp_size,
+            "kvp_size": server_args.kvp_size,
+            "attn_parallel_strategy": server_args.attn_parallel_strategy,
+            "moe_parallel_strategy": server_args.moe_parallel_strategy,
+            "dense_parallel_strategy": server_args.dense_parallel_strategy,
+            "chunked_prefill_size": server_args.chunked_prefill_size,
+            "mla_max_chunk_capacity": server_args.mla_max_chunk_capacity,
+            "ep_num_redundant_experts": server_args.ep_num_redundant_experts,
+            "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
+            "enable_eplb": server_args.enable_eplb,
+            "mm_mode": server_args.mm_mode,
+            "npu_enable_weight_nz": server_args.npu_enable_weight_nz,
+            "npu_enable_opt_rope": server_args.npu_enable_opt_rope,
+            "flashinfer_comm_max_num_tokens": server_args.flashinfer_comm_max_num_tokens,
+            "enable_deep_ep": server_args.enable_deep_ep,
+            "max_prefill_tokens": server_args.max_prefill_tokens,
+            "max_running_requests": server_args.max_running_requests,
+            "enable_mla_l1_5_cache": server_args.enable_mla_l1_5_cache,
+            "max_total_tokens": server_args.max_total_tokens,
+            "npu_hccl_buffsize_a2a": server_args.npu_hccl_buffsize_a2a,
+            "npu_o_proj_tp_size": server_args.npu_o_proj_tp_size,
+            "npu_smooth_quant": server_args.npu_smooth_quant,
+            "npu_kvp_accuracy_fix": server_args.npu_kvp_accuracy_fix,
+            "npu_enable_super_kernel": server_args.npu_enable_super_kernel,
+            "npu_disable_kv_nz": server_args.npu_disable_kv_nz,
+            "model_path": server_args.model_path,
+            "npu_enable_graph_cache": server_args.npu_enable_graph_cache,
+            "npu_graph_cache_path": server_args.npu_graph_cache_path,
+            "npu_compile_bs": server_args.npu_compile_bs,
+            "disaggregation_mode": server_args.disaggregation_mode,
+            "npu_disable_all_gather": server_args.npu_disable_all_gather,
+            "npu_scheduler_comm": server_args.npu_scheduler_comm,
+            "npu_enable_sp_for_indexer": server_args.npu_enable_sp_for_indexer,
+            "npu_disable_dsa_head_parallel": server_args.npu_disable_dsa_head_parallel,
+            "npu_enable_a2_dispatch_combine_opt": server_args.npu_enable_a2_dispatch_combine_opt,
+            "npu_limit_max_new_tokens": server_args.npu_limit_max_new_tokens,
+            "npu_moe_chunked_prefill_size": server_args.npu_moe_chunked_prefill_size,
+            "npu_lmhead_tp_size": server_args.npu_lmhead_tp_size,
+            "npu_enable_oe_cpu_offload": server_args.npu_enable_oe_cpu_offload,
+            "pp_layer_nums": server_args.pp_layer_nums,
+        }
+    )
 
 
 class EnvField:

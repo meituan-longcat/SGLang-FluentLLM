@@ -47,6 +47,7 @@ class RadixAttention(nn.Module):
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
         is_cross_attention: bool = False,
+        is_npu_dsa: bool = False,
         attn_type: AttentionType = AttentionType.DECODER,
     ):
         super().__init__()
@@ -64,6 +65,7 @@ class RadixAttention(nn.Module):
         self.k_scale = None
         self.v_scale = None
         self.attn_type = attn_type
+        self.is_npu_dsa = is_npu_dsa
 
     def forward(
         self,
@@ -74,7 +76,7 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        if k is not None:
+        if k is not None and not self.is_npu_dsa:
             # For cross-layer sharing, kv can be None
             assert v is not None
             if "k_pe" not in kwargs:

@@ -433,11 +433,13 @@ class HiCacheController:
         host_indices = self.mem_pool_host.alloc(num_tokens)
         device_token_indices = (device_indices.unsqueeze(1) * self.page_size + torch.arange(self.page_size, device=device_indices.device)).flatten()
         if host_indices is None:
+            logger.warning(f"Failed to allocate host memory for backup. num_tokens={num_tokens} available={self.mem_pool_host.available_size()}")
             return None
         self.write_queue.append(
             CacheOperation(host_indices, device_token_indices, node_id, priority)
         )
         self.start_writing()
+        logger.info(f"Write request submitted: node_id={node_id}, num_tokens={num_tokens}")
         return host_indices  # return token indices
 
     def start_writing(self) -> None:
@@ -494,8 +496,10 @@ class HiCacheController:
         if device_token_indices is None:
             # Allocate device memory - use a temporary req_pool_index (0)
             # This is a workaround since we don't have the actual req_pool_index
-            device_token_indices = self.mem_pool_device_allocator.alloc(0, num_tokens)
+            # alloced_len is 0 since this is a new allocation without existing context
+            device_token_indices = self.mem_pool_device_allocator.alloc(0, num_tokens, 0)
             if device_token_indices is None:
+                logger.warning(f"Failed to allocate device memory for load. num_tokens={num_tokens}")
                 return None
         
         # Convert token indices to page indices
@@ -509,6 +513,7 @@ class HiCacheController:
         self.load_queue.append(
             CacheOperation(host_indices, device_token_indices, node_id, priority)
         )
+        logger.info(f"Load request submitted: node_id={node_id}, num_tokens={num_tokens}")
         return device_page_indices  # return page indices
 
     def move_indices(self, op: CacheOperation):
@@ -730,6 +735,7 @@ class HiCacheController:
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            logger.debug(f"[_storage_hit_query] req={operation.request_id} batch_hashes_len={len(batch_hashes)} hit_page_num={hit_page_num}")
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -807,6 +813,7 @@ class HiCacheController:
         Returns:
             Operation ID
         """
+        logger.debug(f"[write_storage] req_id={-1} num_pages={len(host_indices) // self.page_size} num_tokens={len(host_indices)}")
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )

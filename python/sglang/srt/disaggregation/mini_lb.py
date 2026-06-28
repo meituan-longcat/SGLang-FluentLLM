@@ -52,6 +52,8 @@ class MiniLoadBalancer:
         self.bootstrap_room_cnt = 0
         self.bootstrap_room_lock = asyncio.Lock()
         self.enable_cache_report = enable_cache_report
+        self.prefill_index = 0  # 用于prefill_configs的轮询计数
+        self.decode_index = 0   # 用于decode_servers的轮询计数
 
     async def get_bootstrap_room(self):
         async with self.bootstrap_room_lock:
@@ -64,6 +66,23 @@ class MiniLoadBalancer:
 
     def add_decode_server(self, new_decode_server: str):
         self.decode_servers.append(new_decode_server)
+
+    def select_pair_round_robin(self):
+        # 校验服务列表非空
+        assert len(self.prefill_configs) > 0, "No prefill servers available"
+        assert len(self.decode_servers) > 0, "No decode servers available"
+
+        # 轮询选择prefill_config
+        prefill_config = self.prefill_configs[self.prefill_index]
+        # 更新prefill索引（循环递增，超过长度后重置为0）
+        self.prefill_index = (self.prefill_index + 1) % len(self.prefill_configs)
+
+        # 轮询选择decode_server
+        decode_server = self.decode_servers[self.decode_index]
+        # 更新decode索引
+        self.decode_index = (self.decode_index + 1) % len(self.decode_servers)
+
+        return prefill_config.url, prefill_config.bootstrap_port, decode_server
 
     def select_pair(self):
         # TODO: return some message instead of panic
@@ -108,16 +127,16 @@ class MiniLoadBalancer:
                     if self.enable_cache_report:
                         # Extract cached_tokens from prefill response (which may have usage field)
                         cached_tokens = 0
-                        
+
                         # Try to get cached_tokens from prefill's usage field (new format)
                         if "usage" in prefill_json and "prompt_tokens_details" in prefill_json["usage"]:
                             if prefill_json["usage"]["prompt_tokens_details"] is not None:
                                 cached_tokens = prefill_json["usage"]["prompt_tokens_details"].get("cached_tokens", 0)
-                        
+
                         # If not found in usage, try to get from meta_info (fallback for compatibility)
                         if cached_tokens == 0 and "meta_info" in prefill_json:
                             cached_tokens = prefill_json["meta_info"].get("cached_tokens", 0)
-                        
+
                         # Inject cached_tokens into decode response
                         if cached_tokens > 0 or "usage" in ret_json:
                             if "usage" not in ret_json:
@@ -133,7 +152,7 @@ class MiniLoadBalancer:
                     if "meta_info" in ret_json and "meta_info" in prefill_json:
                         prefill_cached = prefill_json["meta_info"].get("cached_tokens", 0)
                         ret_json["meta_info"]["cached_tokens"] = prefill_cached
-                    
+
             else:
                 ret_json = "profile"
 
@@ -289,7 +308,7 @@ async def health_check_generate():
     """Health check for generate - checks if backend servers are ready"""
     if load_balancer is None:
         return Response(status_code=503)  # Service Unavailable
-    
+
     prefill_servers, decode_servers = (
         load_balancer.prefill_servers,
         load_balancer.decode_servers,
@@ -354,23 +373,67 @@ async def get_model_info():
 @app.api_route("/start_profile", methods=["GET", "POST"])
 async def start_profile():
     """Start profiling."""
-    prefill_server, _, decode_server = load_balancer.select_pair()
+    prefill_server, _, decode_server = load_balancer.select_pair_round_robin()
     return await load_balancer.profile(prefill_server, decode_server, "start_profile")
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 async def stop_profile():
     """Stop profiling."""
-    prefill_server, _, decode_server = load_balancer.select_pair()
+    prefill_server, _, decode_server = load_balancer.select_pair_round_robin()
     return await load_balancer.profile(prefill_server, decode_server, "stop_profile")
 
+@app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+async def start_expert_distribution_record():
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        # Create the tasks
+        tasks = []
+        for server in chain(prefill_servers, decode_servers):
+            tasks.append(session.post(f"{server}/start_expert_distribution_record"))
+        for i, response in enumerate(asyncio.as_completed(tasks)):
+            await response
+    return Response(status_code=200)
+
+@app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+async def stop_expert_distribution_record():
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        # Create the tasks
+        tasks = []
+        for server in chain(prefill_servers, decode_servers):
+            tasks.append(session.post(f"{server}/stop_expert_distribution_record"))
+        for i, response in enumerate(asyncio.as_completed(tasks)):
+            await response
+    return Response(status_code=200)
+
+@app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+async def dump_expert_distribution_record():
+    prefill_servers, decode_servers = (
+        load_balancer.prefill_servers,
+        load_balancer.decode_servers,
+    )
+    async with aiohttp.ClientSession() as session:
+        # Create the tasks
+        tasks = []
+        for server in chain(prefill_servers, decode_servers):
+            tasks.append(session.post(f"{server}/dump_expert_distribution_record"))
+        for i, response in enumerate(asyncio.as_completed(tasks)):
+            await response
+    return Response(status_code=200)
 
 @app.post("/generate")
 async def handle_generate_request(request_data: dict):
     # Log incoming request
     logger.debug(f"LB received generate request: stream={request_data.get('stream', False)}, text_length={len(request_data.get('text', '')) if isinstance(request_data.get('text'), str) else 'batch'}")
-    
-    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
+
+    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair_round_robin()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -411,7 +474,7 @@ async def handle_generate_request(request_data: dict):
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair()
+    prefill_server, bootstrap_port, decode_server = load_balancer.select_pair_round_robin()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)

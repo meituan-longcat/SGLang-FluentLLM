@@ -9,7 +9,7 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
     get_nsa_index_topk,
-    is_deepseek_nsa
+    is_dsa,
 )
 from sglang.srt.layers.attention.dsa.nsa_indexer import Indexer, IndexerBf16
 from sglang.srt.layers.utils import (
@@ -38,7 +38,7 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.env import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import add_prefix
-from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_tp_rank
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
 
 from sglang.srt.utils import get_colorful_logger
@@ -85,17 +85,18 @@ class DeepseekV32MLA(nn.Module):
         self.num_heads = num_heads
         self.index_head_dim = config.index_head_dim
 
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
         if FLLM_IS_CP:
-            self.attn_tp_rank = 0
-            self.attn_tp_size = 1
-        assert num_heads % self.attn_tp_size == 0
-        self.num_local_heads = num_heads // self.attn_tp_size
+            self.attn_tp_group = None
+            self.num_local_heads = num_heads
+        else:
+            self.attn_tp_group = get_attention_tp_group()
+            assert num_heads % self.attn_tp_group.world_size == 0
+            self.num_local_heads = num_heads // self.attn_tp_group.world_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.config = config
+        assert alt_stream is not None
         self.alt_stream = alt_stream
         self.attention_backend = global_server_args_dict["attention_backend"]
         self.cli_factor = getattr(config, "cli_factor", 1)
@@ -137,8 +138,8 @@ class DeepseekV32MLA(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                outside_tp_group=self.attn_tp_group,
+                disable_parallel=FLLM_IS_CP,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -147,8 +148,8 @@ class DeepseekV32MLA(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
+                outside_tp_group=self.attn_tp_group,
+                disable_parallel=FLLM_IS_CP,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -159,11 +160,13 @@ class DeepseekV32MLA(nn.Module):
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
-        self.use_dsa = is_deepseek_nsa(config)
+        self.use_dsa = is_dsa(config)
         if self.use_dsa:
             IndexerImpl = Indexer
-            if config.architectures[0] == "FLASHForCausalLM":
+            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
+            if config.architectures[0] in ["FLASHForCausalLM", "FLASHForCausalLMNextN"]:
                 IndexerImpl = IndexerBf16
+                is_neox_style = False
             self.indexer = IndexerImpl(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -177,6 +180,7 @@ class DeepseekV32MLA(nn.Module):
                 scale_fmt="ue8m0",
                 block_size=128,
                 rope_scaling=rope_scaling,
+                is_neox_style=is_neox_style,
                 prefix=add_prefix("indexer", prefix),
                 quant_config=quant_config,
                 layer_id=layer_id,
@@ -189,8 +193,8 @@ class DeepseekV32MLA(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            outside_tp_group=self.attn_tp_group,
+            disable_parallel=FLLM_IS_CP,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -200,8 +204,8 @@ class DeepseekV32MLA(nn.Module):
             reduce_results=reduce_attn_results,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
+            outside_tp_group=self.attn_tp_group,
+            disable_parallel=FLLM_IS_CP,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -213,13 +217,14 @@ class DeepseekV32MLA(nn.Module):
             )
 
         if not skip_rope:
+            is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                is_neox_style=False,
+                is_neox_style=is_neox_style,
             )
 
             if rope_scaling:
@@ -322,7 +327,6 @@ class DeepseekV32MLA(nn.Module):
         can_run_flashinfer_fusion: Optional[bool] = None,
     ):
         q_lora = None
-        # qkv_w_buf = torch.empty()
         hidden_states = comm_manager.pre_attn_comm(hidden_states, forward_batch.tp_num_tokens)
         if (
             (not isinstance(hidden_states, tuple))
@@ -357,20 +361,33 @@ class DeepseekV32MLA(nn.Module):
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
 
-        if self.cli_factor <= 1 or self.layer_id % self.cli_factor == 0:
-            topk_indices = self.indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                index_k=index_k,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-                comm_manager=comm_manager,
-            )
+        indexer_forward = lambda: self.indexer(
+            x=hidden_states,
+            q_lora=q_lora,
+            index_k=index_k,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+            comm_manager=comm_manager,
+        )
+
+        if "FLASHForCausalLMNextN" in self.config.architectures[0]:
+            # hack for MTP3H
+            if global_server_args_dict["is_multi_head_eagle"]:
+                if forward_batch.topk_indices is None:
+                    topk_indices = indexer_forward()
+                    forward_batch.topk_indices = topk_indices
+                else:
+                    topk_indices = forward_batch.topk_indices
+            else:
+                topk_indices = indexer_forward()
         else:
-            topk_indices = forward_batch.topk_indices
-        if self.cli_factor > 1:
-            forward_batch.topk_indices = topk_indices
+            if self.cli_factor <= 1 or self.layer_id % self.cli_factor == 0:
+                topk_indices = indexer_forward()
+            else:
+                topk_indices = forward_batch.topk_indices
+            if self.cli_factor > 1:
+                forward_batch.topk_indices = topk_indices
 
         with torch.cuda.stream(self.alt_stream):
             q = self.q_b_proj(q_contiguous)[0].view(-1, self.num_local_heads, self.qk_head_dim)

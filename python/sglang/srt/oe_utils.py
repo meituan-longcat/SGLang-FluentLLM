@@ -1,14 +1,14 @@
 import torch
-try:
+from sglang.srt.utils import is_npu
+__is_npu__ = is_npu()
+
+if not __is_npu__:
     from flashinfer import update_token_table as update_token_table_kernel
-except ImportError as e:
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.error(f"Failed to import update_token_table from flashinfer: {e}")
-    raise
+else:
+    import torch_npu
 
 import dataclasses
-
+from sglang.srt.utils import is_npu, logger
 
 @dataclasses.dataclass
 class OverEmbeddingInfo:
@@ -91,12 +91,25 @@ def update_token_table(
     column_starts: torch.Tensor,
     oe_req_lens: torch.Tensor,
 ) -> torch.Tensor:
-    # torch_update_token_table(oe_token_table, tokens, row_indices, column_starts, oe_req_lens)
-    update_token_table_kernel(
-        tokens=tokens,
-        oe_token_table=oe_token_table,
-        row_indices=row_indices,
-        column_starts=column_starts,
-        req_lens=oe_req_lens,
-        ignore_tokens=None
-    )
+    if __is_npu__:
+        with torch.inference_mode():
+            if row_indices.shape[0] > 0:
+                torch_npu.npu_update_token_table(
+                    tokens=tokens.to(torch.int32),
+                    req_lens=oe_req_lens,
+                    row_indices=row_indices.to(torch.int64),
+                    column_starts=column_starts.to(torch.int32),
+                    ignore_tokens=torch.empty(0, device=tokens.device, dtype=torch.int32),
+                    batch_size=row_indices.numel(),
+                    max_context_len=oe_token_table.shape[1],
+                    oe_token_table=oe_token_table,
+                )
+    else:
+        update_token_table_kernel(
+            tokens=tokens.to(torch.int32),
+            oe_token_table=oe_token_table,
+            row_indices=row_indices,
+            column_starts=column_starts,
+            req_lens=oe_req_lens,
+            ignore_tokens=None
+        )

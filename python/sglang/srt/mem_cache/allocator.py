@@ -3,8 +3,9 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils import get_colorful_logger, is_npu
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
+from sglang.srt.env import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
@@ -56,7 +57,7 @@ class KVAllocator:
     def available_pages(self):
         return self.available_size()
 
-    
+
     def alloc(self, req_pool_index: int, need_size: int, alloced_len: int):
         page_offset = alloced_len % self.page_size
         page_num = (alloced_len + self.page_size - 1) // self.page_size
@@ -76,7 +77,8 @@ class KVAllocator:
         if need_new_page_num > len(self.free_slots):
             # do not change self.seq_lens
             return None
-        
+
+        # Requested page range [384:512] exceeds max_page_num 504. alloced_len=49152, need_size=16384, page_num=384
         # Check if we have enough space in req_to_page tensor
         if page_num + need_new_page_num > self.max_page_num:
             logger.warning(
@@ -86,7 +88,7 @@ class KVAllocator:
             )
             # Do not change self.seq_lens
             return None
-            
+
         new_pages = self.free_slots[:need_new_page_num]
         self.free_slots = self.free_slots[need_new_page_num:]
         # update req_to_page
@@ -175,8 +177,12 @@ class KVAllocator:
 
     def clear(self):
         # Page 0 is used for padding
+        # when npu + kvp_size>1, reserve self.max_batch_size kv block for current token
+        reserved_block_num = 1
+        if global_server_args_dict["kvp_size"] > 1:
+            reserved_block_num = 1 + self.max_batch_size
         self.free_slots = torch.arange(
-            1, self.size // self.page_size, dtype=torch.int32
+            reserved_block_num, self.size // self.page_size, dtype=torch.int32
         )
         if self.token_slot_refs is not None:
             self.token_slot_refs.zero_()

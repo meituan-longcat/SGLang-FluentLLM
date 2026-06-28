@@ -1,18 +1,18 @@
 import torch
 from typing import Optional
 
-from sglang.srt.layers.dense.layouts.w8a8_fp8 import W8A8Fp8LinearMethod
 from sglang.srt.layers.dense.layouts.w8a8_int8 import W8A8Int8LinearMethod
 from sglang.srt.layers.quantization import Fp8Config, QuantizationConfig, QuantizeMethodBase, W8A8Fp8Config, W8A8Int8Config, CompressedTensorsConfig
-from sglang.srt.layers.dense.layouts.fp8 import Fp8LinearMethod
 from sglang.srt.layers.dense.layouts.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import should_ignore_quant_layer
 
 
 def get_layout(config, prefix):
     if isinstance(config, Fp8Config):
+        from sglang.srt.layers.dense.layouts.fp8 import Fp8LinearMethod
         return Fp8LinearMethod(config)
     if isinstance(config, W8A8Fp8Config):
+        from sglang.srt.layers.dense.layouts.w8a8_fp8 import W8A8Fp8LinearMethod
         return W8A8Fp8LinearMethod(config)
     if isinstance(config, W8A8Int8Config):
         return W8A8Int8LinearMethod(config)

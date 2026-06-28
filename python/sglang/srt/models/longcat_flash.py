@@ -1,27 +1,24 @@
 from typing import Iterable, Optional, Tuple, List, Union
 
 import re
-import torch
 
+from flashinfer import dsv3_router_gemm
+import torch
 from torch import nn
 
 from sglang.srt.configs import FLASHConfig
+from sglang.srt.configs.model_config import is_dsa
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
+    get_tp_group, get_pp_group,
 )
 
 from sglang.srt.layers.over_embedding import FusedOverEmbedding
-from sglang.srt.utils import add_prefix, is_npu, LazyValue, is_sm90_supported
+from sglang.srt.utils import add_prefix, LazyValue, is_sm90_supported, bind_or_assign
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -31,7 +28,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     get_attention_tp_rank,
     get_dense_tp_size,
-    get_dense_tp_rank,
     get_dense_tp_group
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -46,95 +42,21 @@ from sglang.srt.distributed.parallel_strategy import AttnParallelStrategy, Dense
 from sglang.srt.distributed.model_tensor_tracer import get_load_number_layers
 from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+from sglang.srt.models.deepseek_v32 import DeepseekV32MLA
 from sglang.srt.models.deepseek_mha_nsa import DeepseekNSAWithMLA
 from sglang.srt.managers.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
+from sglang.srt.layers.dense.mlp import ParallelMLP
+from sglang.srt.layers.moe.layer import MoELayer
 from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.utils import should_ignore_quant_layer
-
-if not is_npu():
-    from flashinfer import dsv3_router_gemm
-    from sglang.srt.layers.moe.layer import MoELayer
 
 from sglang.srt.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-
-class LlamaMLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.layout = global_server_args_dict["dense_parallel_strategy"]
-        # For TP MOE, dense uses TP
-        if not global_server_args_dict["enable_ep_moe"] or self.layout == DenseParallelStategy.TENSOR_PARALLEL:
-            tp_rank = get_dense_tp_rank()
-            tp_size = get_dense_tp_size()
-            self.gate_up_proj = MergedColumnParallelLinear(
-                hidden_size,
-                [intermediate_size] * 2,
-                bias=False,
-                quant_config=quant_config,
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                prefix=add_prefix("gate_up_proj", prefix)
-            )
-            self.down_proj = RowParallelLinear(
-                intermediate_size,
-                hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                reduce_results=False,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-                prefix=add_prefix("down_proj", prefix)
-            )
-        else:
-            self.gate_up_proj = ReplicatedLinear(
-                hidden_size, intermediate_size * 2, bias=False, quant_config=quant_config, prefix=add_prefix("gate_up_proj", prefix)
-            )
-            self.down_proj = ReplicatedLinear(
-                intermediate_size, hidden_size, bias=False, quant_config=quant_config, prefix=add_prefix("down_proj", prefix)
-            )
-
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
-
-        self.gateup_unquanted = self.gate_up_proj.quant_config is None or should_ignore_quant_layer(
-                prefix=self.gate_up_proj.prefix,
-                ignored_layers=getattr(self.gate_up_proj.quant_config, "ignored_layers", [])
-        )
-        self.down_unquanted = self.down_proj.quant_config is None or should_ignore_quant_layer(
-                prefix=self.down_proj.prefix,
-                ignored_layers=getattr(self.down_proj.quant_config, "ignored_layers", [])
-        )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x, block_scale=None):
-        if x.shape[0] == 0:
-            return x
-        if block_scale is not None:
-            gate_up, _ = self.gate_up_proj(x, block_scale, torch.bfloat16)
-        else:
-            gate_up, _ = self.gate_up_proj(x)
-        if self.down_unquanted:
-            x = self.act_fn(gate_up)
-            x, _ = self.down_proj(x)
-        else:
-            x, scale = self.act_fn(gate_up, True)
-            x, _ = self.down_proj(x, scale)
-        return x
 
 class LongcatRouter(nn.Module):
     def __init__(self, config, prefix: str = ""):
@@ -162,7 +84,7 @@ class LongcatRouter(nn.Module):
             start = local_token_offset
             end = start + local_num_tokens
             hidden_states = hidden_states[start:end].contiguous()
-        if not is_npu() and hidden_states.shape[0] and is_sm90_supported() > 0:
+        if hidden_states.shape[0] and is_sm90_supported() > 0:
             logits = dsv3_router_gemm(
                 hidden_states, self.classifier.weight, out_dtype=torch.float32
             )
@@ -258,6 +180,7 @@ class FLASHDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        kv_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -288,7 +211,13 @@ class FLASHDecoderLayer(nn.Module):
             self.moe_intermediate_size = self.intermediate_size
 
         use_nsa_mla = getattr(config, 'use_nsa_mla', False)
-        AttnImpl = DeepseekNSAWithMLA if use_nsa_mla else DeepseekV2AttentionMLA
+        self.kv_stream = kv_stream
+        if is_dsa(config):
+            AttnImpl = DeepseekV32MLA
+        elif use_nsa_mla:
+            AttnImpl = DeepseekNSAWithMLA
+        else:
+            AttnImpl = DeepseekV2AttentionMLA
         self.self_attn = nn.ModuleList([
             AttnImpl(
                 config=config,
@@ -307,7 +236,8 @@ class FLASHDecoderLayer(nn.Module):
                 quant_config=None if "self_attn" in getattr(config, "disable_quant_module", []) else quant_config,
                 layer_id=layer_id * 2 + i,
                 reduce_attn_results=False,
-                prefix=add_prefix(f"self_attn.{i}", prefix)
+                prefix=add_prefix(f"self_attn.{i}", prefix),
+                alt_stream=kv_stream,
             )
             for i in range(2)
         ])
@@ -316,7 +246,7 @@ class FLASHDecoderLayer(nn.Module):
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for i in range(2)
         ])
         self.mlps = nn.ModuleList([
-            LlamaMLP(
+            ParallelMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
                 hidden_act="silu",
@@ -653,6 +583,7 @@ class FLASHModel(nn.Module):
                 enable_tp=not global_server_args_dict["enable_dp_attention"],
             )
         self.alt_stream = None if self.tp_mode() else torch.cuda.Stream()
+        self.kv_stream = torch.cuda.Stream()
         # used for debug
         # config.num_hidden_layers = 3; self.start_layer,self.end_layer = 0, 3
         self.layers = nn.ModuleList(
@@ -663,6 +594,7 @@ class FLASHModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{i}", prefix),
                     alt_stream=self.alt_stream,
+                    kv_stream=self.kv_stream,
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -787,6 +719,7 @@ class FLASHForCausalLM(nn.Module):
             }
         )
         self.capture_aux_hidden_states = False
+        self.pp_group = get_pp_group()
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -804,18 +737,31 @@ class FLASHForCausalLM(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id, begin_size)
-            ("fused_qkv_a_proj_with_mqa", "q_a_proj", None, 0),
-            ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", None, self.config.q_lora_rank),
             ("gate_up_proj", "gate_proj", 0, None),
             ("gate_up_proj", "up_proj", 1, None),
         ]
+        if not is_dsa(self.config):
+            stacked_params_mapping.extend([
+                ("fused_qkv_a_proj_with_mqa", "q_a_proj", None, 0),
+                ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", None, self.config.q_lora_rank),
+            ])
+        else:
+            # change stack order
+            stacked_params_mapping.extend([
+                ("fused_qkv_a_proj_with_mqa", "q_a_proj", None, 0),
+                ("fused_qkv_a_proj_with_mqa", "indexer.wk", None, self.config.q_lora_rank),
+                ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", None, self.config.q_lora_rank+self.config.index_head_dim),
+            ])
         name_mapping = {
             "compress_attn": "attn.compress_attn",
             "compress_key": "compress_kv",     # kv_lora_rank
@@ -831,9 +777,11 @@ class FLASHForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts if hasattr(self.config, "n_routed_experts") else self.config.num_experts[0],
         )
-
+        is_final = False
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            if "lm_head.weight" in name:
+                is_final = True
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -944,13 +892,21 @@ class FLASHForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-
-        self.post_load_weights()
+        if is_final:
+            self.post_load_weights()
 
 
     def post_load_weights(self):
         # weight transpose for absorb
         for layer_id in range(self.config.num_hidden_layers):
+            if (
+                hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
             for i in range(2):
                 self_attn:Union[DeepseekV2AttentionMLA, DeepseekNSAWithMLA] \
                     = self.model.layers[layer_id].self_attn[i]
@@ -973,8 +929,13 @@ class FLASHForCausalLM(nn.Module):
                 w_kc, w_vc = w.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
                 ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+                self_attn.w_kc = bind_or_assign(
+                    self_attn.w_kc,
+                    w_kc.transpose(1, 2).contiguous().transpose(1, 2),
+                )
+                self_attn.w_vc = bind_or_assign(
+                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                )
                 if isinstance(self_attn, DeepseekNSAWithMLA):
                     self_attn.attn.w_vc = self_attn.w_vc
                 if self.config.mla_scale_q_lora:

@@ -11,19 +11,9 @@ import inspect
 from sglang.srt.layers.attention.flash_attention_backend import FlashAttentionBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_tp_rank
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import get_colorful_logger
-
-logger = get_colorful_logger(__name__)
-
 # from block_sparse_attn import block_streaming_attn_func
-try:
-    from duo_flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache, get_scheduler_metadata
-except ImportError:
-    logger.warning("duo_flash_attn_interface not installed!")
-try:
-    from duo_flash_mla_swap import flash_mla_with_kvcache, get_mla_metadata
-except ImportError:
-    logger.warning("duo_flash_attn_interface not installed!")
+from duo_flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache, get_scheduler_metadata
+from duo_flash_mla_swap import flash_mla_with_kvcache, get_mla_metadata
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

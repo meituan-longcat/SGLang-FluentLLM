@@ -19,12 +19,20 @@ import bisect
 from contextlib import contextmanager
 import gc
 import os
-from typing import TYPE_CHECKING, Callable
+from abc import ABC, abstractmethod
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ContextManager,
+    Generator,
+)
 
 import torch
 import tqdm
 
 from sglang.srt.custom_op import CustomOp
+from sglang.srt.env import ENV
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -33,10 +41,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.utils import get_available_gpu_memory, get_bool_env_var, is_hip
+from sglang.srt.utils import get_available_gpu_memory, get_bool_env_var, is_hip, rank0_log, is_npu
 
 
 is_hip_ = is_hip()
+__is_npu__ = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -156,9 +165,14 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     ]
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
-        if server_args.enable_torch_compile
+        if __is_npu__ or server_args.enable_torch_compile
         else []
     )
+    if __is_npu__:
+        if server_args.npu_compile_bs:
+            compile_bs = [int(x) for x in server_args.npu_compile_bs.split(",")]
+        else:
+            compile_bs = [server_args.torch_compile_max_bs]
     return capture_bs, compile_bs
 
 
@@ -175,15 +189,43 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-class CudaGraphRunner:
-    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+class DeviceRunnerBase(ABC):
+    """
+    Abstract base class for hardware-specific graph runners, providing unified interfaces
+    for AI accelerator device operations. This class abstracts common execution workflows
+    and enforces implementation of critical device management methods in derived classes.
+
+    Key Responsibilities:
+    1. Device lifecycle management: Initialization, warm-up, and resource teardown
+    2. Batch processing: Data preparation and execution flow control
+    3. Execution mode switching: Support for both graph compilation and eager execution
+    4. State validation: Runtime capability checks and fallback mechanisms
+
+    Required Abstract Methods:
+    - initialize(): Configure hardware-specific environment and allocate resources
+    - warm_up(): Pre-execution calibration for performance stabilization
+    - can_run_graph() -> bool: can use graph to accelerate the forward pass(eg: cuda: CudaGraph, npu: GraphEngine)
+    - get_runner_context(): Get runner context func for device-specific execution
+    - get_spec_info() -> Any: Get some info for speculative decoding
+
+    Example subclassing:
+    class CustomDeviceRunner(DeviceRunnerBase):
+        def __init__(self, device_config: Dict):
+            super().__init__()
+            # Hardware-specific initialization
+
+        # Implement all abstract methods with device-specific logic
+
+    Note: Concrete subclasses must be instantiated with valid hardware context.
+    """
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
         self.graphs = {}
         self.output_buffers = {}
-        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
+        print(f"{model_runner.server_args=}")
+        self.enable_torch_compile = ENV.npu_enable_graph if __is_npu__ else model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.enable_dp_attention = model_runner.server_args.enable_dp_attention
         self.world_size = model_runner.server_args.world_size
@@ -191,6 +233,9 @@ class CudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        rank0_log(
+            f"Device: {model_runner.device}, capture bs {self.capture_bs}, compile bs {self.compile_bs}"
+        )
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -202,6 +247,7 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+
 
         # Attention backend
         self.max_bs = max(self.capture_bs)
@@ -223,7 +269,7 @@ class CudaGraphRunner:
             set_torch_compile_config()
 
         # Graph inputs
-        with torch.device("cuda"):
+        with torch.device(model_runner.device):
             # Here for ds v3/r1, all 0 (bos) input_ids is unreasonable, will cause
             # nan in verify calculation process, conflicts with existing operators
             self.input_ids = torch.ones((self.max_num_token,), dtype=torch.int32)
@@ -240,7 +286,7 @@ class CudaGraphRunner:
             self.out_cache_loc = torch.arange(0, self.max_num_token, dtype=torch.int64)
             # During capture, kv cache is actually written, limit to padding page
             self.out_cache_loc.clamp_(min=0, max=63)
-            self.positions = torch.arange(0, self.max_num_token, dtype=torch.int64)
+            self.positions = torch.arange(0, self.max_num_token, dtype=torch.int32)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
 
             # Speculative_inference
@@ -259,6 +305,31 @@ class CudaGraphRunner:
                     dtype=self.model_runner.dtype,
                 )
 
+        self.warm_up()
+
+    @abstractmethod
+    def warm_up(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def can_run_graph(self, forward_batch: ForwardBatch):
+        raise NotImplementedError
+
+    @contextmanager
+    def get_runner_context(
+        self, forward_batch: "ForwardBatch"
+    ) -> ContextManager[
+        Callable[..., "LogitsProcessorOutput"]
+    ]:
+        raise NotImplementedError()
+    @abstractmethod
+    def get_spec_info(self, num_tokens: int):
+        raise NotImplementedError
+
+
+class CudaGraphRunner(DeviceRunnerBase):
+    """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
+    def warm_up(self):
         # Capture
         try:
             with self.model_capture_mode():
@@ -284,7 +355,7 @@ class CudaGraphRunner:
         if hasattr(self.model_runner.model, "capture_mode"):
             self.model_runner.model.capture_mode = False
 
-    def can_run(self, forward_batch: ForwardBatch):
+    def can_run_graph(self, forward_batch: ForwardBatch):
         if self.enable_dp_attention:
             min_num_tokens, max_num_tokens = min(forward_batch.global_num_tokens), max(
                 forward_batch.global_num_tokens
@@ -348,11 +419,18 @@ class CudaGraphRunner:
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
-        input_ids = self.input_ids[:num_tokens]
+        if __is_npu__:
+            with torch.device(self.model_runner.device):
+                self.input_ids = torch.ones((num_tokens,), dtype=torch.int32)
+                self.positions = torch.arange(0, num_tokens, dtype=torch.int32)
+            input_ids = self.input_ids
+            positions = self.positions
+        else:
+            input_ids = self.input_ids[:num_tokens]
+            positions = self.positions[:num_tokens]
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
-        positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :bs]
 
         if self.enable_dp_attention:
@@ -364,6 +442,10 @@ class CudaGraphRunner:
         else:
             global_num_tokens = None
             gathered_buffer = None
+
+        if self.use_over_embedding:
+            self.oe_column_starts[:bs] = seq_lens - 1
+            self.oe_req_lens[:bs] = 1
 
         spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -381,6 +463,7 @@ class CudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
+            spec_num_steps = self.model_runner.server_args.speculative_num_steps,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum(),
             oe_token_table=self.token_table,
@@ -396,7 +479,7 @@ class CudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            all_decode_or_idle=True
+            all_decode_or_idle=True,
         )
 
         # Attention backend
@@ -532,12 +615,28 @@ class CudaGraphRunner:
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen.")
             else:
+                # TODO: topk、seq_lens_sum、seq_lens_cpu为多余参数，此外还缺失is_all_greedy，怀疑是NPU分支从某个更老的GPU主线分支拷贝的。
+                # 参考commit message: support npu graph
                 spec_info = EagleVerifyInput(
                     draft_token=None,
                     positions=None,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    topk=self.model_runner.server_args.speculative_eagle_topk,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
+                    seq_lens_sum=None,
+                    seq_lens_cpu=None,
                 )
 
         return spec_info
+
+    @contextmanager
+    def get_runner_context(self, forward_batch: "ForwardBatch") -> Generator[
+        Callable[[], LogitsProcessorOutput],
+        Any,
+        None,
+    ]:
+        def runner_fn():
+            return self.replay(forward_batch)
+
+        yield runner_fn

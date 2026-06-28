@@ -18,10 +18,13 @@ import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
+from sglang.srt.utils import is_npu
+__is_npu__ = is_npu()
+if not __is_npu__:
+    import pynvml
 
 logger = logging.getLogger(__name__)
 
-import pynvml
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")

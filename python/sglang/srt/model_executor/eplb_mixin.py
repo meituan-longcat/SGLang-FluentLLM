@@ -1,5 +1,8 @@
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+import time
+from functools import wraps
+
 
 import einops
 import torch
@@ -7,7 +10,7 @@ import torch.distributed
 from torch.distributed import P2POp
 
 from sglang.srt.env import global_server_args_dict
-from sglang.srt.utils import get_bool_env_var, get_colorful_logger
+from sglang.srt.utils import get_bool_env_var, get_colorful_logger, get_device_module, is_npu
 
 from sglang.srt.managers.eplb_manager import EPLBManager
 from sglang.srt.managers.expert_distribution import (
@@ -21,7 +24,38 @@ from sglang.srt.managers.expert_location import (
     set_global_expert_location_metadata,
 )
 
+__is_npu__ = is_npu()
+
+if __is_npu__:
+    import torchair
+
 logger = get_colorful_logger(__name__)
+
+device_module = get_device_module()
+
+def flatten_2d_list(nested_list):
+    if len(nested_list) == 0:
+        return []
+    if not any(isinstance(i, list) for i in nested_list):
+        return nested_list
+    return [x for sublist in nested_list for x in sublist]
+
+def list_depth(data):
+    if not isinstance(data, list):
+        return 0
+    if all(isinstance(item, list) for item in data):
+        return 2
+    return 1
+
+def inplace_perm_helper(x, perm):
+    new_tensor = x[perm].clone()
+    x.copy_(new_tensor)
+
+
+def construct_perm_from_phy_to_logic_mapping(old_mapping: List[int], new_mapping: List[int]):
+    map_dict = dict(zip(old_mapping, range(len(old_mapping))))
+    gather_indices = [map_dict[lid] for lid in new_mapping]
+    return gather_indices
 
 
 class ExpertLocationUpdater:
@@ -31,6 +65,7 @@ class ExpertLocationUpdater:
     def update(
         self,
         routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
+        device_local_routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
         new_expert_location_metadata: ExpertLocationMetadata,
         update_layer_ids: List[int],
         nnodes: int,
@@ -38,11 +73,12 @@ class ExpertLocationUpdater:
     ):
         if self._first_execution:
             self._first_execution = False
-            torch.cuda.empty_cache()
+            device_module.empty_cache()
 
         old_expert_location_metadata = get_global_expert_location_metadata()
         _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+            device_local_routed_experts_weights_of_layer=device_local_routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
             new_expert_location_metadata=new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
@@ -65,6 +101,7 @@ def _update_expert_weights(**kwargs):
 # can add watchdog as well
 def _update_expert_weights_with_canary(
     routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
+    device_local_routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
     update_layer_ids: List[int],
@@ -92,6 +129,7 @@ def _update_expert_weights_with_canary(
 
     _update_expert_weights_raw(
         routed_experts_weights_of_layer=routed_experts_weights_of_layer,
+        device_local_routed_experts_weights_of_layer=device_local_routed_experts_weights_of_layer,
         old_expert_location_metadata=old_expert_location_metadata,
         new_expert_location_metadata=new_expert_location_metadata,
         update_layer_ids=update_layer_ids,
@@ -112,6 +150,7 @@ def _update_expert_weights_with_canary(
 
 def _update_expert_weights_raw(
     routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
+    device_local_routed_experts_weights_of_layer: Dict[int, List[torch.Tensor]],
     old_expert_location_metadata: ExpertLocationMetadata,
     new_expert_location_metadata: ExpertLocationMetadata,
     update_layer_ids: List[int],
@@ -120,15 +159,15 @@ def _update_expert_weights_raw(
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
-    temp_buffers = create_temp_buffers(
-        routed_experts_weights_of_layer[update_layer_ids[0]]
-    )
-
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
     num_gpu_per_node = world_size // nnodes
 
     for layer_id in update_layer_ids:
+        temp_buffers = create_temp_buffers(
+            routed_experts_weights_of_layer[layer_id], num_local_physical_experts=num_local_physical_experts
+        )
+
         update_expert_weights_single_layer(
             routed_experts_weights=routed_experts_weights_of_layer[layer_id],
             temp_buffers=temp_buffers,
@@ -143,12 +182,31 @@ def _update_expert_weights_raw(
             rank=rank,
             world_size=world_size,
             log_metrics=log_metrics,
+            debug=True,
         )
 
 
-def create_temp_buffers(sample_tensors):
-    return [torch.empty_like(tensor) for tensor in sample_tensors]
+        old_mapping = old_expert_location_metadata.physical_to_logical_map_cpu[
+            layer_id
+        ].tolist()
+        new_mapping = new_expert_location_metadata.physical_to_logical_map_cpu[
+            layer_id
+        ].tolist()
+        perm = construct_perm_from_phy_to_logic_mapping(old_mapping, new_mapping)
+        for local_routed_experts_weights in device_local_routed_experts_weights_of_layer[layer_id]:
+            inplace_perm_helper(local_routed_experts_weights, perm)
 
+
+def create_temp_buffers(sample_tensors, num_local_physical_experts = None):
+    if num_local_physical_experts is None:
+        return [torch.empty_like(tensor) for tensor in sample_tensors]
+    else:
+        result = []
+        for tensor in sample_tensors:
+            assert tensor.shape[0] == num_local_physical_experts, f"{tensor.shape=} not match {num_local_physical_experts=}"
+            per_expert_buffer_shape = tensor.shape[1:]
+            result.append([torch.empty(per_expert_buffer_shape, dtype=tensor.dtype, layout=tensor.layout, device=tensor.device) for _ in range(num_local_physical_experts)])
+        return result
 
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
@@ -228,7 +286,7 @@ def update_expert_weights_single_layer(
             if old_physical_to_logical_map[src_expert_location] == logical_expert_id:
                 for i in range(num_tensors):
                     _get_tensor(temp_buffers, i, dst_expert_location).copy_(
-                        _get_tensor(routed_experts_weights, i, src_expert_location)
+                        handle_nz_tensor(routed_experts_weights, i, src_expert_location)
                     )
                 buffer2weight_copy_infos.append(
                     (dst_expert_location, dst_expert_location)
@@ -355,9 +413,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(
+                        tensor=handle_nz_tensor(
                             routed_experts_weights, i, src_expert_location
-                        ),
+                        ).clone(),
                         peer=dst_rank,
                     )
                     for dst_rank in all_dst_ranks
@@ -416,6 +474,7 @@ def update_expert_weights_single_layer(
         if len(p2p_ops) == 0:
             return
 
+        # logger.info(f"[EPLB][expert update] {p2p_ops=}")
         reqs = torch.distributed.batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
@@ -426,12 +485,21 @@ def update_expert_weights_single_layer(
             routed_experts_weights_expert_location,
         ) in buffer2weight_copy_infos:
             for i in range(num_tensors):
-                _get_tensor(
+                handle_nz_tensor(
                     routed_experts_weights, i, routed_experts_weights_expert_location
                 ).copy_(_get_tensor(temp_buffers, i, temp_buffers_expert_location))
 
     def _get_tensor(tensors, tensor_index: int, expert_location: int) -> torch.Tensor:
-        return tensors[tensor_index][_get_local_expert_location(expert_location)]
+        if list_depth(tensors) == 1:
+            local_loc = _get_local_expert_location(expert_location)
+            return tensors[tensor_index].narrow(0, local_loc, 1).squeeze(0)
+        elif list_depth(tensors) == 2:
+            return tensors[tensor_index][_get_local_expert_location(expert_location)]
+
+    def handle_nz_tensor(tensors, tensor_index: int, expert_location: int):
+        local_experts = tensors[tensor_index]
+        local_experts_pure_data = torchair.llm_datadist.create_npu_tensors(local_experts.shape, local_experts.dtype, [local_experts.data_ptr()])
+        return local_experts_pure_data[0][_get_local_expert_location(expert_location)]
 
     def _get_local_expert_location(expert_location: int) -> int:
         assert (
@@ -491,6 +559,9 @@ class _ChunkUtils:
         start = chunk_index * short_chunk_size + min(chunk_index, num_long_chunks)
         end = start + short_chunk_size + int(chunk_index < num_long_chunks)
         return slice(start, end)
+
+    def __repr__(self):
+        return f"[{self.__class__.__name__}]({self.chunk_values=}, {self.element_values=})"
 
 
 def _deduplicate_ordered(arr: List[int]):
@@ -586,6 +657,7 @@ class EPLBMixin:
     ):
         self.expert_location_updater.update(
             self.model.routed_experts_weights_of_layer,
+            self.model.device_local_routed_experts_weights_of_layer,
             new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
             nnodes=self.server_args.nnodes,

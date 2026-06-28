@@ -73,11 +73,16 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            cur_model_name = name.split(".")[-1]
             if __is_npu__:
-                cur_model_name = name.split(".")[-1]
-                tgt_model_strs = ["llava", "llavavid", "mllama", "qwen2_5_vl", "yivl", "deepseek_mha_nsa", "gpt_oss"]
+                tgt_model_strs = ["llama_eagle3", "llava", "llavavid", "mllama", "qwen2_5_vl", "yivl",
+                                  "deepseek_mha_nsa", "gpt_oss", "glm4_moe", "qwen3_nsa", "deepseek_nextn",
+                                  "deepseek_v2", "deepseek_v2_overlap", "glm4_moe_nextn", "kimi_linear",
+                                  "longcat_flash", "longcat_flash_overlap", "flash_nextn", "longcat_eagle3"]
                 if cur_model_name in tgt_model_strs:
                     continue
+            elif cur_model_name.startswith("npu_"):
+                continue
             try:
                 module = importlib.import_module(name)
             except Exception as e:

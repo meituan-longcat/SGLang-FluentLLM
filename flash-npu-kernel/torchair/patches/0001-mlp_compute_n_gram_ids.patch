@@ -1,0 +1,144 @@
+From 85c04c7e18c2fcb5644747855cd51a2e8202834f Mon Sep 17 00:00:00 2001
+From: Chl_SolaAir <Chl_SolaAir@noreply.gitcode.com>
+Date: Fri, 21 Nov 2025 19:39:05 +0800
+Subject: [PATCH 1/4] =?UTF-8?q?=E6=94=AF=E6=8C=81mlp=5Fcompute=5Fn=5Fgram?=
+ =?UTF-8?q?=5Fids=E5=85=A5=E5=9B=BE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ .../auto_generated_ge_raw_ops.py              | 61 +++++++++++++++++++
+ .../custom/mlp_compute_n_gram_ids.py          | 46 ++++++++++++++
+ 2 files changed, 107 insertions(+)
+ create mode 100644 python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_compute_n_gram_ids.py
+
+diff --git a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+index 48224fdb..59b8039a 100644
+--- a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
++++ b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+@@ -27,7 +27,68 @@ from torchair.ge import attr
+ # IR PartitionedCall skipped as graph
+ # IR StatefulPartitionedCall skipped as graph
+ 
++# This api is auto-generated from IR MlpComputeNGramIds
++@auto_convert_to_tensor([False, False, False, False, False, False, False], [False, False, False, False, False, False, False], inputs_tensor_type=[TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL])
++def MlpComputeNGramIds(oe_weights: Tensor, oe_mods: Tensor, over_embedding_input_ids: Tensor, ignore_token_flags: Tensor, oe_exclusive_req_len_sums: Tensor, oe_exclusive_oe_info_len_sums: Tensor, oe_exclusive_embeder_size_sums: Tensor, *, seq_len: int, batch_size: int, over_embedding_n: int, over_embedding_k: int, dependencies=[], node_name=None):
++    """REG_OP(MlpComputeNGramIds)\n
++.INPUT(oe_weights, ge::TensorType::ALL())\n
++.INPUT(oe_mods, ge::TensorType::ALL())\n
++.INPUT(over_embedding_input_ids, ge::TensorType::ALL())\n
++.INPUT(ignore_token_flags, ge::TensorType::ALL())\n
++.INPUT(oe_exclusive_req_len_sums, ge::TensorType::ALL())\n
++.INPUT(oe_exclusive_oe_info_len_sums, ge::TensorType::ALL())\n
++.INPUT(oe_exclusive_embeder_size_sums, ge::TensorType::ALL())\n
++.OUTPUT(oe_n_gram_ids, ge::TensorType::ALL())\n
++.REQUIRED_ATTR(seq_len, Int)\n
++.REQUIRED_ATTR(batch_size, Int)\n
++.REQUIRED_ATTR(over_embedding_n, Int)\n
++.REQUIRED_ATTR(over_embedding_k, Int)\n
++"""
++
++    # process inputs
++    inputs = {
++        "oe_weights": oe_weights,
++        "oe_mods": oe_mods,
++        "over_embedding_input_ids": over_embedding_input_ids,
++        "ignore_token_flags": ignore_token_flags,
++        "oe_exclusive_req_len_sums": oe_exclusive_req_len_sums,
++        "oe_exclusive_oe_info_len_sums": oe_exclusive_oe_info_len_sums,
++        "oe_exclusive_embeder_size_sums": oe_exclusive_embeder_size_sums,
++    }
++
++    # process attrs
++    attrs = {
++        "seq_len": attr.Int(seq_len),
++        "batch_size": attr.Int(batch_size),
++        "over_embedding_n": attr.Int(over_embedding_n),
++        "over_embedding_k": attr.Int(over_embedding_k),
++    }
+ 
++    # process outputs
++    outputs = [
++    "oe_n_gram_ids",
++    ]
++
++    return ge_op(
++        op_type="MlpComputeNGramIds",
++        inputs=inputs,
++        attrs=attrs,
++        outputs=outputs,
++        dependencies=dependencies,
++        ir=IrDef("MlpComputeNGramIds") \
++        .input("oe_weights", "") \
++        .input("oe_mods", "") \
++        .input("over_embedding_input_ids", "") \
++        .input("ignore_token_flags", "") \
++        .input("oe_exclusive_req_len_sums", "") \
++        .input("oe_exclusive_oe_info_len_sums", "") \
++        .input("oe_exclusive_embeder_size_sums", "") \
++        .required_attr("seq_len", attr.Int) \
++        .required_attr("batch_size", attr.Int) \
++        .required_attr("over_embedding_n", attr.Int) \
++        .required_attr("over_embedding_k", attr.Int) \
++        .output("oe_n_gram_ids" , "")
++    )
+ 
+ # This api is auto-generated from IR Aipp
+ @auto_convert_to_tensor([False, False], [False, True])
+diff --git a/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_compute_n_gram_ids.py b/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_compute_n_gram_ids.py
+new file mode 100644
+index 00000000..fdfc6de3
+--- /dev/null
++++ b/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_compute_n_gram_ids.py
+@@ -0,0 +1,46 @@
++
++import torch
++from torch import Generator, contiguous_format, inf, strided, SymInt
++from torch.types import Device, Number, _bool, _complex, _device, _dtype, _float, _int, _layout, _qscheme, _size
++from torchair._ge_concrete_graph import ge_apis as ge
++from torchair._ge_concrete_graph.fx2ge_converter import declare_supported, register_fx_node_ge_converter
++from torchair._ge_concrete_graph.supported_declaration import _TypedTensor, F32, F16, BF16, F64, I32, I16, I64, \
++    I8, U8, BOOL, Support
++from torchair._ge_concrete_graph.utils import dtype_promote
++from torchair.ge._ge_graph import Tensor, TensorSpec
++from typing import (
++    Any, Callable, ContextManager, Iterator, List, Literal, NamedTuple, Optional, Sequence, Tuple, TypeVar,
++    Union, overload, Optional
++)
++
++
++# ... 省略前面不变的代码 ...
++
++@register_fx_node_ge_converter(torch.ops.npu.mlp_compute_n_gram_ids.default)
++def convert_npu_mlp_compute_n_gram_ids(
++        oe_weights: Tensor,
++        oe_mods: Tensor,
++        over_embedding_input_ids: Tensor,
++        ignore_token_flags: Tensor,
++        oe_exclusive_req_len_sums: Tensor,
++        oe_exclusive_oe_info_len_sums: Tensor,
++        oe_exclusive_embeder_size_sums: Tensor,
++        seq_len: int,
++        batch_size: int,
++        over_embedding_n: int,
++        over_embedding_k: int
++):
++    # 调用自定义算子 MlpComputeNGramIds
++    return ge.MlpComputeNGramIds(
++        oe_weights,
++        oe_mods,
++        over_embedding_input_ids,
++        ignore_token_flags,
++        oe_exclusive_req_len_sums,
++        oe_exclusive_oe_info_len_sums,
++        oe_exclusive_embeder_size_sums,
++        seq_len=seq_len,
++        batch_size=batch_size,
++        over_embedding_n=over_embedding_n,
++        over_embedding_k=over_embedding_k
++    )
+\ No newline at end of file
+-- 
+2.39.5 (Apple Git-154)
+

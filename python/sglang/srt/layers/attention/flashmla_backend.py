@@ -124,7 +124,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 reshape_q_contiguous = reshape_q.contiguous()
                 q_nope, q_scale, q_rope = flash_mla_module.quantize_ckv_per_token_head(reshape_q_contiguous, self.kv_lora_rank)
                 k_cache_lora, k_scale, k_cache_rope = k_cache
-                o, _ = flash_mla_module.flash_mla_ckv_fp8_per_token(
+                o, lse = flash_mla_module.flash_mla_ckv_fp8_per_token(
                     q_nope=q_nope,
                     q_rope=q_rope,
                     k_cache_lora=k_cache_lora.view(-1, PAGE_SIZE, 1, self.kv_lora_rank),
@@ -142,7 +142,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 )
             elif self.cache_dtype == torch.float8_e4m3fn:
                 reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
-                o, _ = flash_mla_module.flash_mla_with_kvcache(
+                o, lse = flash_mla_module.flash_mla_with_kvcache(
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_table[:bs],
@@ -161,7 +161,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     ),
                 )
             else:
-                o, _ = flash_mla_module.flash_mla_with_kvcache(
+                o, lse = flash_mla_module.flash_mla_with_kvcache(
                     q=reshape_q,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_table[:bs],
@@ -173,7 +173,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     softmax_scale=layer.scaling,
                     causal=True,
                 )
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
 
     def forward_decode(
         self,
@@ -205,7 +205,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             reshape_q_contiguous = reshape_q.contiguous()
             q_nope, q_scale, q_rope = flash_mla_module.quantize_ckv_per_token_head(reshape_q_contiguous, self.kv_lora_rank)
             k_cache_lora, k_scale, k_cache_rope = k_cache
-            o, _ = flash_mla_module.flash_mla_ckv_fp8_per_token(
+            o, lse = flash_mla_module.flash_mla_ckv_fp8_per_token(
                 q_nope=q_nope,
                 q_rope=q_rope,
                 k_cache_lora=k_cache_lora.view(-1, PAGE_SIZE, 1, self.kv_lora_rank),
@@ -221,10 +221,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 causal=True,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
         elif self.cache_dtype == torch.float8_e4m3fn:
             reshape_q_fp8 = reshape_q.to(torch.float8_e4m3fn)
-            o, _ = flash_mla_module.flash_mla_with_kvcache(
+            o, lse = flash_mla_module.flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_table[:bs],
@@ -238,10 +238,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 descale_k=torch.ones((1), dtype=torch.float32, device=reshape_q.device),
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
         else:
             # todo: need check all causal True or False?
-            o, _ = flash_mla_module.flash_mla_with_kvcache(
+            o, lse = flash_mla_module.flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_table[:bs],
@@ -253,7 +253,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 causal=True,
             )
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         block_table = self.kv_allocator.req_to_page[forward_batch.req_pool_indices]

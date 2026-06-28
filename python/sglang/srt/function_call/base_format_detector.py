@@ -98,6 +98,17 @@ class BaseFormatDetector(ABC):
 
         return results
 
+    def flush(self, tools: List[Tool]) -> StreamingParseResult:
+        """Finalize any incomplete state at end-of-stream.
+
+        Subclasses with custom streaming state machines should override this
+        to close out partially-parsed tool calls when the model stops generating
+        without emitting the expected closing tokens.
+
+        The default implementation is a no-op.
+        """
+        return StreamingParseResult()
+
     @abstractmethod
     def detect_and_parse(
         self,

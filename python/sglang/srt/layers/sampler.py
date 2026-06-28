@@ -9,7 +9,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.env import global_server_args_dict
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda_available
+from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda_available, is_npu
 
 if is_cuda_available():
     from flashinfer.sampling import (
@@ -75,7 +75,7 @@ class Sampler(nn.Module):
                 # logprobs = logits
         else:
             # Post process logits
-            logits.div_(sampling_info.temperatures)
+            logits = logits.div(sampling_info.temperatures)
             logits[:] = torch.softmax(logits, dim=-1)
             probs = logits
             del logits
@@ -111,13 +111,22 @@ class Sampler(nn.Module):
             elif global_server_args_dict["sampling_backend"] == "pytorch":
                 if batch_next_token_ids is None:
                     # A slower fallback implementation with torch native operations.
-                    batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
-                        probs,
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
-                        sampling_info.min_ps,
-                        sampling_info.need_min_p_sampling,
-                    )
+                    if is_npu():
+                        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch_npu(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                        )
+                    else:
+                        batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                            probs,
+                            sampling_info.top_ks,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                        )
 
                 if return_logprob:
                     # clamp to avoid -inf
@@ -208,16 +217,39 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     """A top-k, top-p and min-p sampling implementation with native pytorch operations."""
     probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    mask = torch.arange(0, probs.shape[-1], device=probs.device
+                        ).view(1, -1) >= top_ks.view(-1, 1)
+    mask = mask | ((probs_sum - probs_sort) > top_ps.view(-1, 1))
 
     if need_min_p_sampling:
         min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+        mask = mask | (probs_sort < min_p_thresholds.view(-1, 1))
 
+    probs_sort = torch.where(mask, 0, probs_sort)
+    sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    # int32 range is enough to represent the token ids
+    probs_idx = probs_idx.to(torch.int32)
+    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+    return batch_next_token_ids
+
+
+def top_k_top_p_min_p_sampling_from_probs_torch_npu(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+):
+    top_k_white_list = {1: 4096, 2: 2048, 3: 2048, 4: 2048}
+    # probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sort, probs_idx = torch.topk(probs, k=top_k_white_list.get(probs.shape[0], 1024), dim=-1, largest=True, sorted=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    mask_top_k = torch.arange(0, probs_sort.shape[-1], device=probs_sort.device).view(1, -1) >= top_ks.view(-1, 1)
+    mask_top_p = torch.zeros_like(mask_top_k, dtype=torch.bool)
+    if need_min_p_sampling:
+        mask_top_p = (probs_sum - probs_sort) > top_ps.view(-1, 1)
+
+    probs_sort = torch.where(mask_top_k | mask_top_p, 0, probs_sort)
     sampled_index = torch.multinomial(probs_sort, num_samples=1)
     # int32 range is enough to represent the token ids
     probs_idx = probs_idx.to(torch.int32)

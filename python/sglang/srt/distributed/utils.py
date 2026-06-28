@@ -5,7 +5,9 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
-from sglang.srt.utils import get_colorful_logger
+
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.utils import get_colorful_logger, get_prefix_sum
 import os
 import pickle
 import time
@@ -67,21 +69,12 @@ def get_pp_indices(
     If the number of layers is not divisible by the number of partitions,
     the last partition will have the remaining layers.
     """
-    # partition_list_str can be set to None in sglang
-    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
-    if partition_list_str is not None:
-        try:
-            partitions = [int(layer) for layer in partition_list_str.split(",")]
-        except ValueError as err:
-            raise ValueError(
-                "Invalid partition string: {}".format(partition_list_str)
-            ) from err
-        if len(partitions) != pp_size:
-            raise ValueError(f"{len(partitions)=} does not match {pp_size=}.")
-        if sum(partitions) != num_hidden_layers:
-            raise ValueError(f"{sum(partitions)=} does not match {num_hidden_layers=}.")
-        start_layer = sum(partitions[:pp_rank])
-        end_layer = start_layer + partitions[pp_rank]
+    pp_layer_nums = global_server_args_dict["pp_layer_nums"]
+    if pp_layer_nums is not None:
+        pp_layer_nums_prefix_sum = get_prefix_sum(pp_layer_nums)
+        assert pp_layer_nums_prefix_sum[-1] == num_hidden_layers, f"{pp_layer_nums_prefix_sum=} not match {num_hidden_layers=}"
+        start_layer = pp_layer_nums_prefix_sum[pp_rank]
+        end_layer = pp_layer_nums_prefix_sum[pp_rank + 1]
     else:
         layers_per_partition = num_hidden_layers // pp_size
         start_layer = pp_rank * layers_per_partition

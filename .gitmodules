@@ -28,6 +28,3 @@
 [submodule "3rdparty/triton_configs"]
 	path = 3rdparty/triton_configs
 	url = https://github.com/meituan-longcat/triton_configs.git
-[submodule "3rdparty/flash-attention"]
-	path = 3rdparty/flash-attention
-	url = https://github.com/Dao-AILab/flash-attention

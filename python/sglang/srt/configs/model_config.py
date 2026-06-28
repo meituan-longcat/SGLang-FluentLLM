@@ -64,7 +64,7 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     return (
         config.architectures is not None
         and config.architectures[0]
-        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", "FLASHForCausalLM"]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", "FLASHForCausalLM", "FLASHForCausalLMNextN"]
         and getattr(config, "index_topk", None) is not None
     )
 
@@ -72,23 +72,23 @@ def is_dsa(config: PretrainedConfig) -> bool:
     return (
         config.architectures is not None
         and config.architectures[0]
-        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", "FLASHForCausalLM"]
+        in ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", "FLASHForCausalLM", "FLASHForCausalLMNextN", "GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN"]
         and getattr(config, "index_topk", None) is not None
     )
 
 
 def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+    assert is_dsa(config)
     return config.index_head_dim
 
 
 def get_nsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+    assert is_dsa(config)
     return config.index_topk
 
 
 def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+    assert is_dsa(config)
     return config.index_n_heads
 
 
@@ -193,6 +193,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "FLASHForCausalLM" in self.hf_config.architectures
             or "FLASHForCausalLMNextN" in self.hf_config.architectures
+            or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -202,7 +203,7 @@ class ModelConfig:
             self.v_head_dim = self.hf_config.v_head_dim
             self.index_head_dim = (
                 get_nsa_index_head_dim(self.hf_config)
-                if is_deepseek_nsa(self.hf_config)
+                if is_dsa(self.hf_config)
                 else None
             )
 

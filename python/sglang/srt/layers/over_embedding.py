@@ -4,15 +4,7 @@ import torch
 from torch import nn
 from torch.nn import Parameter
 
-from eps.fast_oep import AllToAll
 
-try:
-    from flashinfer import compute_n_gram_ids_v2
-except ImportError as e:
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.error(f"Failed to import compute_n_gram_ids_v2 from flashinfer: {e}")
-    raise
 
 from sglang.srt.layers.quantization import QuantizeMethodBase
 from sglang.srt.distributed import (
@@ -24,6 +16,17 @@ from sglang.srt.layers.vocab_parallel_embedding import UnquantizedEmbeddingMetho
 from sglang.srt.env import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils import is_npu
+__is_npu__ = is_npu()
+if not __is_npu__:
+    from eps.fast_oep import AllToAll
+    try:
+        from flashinfer import compute_n_gram_ids_v2
+    except ImportError as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to import compute_n_gram_ids_v2 from flashinfer: {e}")
+        raise
 
 logger = get_colorful_logger(__name__)
 
@@ -71,8 +74,11 @@ class OEPEmbedding(torch.nn.Module):
             params_dtype=self.params_dtype,
             weight_loader=None,
         )
-
-        if self.world_size > 0:
+        # Delay AllToAll creation to avoid conflicts with torch_memory_saver
+        self.a2a = None
+    def _ensure_a2a_initialized(self):
+        """Lazy initialization of AllToAll to avoid torch_memory_saver conflicts."""
+        if self.world_size > 0 and self.a2a is None:
             comm = get_eps_communicator()
             self.a2a = AllToAll(
                 self.embedding_dim,
@@ -83,6 +89,7 @@ class OEPEmbedding(torch.nn.Module):
 
     def forward(self, input_, num_global_tokens):
         if self.world_size > 1:
+            self._ensure_a2a_initialized()
             self.a2a.dispatch(input_)
             output = torch.empty(input_.shape[1],
                                  input_.shape[0],
@@ -143,13 +150,13 @@ class FusedOverEmbedding(torch.nn.Module):
 
         # Initialize OE vocabulary [m0+m1+...+m11, self.oe_hidden_dim]
         self.oe_hidden_dim = embedding_dim // self.n_grams
-        self.exclusive_oe_embeder_size_sums = torch.zeros([self.n_grams + 1],
+        exclusive_oe_embeder_size_sums = torch.zeros([self.n_grams + 1],
                                                           dtype=torch.int32,
                                                           device=device)
         for i in range(self.n_grams):
             m = int(over_embedding_m + i * 2 + 1)
-            self.exclusive_oe_embeder_size_sums[i + 1] = self.exclusive_oe_embeder_size_sums[i] + m
-
+            exclusive_oe_embeder_size_sums[i + 1] = exclusive_oe_embeder_size_sums[i] + m
+            self.register_buffer('exclusive_oe_embeder_size_sums', exclusive_oe_embeder_size_sums)
         max_num_global_tokens = global_server_args_dict["chunked_prefill_size"] * get_tensor_model_parallel_world_size()
         self.oe_embeder = OEPEmbedding(
                 num_embeddings=self.exclusive_oe_embeder_size_sums[-1].item(),
@@ -167,14 +174,16 @@ class FusedOverEmbedding(torch.nn.Module):
         )
 
         # Initialize weight tensor, avoid repeated computation when calculating n-gram ids
-        self.oe_mods = torch.zeros([self.over_embedding_n-1, self.over_embedding_k], dtype=torch.int32)
-        self.oe_weights = torch.zeros([self.over_embedding_n-1, self.over_embedding_k, self.over_embedding_n], dtype=torch.int32)
+        oe_mods = torch.zeros([self.over_embedding_n-1, self.over_embedding_k], dtype=torch.int32, device=device)
+        oe_weights = torch.zeros([self.over_embedding_n-1, self.over_embedding_k, self.over_embedding_n], dtype=torch.int32, device=device)
         for n in range(2, self.over_embedding_n + 1):
             for k in range(self.over_embedding_k):
                 mod = self.over_embedding_m + 2 * ((n - 2) * self.over_embedding_k + k) + 1
-                self.oe_mods[n-2][k] = mod
+                oe_mods[n-2][k] = mod
                 for delta in range(self.over_embedding_n):
-                    self.oe_weights[n-2][k][delta] = pow(num_embeddings, delta, mod)
+                    oe_weights[n-2][k][delta] = pow(num_embeddings, delta, mod)
+        self.register_buffer('oe_mods', oe_mods)
+        self.register_buffer('oe_weights', oe_weights)
         self.oe_n_gram_ids = torch.zeros([global_server_args_dict['chunked_prefill_size'], self.n_grams], dtype=torch.int32, device=device)
         self.exclusive_req_len_sums = torch.zeros(global_server_args_dict['max_running_requests'] + 1, dtype=torch.int32, device=device)
 

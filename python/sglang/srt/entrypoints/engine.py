@@ -29,7 +29,9 @@ from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
 import zmq
 import zmq.asyncio
 
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+# noinspection PyUnusedImports
+import sglang.srt.npu.utils  # 保证在加载sglang.srt.layers.moe.topk之前设置USE_EPS_TOPK_SIGMOID
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, CompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 
@@ -163,6 +165,23 @@ class Engine(EngineBase):
             request.bootstrap_room = bootstrap_room
 
         generator = self.openai_serving_chat.handle_request_engine(request)
+        if request.stream:
+            return generator
+        else:
+            response = await generator.__anext__()
+            return response
+
+    async def openai_v1_completions(self, request_dict: dict,
+                                         bootstrap_host : Optional[str] = None,
+                                         bootstrap_port : Optional[int] = None,
+                                         bootstrap_room : Optional[int] = None):
+        request = CompletionRequest(**request_dict)
+        if bootstrap_host is not None:
+            request.bootstrap_host = bootstrap_host
+            request.bootstrap_port = bootstrap_port
+            request.bootstrap_room = bootstrap_room
+
+        generator = self.openai_serving_completion.handle_request_engine(request)
         if request.stream:
             return generator
         else:
@@ -701,6 +720,39 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
+def _calculate_rank_ranges(
+    nnodes: int, pp_size: int, tp_size: int, node_rank: int
+) -> Tuple[range, range, int, int]:
+    """Calculate pp_rank_range and tp_rank_range for a given node.
+
+    Args:
+        nnodes: Total number of nodes.
+        pp_size: Pipeline parallel size.
+        tp_size: Tensor parallel size.
+        node_rank: The rank of the node to compute ranges for.
+
+    Returns:
+        A tuple of (pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node):
+        - pp_rank_range: range of pipeline-parallel ranks assigned to this node.
+        - tp_rank_range: range of tensor-parallel ranks assigned to this node.
+        - pp_size_per_node: number of PP ranks per node.
+        - tp_size_per_node: number of TP ranks per node.
+    """
+    pp_size_per_node = max(pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
+    )
+
+    nnodes_per_tp_group = nnodes_per_pp_rank
+    tp_size_per_node = tp_size // nnodes_per_tp_group
+    tp_rank_range = range(
+        tp_size_per_node * (node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+    )
+
+    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
@@ -712,6 +764,12 @@ def _launch_subprocesses(
     configure_logger(server_args)
     server_args.check_server_args()
     _set_envs_and_config(server_args)
+
+    # Populate global_server_args_dict in the main process so that components
+    # running here (e.g. TokenizerManager → SamplingParams) can read the real
+    # server configuration instead of the None defaults.
+    from sglang.srt.env import global_server_args_dict_update
+    global_server_args_dict_update(server_args)
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -731,26 +789,33 @@ def _launch_subprocesses(
         )
 
         scheduler_pipe_readers = []
-        tp_size_per_node = server_args.world_size // server_args.nnodes
-        tp_rank_range = range(
-            tp_size_per_node * server_args.node_rank,
-            tp_size_per_node * (server_args.node_rank + 1),
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node=(
+            _calculate_rank_ranges(
+                server_args.nnodes,
+                server_args.pp_size,
+                server_args.tp_size,
+                server_args.node_rank,
+            )
         )
-        for tp_rank in tp_rank_range:
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = (
-                server_args.base_gpu_id
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            moe_ep_rank = tp_rank // (server_args.world_size // server_args.ep_size)
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, port_args, gpu_id, tp_rank, moe_ep_rank, None, tp_rank, writer),  # Currently no pp, when dp is 1, tp_rank is global_rank
-            )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                reader, writer=mp.Pipe(duplex=False)
+                gpu_id=(
+                    server_args.base_gpu_id
+                    +((pp_rank%pp_size_per_node)*tp_size_per_node)
+                    +(tp_rank%tp_size_per_node)*server_args.gpu_id_step
+                )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+                global_rank=pp_rank*server_args.tp_size + tp_rank
+                proc=mp.Process(
+                    target=run_scheduler_process,
+                    args=(server_args, port_args, gpu_id, pp_rank, tp_rank, moe_ep_rank, None, global_rank, writer),
+                )
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
     else:
         # Launch the data parallel controller
         reader, writer = mp.Pipe(duplex=False)
@@ -795,17 +860,9 @@ def _launch_subprocesses(
     )
     detoken_proc.start()
 
-    # Launch tokenizer process
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-
     # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
+    template_manager = TemplateManager(server_args, port_args)
+    tokenizer_manager = template_manager.tokenizer_manager
 
     # Wait for the model to finish loading
     scheduler_infos = []

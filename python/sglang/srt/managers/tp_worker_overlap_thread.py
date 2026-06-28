@@ -23,7 +23,7 @@ from typing import Optional
 import psutil
 import torch
 import math
-
+from sglang.srt.env import ENV
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -34,13 +34,16 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import (
+    get_compiler_backend,
+    is_npu
+)
 from sglang.utils import get_exception_traceback
 
 logger = get_colorful_logger(__name__)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+# @torch.compile(dynamic=True, backend=get_compiler_backend())
 def resolve_future_token_ids(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
@@ -62,7 +65,7 @@ class TpModelWorkerClient:
         nccl_port: int,
     ):
         # Load the model
-        self.worker = TpModelWorker(server_args, gpu_id, attn_tp_rank, moe_ep_rank, global_rank, nccl_port)
+        self.worker = TpModelWorker(server_args, gpu_id, attn_tp_rank, moe_ep_rank, global_rank, nccl_port, enable_overlap=True)
         self.model_config = self.worker.model_config
         self.model_runner = self.worker.model_runner
         self.max_running_requests = self.worker.max_running_requests
@@ -88,13 +91,25 @@ class TpModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
+        # self.forward_stream = self.worker.model_runner.forward_stream
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        if is_npu() and ENV.npu_enable_graph:
+            with torch.get_device_module(self.device).stream(self.forward_stream):
+                self.worker.model_runner.init_npu_graphs()
         self.parent_process = psutil.Process().parent()
+        # 第一次 launch 的 batch 在 GPU 上执行时, 第二次调度的 batch 可能已经 launch
+        # 而第三次的 launch 一定在第一次 launch 的 batch 执行完之后 (由 copy_done 保证)
+        # 所以需要在 forward 线程上保留两次 launch 的 batch 数量的引用, 防止 torch 回收
+        # model_worker_batch（生命周期短） 中的张量空间导致 illeagl memory access。
+        self.num_continuous_decode_steps = server_args.num_continuous_decode_steps
+        self.keep_batch_reference_num = 2 * self.num_continuous_decode_steps
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
         self.scheduler_stream = torch.get_device_module(self.device).current_stream()
+        if is_npu():
+            torch.npu.set_stream_limit(self.scheduler_stream, 8, 16)
         if self.device == "cpu":
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
         self.use_over_embedding = getattr(self.worker.model_config, "use_over_embedding", False)
@@ -149,7 +164,7 @@ class TpModelWorkerClient:
     @torch.no_grad()
     def forward_thread_func_(self):
         batch_pt = 0
-        batch_lists = [None] * 2
+        batch_lists = [None] * self.keep_batch_reference_num
 
         while True:
             model_worker_batch, future_token_ids_ct = self.input_queue.get()
@@ -159,7 +174,7 @@ class TpModelWorkerClient:
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released
             # by pytorch and cause CUDA illegal memory access errors.
-            batch_lists[batch_pt % 2] = model_worker_batch
+            batch_lists[batch_pt % self.keep_batch_reference_num] = model_worker_batch
             batch_pt += 1
 
             # Create event

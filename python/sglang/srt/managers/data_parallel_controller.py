@@ -12,7 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
+from typing import List
 
+from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.utils import get_colorful_logger
 import multiprocessing as mp
 import signal
@@ -36,6 +38,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, get_zmq_socket, register_usr_signal
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -180,24 +183,24 @@ class DataParallelController:
 
         threads = []
         dp_port_args = []
-        
+
         # Parse dist_init_addr from port_args to create per-dp-rank ports
         # Extract base info from the passed port_args
         base_scheduler_port = int(port_args.scheduler_input_ipc_name.split(":")[-1])
         dist_init_host = port_args.scheduler_input_ipc_name.split("//")[1].split(":")[0]
-        
+
         # port_args.scheduler_input_ipc_name (base_scheduler_port) is used by:
         # TokenizerManager -> DataParallelController
-        # 
+        #
         # For DataParallelController -> Scheduler[dp_rank], we need different ports.
         # Following the same logic as PortArgs.init_new with dp_rank parameter:
         # scheduler_input_port = port_base + 4 + dp_rank
         # Since base_scheduler_port = port_base + 4, we have:
         # scheduler_input_port = base_scheduler_port + dp_rank
-        # 
+        #
         # But we need to avoid conflict with TokenizerManager's port (base_scheduler_port).
         # So we start from base_scheduler_port + 1 for dp_rank=0.
-        
+
         for dp_rank in range(server_args.dp_size):
             # Create port_args for each dp_rank by adjusting scheduler_input_port
             # This avoids calling PortArgs.init_new which might use default port
@@ -213,7 +216,7 @@ class DataParallelController:
                 tokenizer_worker_ipc_name=port_args.tokenizer_worker_ipc_name,
             )
             dp_port_args.append(tmp_port_args)
-            
+
             # Bind to scheduler_input_ipc_name BEFORE starting scheduler threads
             # This ensures the port is available when scheduler tries to connect
             if server_args.node_rank == 0:
@@ -224,83 +227,86 @@ class DataParallelController:
                     True,  # bind
                 )
 
-        if server_args.dp_size == 1:
-            dp_rank_range = range(0,1)
-        else:
-            dp_ranks_per_node = server_args.dp_size // server_args.nnodes
-            dp_rank_range = range(
-                dp_ranks_per_node * server_args.node_rank,
-                dp_ranks_per_node * (server_args.node_rank + 1),
-            )
-        for dp_rank in dp_rank_range:
-            # Create a thread for each worker
-            thread = threading.Thread(
-                target=self.launch_tensor_parallel_group,
-                args=(server_args, dp_port_args[dp_rank], base_gpu_id, dp_rank),
-            )
-            threads.append(thread)
-            base_gpu_id += server_args.attn_tp_size * server_args.gpu_id_step
-
-        # Start all threads
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
+        self.launch_tensor_parallel_group(server_args, port_args, 0, dp_port_args)
         return dp_port_args
 
     def launch_tensor_parallel_group(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
-        base_gpu_id_current_dp: int,
-        dp_rank: int,
+        base_gpu_id: int,
+        dp_port_args: List[PortArgs],
     ):
+        memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=server_args.enable_memory_saver
+        )
         scheduler_pipe_readers = []
-        if server_args.attn_tp_size > server_args.nprocs_per_node:
-            attn_tp_ranks_per_node = server_args.attn_tp_size // server_args.nnodes
-            attn_tp_rank_range = range(
-                attn_tp_ranks_per_node * server_args.node_rank,
-                attn_tp_ranks_per_node * (server_args.node_rank + 1),
-            )
-        else:
-            attn_tp_rank_range = range(0, server_args.attn_tp_size)
-        for attn_tp_rank in attn_tp_rank_range:
-            # Use the port_args from launch_dp_schedulers
-            # Don't recalculate to avoid port conflicts and inconsistencies
-            rank_port_args = port_args
-            
-            reader, writer = mp.Pipe(duplex=False)
-            gpu_id = (
-                server_args.base_gpu_id
-                + base_gpu_id_current_dp
-                + attn_tp_rank * server_args.gpu_id_step
-            )
-            global_rank = dp_rank * server_args.attn_tp_size + attn_tp_rank
 
-            moe_ep_rank = global_rank // (server_args.world_size // server_args.ep_size)
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+        )
 
-            # run scheduler
-            proc = mp.Process(
-                target=run_scheduler_process,
-                args=(server_args, rank_port_args, gpu_id, attn_tp_rank, moe_ep_rank, dp_rank, global_rank, writer),
-            )
-            proc.start()
-            self.scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
+        nnodes_per_tp_group = nnodes_per_pp_rank
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+        tp_rank_range = range(
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        )
+
+        for pp_rank in pp_rank_range:
+            for tp_rank in tp_rank_range:
+                assert server_args.enable_dp_attention
+                _, _, dp_rank=compute_dp_attention_world_info(
+                    server_args.enable_dp_attention,
+                    tp_rank,
+                    server_args.tp_size,
+                    server_args.dp_size,
+                )
+                # compute zmq ports for this dp rank
+                rank_port_args=dp_port_args[dp_rank]
+
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id
+                    + base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                )
+                attn_dp_size = server_args.dp_size
+
+                # Parallelism hierarchy (outermost to innermost):
+                # - Attention: Global(TP) -> DP -> ATTN_CP/TP
+                attn_tp_size = server_args.tp_size // attn_dp_size
+                attn_tp_rank = tp_rank % attn_tp_size
+                moe_ep_rank = tp_rank % server_args.tp_size // (server_args.tp_size  // server_args.ep_size)
+
+                # run scheduler
+                proc=mp.Process(
+                    target=run_scheduler_process,
+                    args=(server_args, rank_port_args, gpu_id, pp_rank, attn_tp_rank, moe_ep_rank, dp_rank, tp_rank, writer),
+                )
+                with memory_saver_adapter.configure_subprocess():
+                    proc.start()
+
+                self.scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
+
         # Wait for model to finish loading
         scheduler_info = []
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
-        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
-        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
-        self.max_running_requests = scheduler_info[0]["max_running_requests"]
-        self.chunked_prefill_size = scheduler_info[0]["chunked_prefill_size"]
-        self.context_length = scheduler_info[0]["context_length"]
+        self.max_total_num_tokens=scheduler_info[0]["max_total_num_tokens"]
+        self.max_req_input_len=scheduler_info[0]["max_req_input_len"]
+        self.max_running_requests=scheduler_info[0]["max_running_requests"]
+        self.chunked_prefill_size=scheduler_info[0]["chunked_prefill_size"]
+        self.context_length=scheduler_info[0]["context_length"]
 
     def round_robin_scheduler(self, req: Req):
-        if self.server_args.disaggregation_mode == "null":
+        if self.server_args.disaggregation_mode == "null" or self.server_args.disaggregation_mode == "decode":
             self.workers[self.round_robin_counter].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(
                 self.workers

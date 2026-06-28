@@ -11,7 +11,10 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    get_mlp_tp_group,
+    init_model_parallel_group,
     tensor_model_parallel_all_reduce,
+    get_world_group
 )
 from sglang.srt.distributed.device_communicators.custom_all_reduce import _can_p2p
 from sglang.srt.utils import get_colorful_logger, is_npu, is_sm90_supported
@@ -21,8 +24,6 @@ logger = get_colorful_logger(__name__)
 
 _is_npu__ = is_npu()
 
-if not _is_npu__:
-    import eps
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -78,7 +79,7 @@ def init_attn_tp_dp_convertor_v1(global_rank, max_num_tokens, attn_tp_size, hidd
     eps establishes global communication groups, but for completing reduce_scatter and all_gather within tp group, here we only establish in-group communication connections
 """
 def init_attn_tp_dp_convertor_v2(max_num_tokens, hidden_size):
-    
+
     global _ATTN_TP_DP_CONVERTOR
     from sglang.srt.distributed.device_communicators.custom_triton_rsag.triton_rsag import TritonRSAG
     convertor = TritonRSAG(get_attention_tp_group(), get_attention_tp_rank(), max_num_tokens, hidden_size)
@@ -102,9 +103,8 @@ def initialize_dp_attention(attn_tp_rank, attn_tp_size, dp_size, dp_rank, global
     _ATTN_TP_RANK, _ATTN_TP_SIZE, _DP_RANK = attn_tp_rank, attn_tp_size, dp_rank
     _DP_SIZE = dp_size
 
-    tp_group = get_tp_group()
-
-    world_size = torch.distributed.get_world_size()
+    world_group = get_world_group()
+    world_size = world_group.world_size
 
     _ATTN_TP_GROUP = GroupCoordinator(
         [
@@ -112,7 +112,7 @@ def initialize_dp_attention(attn_tp_rank, attn_tp_size, dp_size, dp_rank, global
             for head in range(0, world_size, _ATTN_TP_SIZE)
         ],
         local_rank,
-        torch.distributed.get_backend(tp_group.device_group),
+        torch.distributed.get_backend(world_group.device_group),
         SYNC_TOKEN_IDS_ACROSS_TP,
         False,
         False,
@@ -140,12 +140,22 @@ def initialize_dp_dense(dense_tp_rank, dense_tp_size, dense_dp_size, dense_dp_ra
         _DENSE_TP_GROUP = _ATTN_TP_GROUP
         _DENSE_TP_DP_CONVERTOR = _ATTN_TP_DP_CONVERTOR
     else:
-        dense_tp_groups = []
-        for i in range(_DENSE_DP_SIZE):
-            dense_tp_group_ranks = list(range(i * _DENSE_TP_SIZE, (i + 1) * _DENSE_TP_SIZE))
-            logger.info(f"dense_tp_group_ranks: {dense_tp_group_ranks}")
-            dense_tp_groups.append(torch.distributed.new_group(dense_tp_group_ranks))
-        _DENSE_TP_GROUP = dense_tp_groups
+        tp_group = get_tp_group()
+        dense_tp_group_ranks = [
+            list(range(i * _DENSE_TP_SIZE, (i + 1) * _DENSE_TP_SIZE))
+            for i in range(_DENSE_DP_SIZE)
+        ]
+        for ranks in dense_tp_group_ranks:
+            logger.info(f"dense_tp_group_ranks: {ranks}")
+        _DENSE_TP_GROUP = init_model_parallel_group(
+            dense_tp_group_ranks,
+            local_rank,
+            torch.distributed.get_backend(tp_group.device_group),
+            group_name="dense_tp",
+        )
+
+        if _is_npu__:
+            _DENSE_TP_GROUP = get_mlp_tp_group()
 
         assert max_num_tokens is not None
 
@@ -218,6 +228,52 @@ def get_dense_dp_rank():
 def get_dense_dp_size():
     assert _DENSE_DP_SIZE is not None, "dp dense not initialized!"
     return _DENSE_DP_SIZE
+
+
+_DRAFT_ATTN_TP_GROUP = None
+_DRAFT_ATTN_TP_RANK = None
+_DRAFT_ATTN_TP_SIZE = None
+
+def get_draft_attention_tp_group():
+    assert _DRAFT_ATTN_TP_GROUP is not None, "draft dp attention not initialized!"
+    return _DRAFT_ATTN_TP_GROUP
+
+
+def get_draft_attention_tp_rank():
+    assert _DRAFT_ATTN_TP_RANK is not None, "draft dp attention not initialized!"
+    return _DRAFT_ATTN_TP_RANK
+
+
+def get_draft_attention_tp_size():
+    assert _DRAFT_ATTN_TP_SIZE is not None, "draft dp attention not initialized!"
+    return _DRAFT_ATTN_TP_SIZE
+
+def initialize_dp_draft_model():
+    global _DRAFT_ATTN_TP_GROUP, _DRAFT_ATTN_TP_RANK, _DRAFT_ATTN_TP_SIZE
+
+    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
+
+    # set to TP1
+    _DRAFT_ATTN_TP_RANK, _DRAFT_ATTN_TP_SIZE = 0, 1
+
+    tp_group = get_tp_group()
+
+    world_size = torch.distributed.get_world_size()
+
+    _DRAFT_ATTN_TP_GROUP = GroupCoordinator(
+        [
+            list(range(head, head + _DRAFT_ATTN_TP_SIZE))
+            for head in range(0, world_size, _DRAFT_ATTN_TP_SIZE)
+        ],
+        0,
+        torch.distributed.get_backend(tp_group.device_group),
+        SYNC_TOKEN_IDS_ACROSS_TP,
+        False,
+        False,
+        False,
+        False,
+        group_name="draft_attention_tp",
+    )
 
 
 def compute_dp_attention_world_info(enable_dp_attention, tp_rank, tp_size, dp_size):

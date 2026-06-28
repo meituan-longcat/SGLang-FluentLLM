@@ -4,57 +4,21 @@ import importlib.util
 from typing import List, Optional
 
 import torch
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
-    QuantizeMethodBase,
 )
+from sglang.srt.utils import is_npu
 from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+__is_npu__ = is_npu()
+if __is_npu__:
+    import torch_npu
+
 has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
-
-
-
-class UnquantizedEmbeddingMethod(QuantizeMethodBase):
-    """Unquantized method for embeddings."""
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: List[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        """Create weights for embedding layer."""
-        weight = Parameter(
-            torch.empty(
-                sum(output_partition_sizes),
-                input_size_per_partition,
-                dtype=params_dtype,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
-        layer.register_parameter("weight", weight)
-        set_weight_attrs(weight, extra_weight_attrs)
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
-
-    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
-        return F.embedding(input_, layer.weight)
 
 
 class UnquantizedLinearMethod(LinearMethodBase):
@@ -90,5 +54,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        enable_weight_transpsoe: bool = False
     ) -> torch.Tensor:
-        return F.linear(x, layer.weight, bias)
+        cur_weight = layer.weight
+        if not enable_weight_transpsoe:
+            cur_weight = cur_weight.permute(1, 0)
+        out = torch.matmul(x, cur_weight)
+        return out if bias is None else out + bias

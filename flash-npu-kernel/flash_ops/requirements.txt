@@ -1,0 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+build
+pyyaml
+numpy<2
+pytest

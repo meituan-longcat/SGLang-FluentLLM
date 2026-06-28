@@ -176,3 +176,40 @@ def cp_all_gather_rerange_output(
         [x_list[i] for i in inverse_index]
     )
     return output
+
+
+class PPMissingLayer(torch.nn.Identity):
+    # Adapted from
+    # https://github.com/vllm-project/vllm/blob/18ed3132d2bfe1df9a74729457b69243955221e8/vllm/model_executor/models/utils.py#L468C1-L486C1
+    """
+    A placeholder layer for missing layers in a pipeline parallel model.
+
+    Attribute access on this placeholder returns 'self' so that common
+    patterns like ``isinstance(layer.mlp, SomeMoE)`` safely evaluate to
+    ``False`` instead of raising ``AttributeError``.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.return_tuple = kwargs.get("return_tuple", False)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except (AttributeError, KeyError):
+            return self
+
+    def __setattr__(self, name: str, value):
+        if name == "return_tuple" or name.startswith("_"):
+            super().__setattr__(name, value)
+        else:
+            pass
+
+    def forward(self, *args, **kwargs):
+        """
+        Return the first arg from args or the first value from kwargs.
+
+        Wraps the input in a tuple if `self.return_tuple` is True.
+        """
+        input = args[0] if args else next(iter(kwargs.values()))
+        return (input,) if self.return_tuple else input

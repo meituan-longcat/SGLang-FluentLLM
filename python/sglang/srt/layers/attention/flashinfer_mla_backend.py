@@ -37,6 +37,39 @@ from sglang.srt.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
+
+def _remap_flashinfer_kv_indices(
+    token_to_kv_pool,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_lens: torch.Tensor,
+):
+    if not getattr(token_to_kv_pool, "enable_mla_l1_5_cache", False):
+        return kv_indices, kv_indptr, kv_lens
+    if kv_indices.numel() == 0:
+        return kv_indices, kv_indptr, kv_lens
+
+    mask_out, _, _, _, _ = token_to_kv_pool.global_loc_to_local_mapping(kv_indices)
+    if mask_out.numel() == 0:
+        return kv_indices, kv_indptr, kv_lens
+
+    bs = kv_lens.numel()
+    seg_ids = torch.repeat_interleave(
+        torch.arange(bs, device=kv_indices.device), kv_lens
+    )
+    local_kv_lens = torch.zeros_like(kv_lens)
+    if seg_ids.numel() > 0:
+        local_kv_lens.scatter_add_(0, seg_ids, mask_out.to(kv_lens.dtype))
+
+    local_kv_indptr = kv_indptr.clone()
+    if bs > 0:
+        local_kv_indptr[1:] = torch.cumsum(local_kv_lens, dim=0)
+
+    local_kv_indices = kv_indices[mask_out]
+    kv_indices[: local_kv_indices.numel()].copy_(local_kv_indices)
+    kv_indices = kv_indices[: local_kv_indices.numel()]
+    return kv_indices, local_kv_indptr, local_kv_lens
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -245,9 +278,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # For fast decode plan in graph replaying
         self.cuda_graph_qo_indptr_cpu = self.cuda_graph_qo_indptr.to("cpu")
         self.cuda_graph_kv_indptr_cpu = self.cuda_graph_kv_indptr.to("cpu")
+        self.cuda_graph_kv_lens_cpu = self.cuda_graph_kv_lens.to("cpu")
         self.fast_decode_kwargs = {
             "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu,
             "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu,
+            "kv_len_arr_cpu": self.cuda_graph_kv_lens_cpu,
             "kv_indices": self.cuda_graph_kv_indices,
         }
 
@@ -379,16 +414,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
-            assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs]
-            self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
-                kv_len_arr_cpu, dim=0
-            )
             self.fast_decode_kwargs.update(
                 {
                     "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu[: bs + 1],
                     "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu[: bs + 1],
-                    "kv_len_arr_cpu": kv_len_arr_cpu,
+                    "kv_len_arr_cpu": self.cuda_graph_kv_lens_cpu[:bs],
                 }
             )
 
@@ -520,25 +550,27 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 k_rope_fetch = k_rope_cache[kv_fetch_indices].float()
                 k_nope_deq = (k_nope_fetch * k_nope_scale_fetch).to(q_nope.dtype)
                 k_rope = (k_rope_fetch * k_nope_scale_fetch).to(q_nope.dtype)
-            o = wrapper.run(
+            o, lse = wrapper.run(
                 q_nope,
                 q_pe,
                 k_nope_deq,
                 k_rope,
                 out=o,
+                return_lse=True,
             )
         else:
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
                 q_nope.dtype
             )
-            o = wrapper.run(
+            o, lse = wrapper.run(
                 q_nope,
                 q_pe,
                 k_buf[:, :, : layer.v_head_dim],
                 k_buf[:, :, layer.v_head_dim :],
                 out=o,
+                return_lse=True,
             )
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return o, lse
 
 
 class FlashInferMLAIndicesUpdaterDecode:
@@ -547,16 +579,20 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
+        if global_server_args_dict["enable_mla_l1_5_cache"]:
+            self.num_local_heads = model_runner.model_config.num_attention_heads
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
+        self.kv_cache_quant_method = model_runner.kv_cache_quant_method
         self.attn_backend = attn_backend
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.q_indptr = attn_backend.q_indptr_decode
 
     def update(
@@ -604,7 +640,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             kv_indices = (
                 torch.empty(paged_kernel_lens_sum, dtype=torch.int32, device="cuda")
                 if not init_metadata_replay
-                else fast_decode_kwargs["kv_indices"]
+                else fast_decode_kwargs["kv_indices"][:paged_kernel_lens_sum]
             )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
@@ -615,15 +651,34 @@ class FlashInferMLAIndicesUpdaterDecode:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            if self.kv_cache_quant_method != "per_token_head":
+                kv_indices, kv_indptr, kv_lens = _remap_flashinfer_kv_indices(
+                    self.token_to_kv_pool, kv_indices, kv_indptr, kv_lens
+                )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
-        if not init_metadata_replay:
+        if init_metadata_replay:
+            assert "qo_indptr_cpu" in fast_decode_kwargs
+            assert "kv_indptr_cpu" in fast_decode_kwargs
+            assert "kv_len_arr_cpu" in fast_decode_kwargs
+
+            # correctness guard for remap path
+            assert kv_indptr.numel() == bs + 1, f"{kv_indptr.numel()=} vs {bs + 1=}"
+            assert kv_lens.numel() == bs, f"{kv_indptr.numel()=} vs {bs + 1=}, {kv_lens.numel()=} vs {bs=}"
+            assert kv_indptr[-1].item() == kv_indices.numel(), f"{kv_indptr[-1].item()=} vs {kv_indices.numel()=}"
+
+            # keep fast-plan CPU inputs consistent with remapped kv tensors
+            fast_decode_kwargs["kv_indptr_cpu"][1 : bs + 1].copy_(
+                kv_indptr[1:].to("cpu")
+            )
+            fast_decode_kwargs["kv_len_arr_cpu"][:bs].copy_(kv_lens.to("cpu"))
+
             wrapper.plan(
-                q_indptr,
-                kv_indptr,
+                fast_decode_kwargs["qo_indptr_cpu"],
+                fast_decode_kwargs["kv_indptr_cpu"],
                 kv_indices,
-                kv_lens,
+                fast_decode_kwargs["kv_len_arr_cpu"],
                 self.num_local_heads,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
@@ -635,10 +690,10 @@ class FlashInferMLAIndicesUpdaterDecode:
             )
         else:
             wrapper.plan(
-                fast_decode_kwargs["qo_indptr_cpu"],
-                fast_decode_kwargs["kv_indptr_cpu"],
+                q_indptr,
+                kv_indptr,
                 kv_indices,
-                fast_decode_kwargs["kv_len_arr_cpu"],
+                kv_lens,
                 self.num_local_heads,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,
@@ -656,6 +711,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
+        if global_server_args_dict["enable_mla_l1_5_cache"]:
+            self.num_local_heads = model_runner.model_config.num_attention_heads
         self.kv_cache_quant_method = model_runner.kv_cache_quant_method
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -672,6 +729,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.kv_indptr = attn_backend.kv_indptr
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
     def update(

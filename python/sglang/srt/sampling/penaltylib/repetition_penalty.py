@@ -64,10 +64,10 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
                 f"repetiton penalty _cumulate_output_tokens failed due to Exception: {str(e)}"
             )
 
-    def _update_multiply_penalty(self, multiply_penalty: torch.Tensor) -> torch.Tensor:
-        # multiply_penalty should be a tensor filled with 1
-        assert multiply_penalty is not None
-        multiply_penalty.mul_(self.cumulated_repetition_penalties)
+    def _update_scaling_penalty(self, scaling_penalty: torch.Tensor) -> torch.Tensor:
+        # sacling_penalty should be a tensor filled with 1
+        assert scaling_penalty is not None
+        scaling_penalty.mul_(self.cumulated_repetition_penalties)
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:
         try:

@@ -5,7 +5,7 @@ import triton.language as tl
 from typing import Tuple
 from transformers.models.llama.modeling_llama import repeat_kv
 from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
-from flash_attn_interface import flash_attn_with_kvcache
+from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
 
 from einops import rearrange
 

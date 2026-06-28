@@ -3,7 +3,11 @@ from typing import List, Optional
 import torch
 import triton
 
-import deep_gemm
+from sglang.srt.utils import supports_custom_op, is_npu
+
+__is_npu__ = is_npu()
+if not __is_npu__:
+    import deep_gemm
 
 from sglang.srt.layers.dense.gemms.fp8.triton import triton_w8a8_block_fp8_linear
 from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import sglang_per_token_group_quant_fp8
@@ -93,7 +97,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         )
     else:
         q_input, x_scale = input_2d, input_scale
-    
+
     output = dense_deep_gemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )

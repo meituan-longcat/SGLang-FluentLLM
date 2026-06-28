@@ -1,0 +1,3 @@
+  - func: compute_n_gram_ids(Tensor oe_weights, Tensor oe_mods, Tensor exclusive_oe_embeder_size_sums, Tensor tokens, Tensor exclusive_req_len_sums, Tensor oe_token_table, Tensor row_indices, Tensor column_starts, int batch_size, int oe_n, int oe_k, int max_context_len) -> Tensor
+    op_api: all_version
+    exposed: all_version

@@ -55,7 +55,7 @@ from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import TokenizerManager, tokenizer_encode_task
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -149,16 +149,13 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         try:
             model_name = request.model
-            tokenizer = self.tokenizer_manager.tokenizer
 
             if self.use_harmony:
                 messages, request_prompts, engine_prompts = (
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
-                    request, prev_response, tokenizer
-                )
+                messages, request_prompts, engine_prompts = await self._make_request(request, prev_response)
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -332,7 +329,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
-        tokenizer: Any,
     ):
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
@@ -348,7 +344,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Follow SGLang's _process_messages pattern
             is_multimodal = self.tokenizer_manager.model_config.is_multimodal
-            processed_messages = self._process_messages(chat_request, is_multimodal)
+            processed_messages = await self._process_messages(chat_request, is_multimodal)
 
             # Extract the results
             if is_multimodal:
@@ -366,7 +362,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 prompt_text += f"{role}: {content}\n"
-            prompt_ids = tokenizer.encode(prompt_text)
+            prompt_ids = await self.tokenizer_manager.run_tokenizer_task(tokenizer_encode_task, prompt_text)
             request_prompts = [prompt_ids]
             engine_prompts = [prompt_ids]
 

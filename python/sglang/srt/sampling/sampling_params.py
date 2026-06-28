@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
 
+from sglang.srt.utils import is_npu
+__is_npu__ = is_npu()
 
 class SamplingParams:
     """
@@ -29,7 +31,7 @@ class SamplingParams:
 
     def __init__(
         self,
-        max_new_tokens: int = 128,
+        max_new_tokens: Optional[int] = 128,
         stop: Optional[Union[str, List[str]]] = None,
         stop_token_ids: Optional[List[int]] = None,
         temperature: float = 1.0,
@@ -55,6 +57,12 @@ class SamplingParams:
         logit_bias: Optional[Dict[str, float]] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
+        if __is_npu__:
+            from sglang.srt.env import global_server_args_dict
+            npu_limit_max_new_tokens = global_server_args_dict["npu_limit_max_new_tokens"]
+            if npu_limit_max_new_tokens is not None and (
+                self.max_new_tokens is None or self.max_new_tokens > npu_limit_max_new_tokens):
+                self.max_new_tokens = npu_limit_max_new_tokens
         self.stop_strs = stop
         if stop_token_ids:
             self.stop_token_ids = set(stop_token_ids)
@@ -147,21 +155,3 @@ class SamplingParams:
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
-
-    def normalize(self, tokenizer):
-        # Process stop strings
-        if self.stop_strs is None:
-            self.stop_strs = []
-            self.stop_str_max_len = 0
-        else:
-            if isinstance(self.stop_strs, str):
-                self.stop_strs = [self.stop_strs]
-
-            stop_str_max_len = 0
-            for stop_str in self.stop_strs:
-                if tokenizer is not None:
-                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
-                else:
-                    stop_str_max_len = max(stop_str_max_len, len(stop_str))
-            self.stop_str_max_len = stop_str_max_len

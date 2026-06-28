@@ -9,9 +9,8 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
+    get_lm_head_tp_group, get_tp_group, get_attn_tp_group, GroupCoordinator, get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -19,9 +18,19 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import set_weight_attrs, get_colorful_logger
+
+from sglang.srt.utils import is_npu
+from sglang.srt.env import ENV
+
+__is_npu__ = is_npu()
+
+if __is_npu__:
+    import torch_npu
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+
+logger = get_colorful_logger(__name__)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -140,33 +149,59 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_org_elements <= self.num_org_elements_padded
         assert self.num_added_elements <= self.num_added_elements_padded
 
-
-@torch.compile
-def get_masked_input_and_mask(
-    input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    # torch.jit.script will fuse all of the pointwise ops below
-    # into a single kernel, making it very fast
-    org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
-    added_vocab_mask = (input_ >= added_vocab_start_index) & (
-        input_ < added_vocab_end_index
-    )
-    added_offset = (
-        added_vocab_start_index
-        - (org_vocab_end_index - org_vocab_start_index)
-        - num_org_vocab_padding
-    )
-    valid_offset = (org_vocab_start_index * org_vocab_mask) + (
-        added_offset * added_vocab_mask
-    )
-    vocab_mask = org_vocab_mask | added_vocab_mask
-    input_ = vocab_mask * (input_ - valid_offset)
-    return input_, ~vocab_mask
+if __is_npu__:
+    def get_masked_input_and_mask(
+        input_: torch.Tensor,
+        org_vocab_start_index: int,
+        org_vocab_end_index: int,
+        num_org_vocab_padding: int,
+        added_vocab_start_index: int,
+        added_vocab_end_index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # torch.jit.script will fuse all of the pointwise ops below
+        # into a single kernel, making it very fast
+        org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
+        added_vocab_mask = (input_ >= added_vocab_start_index) & (
+            input_ < added_vocab_end_index
+        )
+        added_offset = (
+            added_vocab_start_index
+            - (org_vocab_end_index - org_vocab_start_index)
+            - num_org_vocab_padding
+        )
+        valid_offset = (org_vocab_start_index * org_vocab_mask) + (
+            added_offset * added_vocab_mask
+        )
+        vocab_mask = org_vocab_mask | added_vocab_mask
+        input_ = vocab_mask * (input_ - valid_offset)
+        return input_, ~vocab_mask
+else:
+    @torch.compile
+    def get_masked_input_and_mask(
+        input_: torch.Tensor,
+        org_vocab_start_index: int,
+        org_vocab_end_index: int,
+        num_org_vocab_padding: int,
+        added_vocab_start_index: int,
+        added_vocab_end_index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # torch.jit.script will fuse all of the pointwise ops below
+        # into a single kernel, making it very fast
+        org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
+        added_vocab_mask = (input_ >= added_vocab_start_index) & (
+            input_ < added_vocab_end_index
+        )
+        added_offset = (
+            added_vocab_start_index
+            - (org_vocab_end_index - org_vocab_start_index)
+            - num_org_vocab_padding
+        )
+        valid_offset = (org_vocab_start_index * org_vocab_mask) + (
+            added_offset * added_vocab_mask
+        )
+        vocab_mask = org_vocab_mask | added_vocab_mask
+        input_ = vocab_mask * (input_ - valid_offset)
+        return input_, ~vocab_mask
 
 
 class VocabParallelEmbedding(torch.nn.Module):
@@ -219,16 +254,24 @@ class VocabParallelEmbedding(torch.nn.Module):
         prefix: str = "",
         enable_tp: bool = True,
         use_presharded_weights: bool = False,
+        comm_group: GroupCoordinator = None,
+        cpu_offload: bool = False,
     ):
         super().__init__()
         self.quant_config = quant_config
 
         self.enable_tp = enable_tp
         if self.enable_tp:
-            tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
+            if not is_npu():
+                self.comm_group = get_tp_group()
+                tp_rank = get_tensor_model_parallel_rank()
+                self.tp_size = get_tensor_model_parallel_world_size()
+            else:
+                self.comm_group = get_lm_head_tp_group() if comm_group == None else comm_group
+                tp_rank = self.comm_group.rank_in_group if self.comm_group else 0
+                self.tp_size = self.comm_group.world_size if self.comm_group else 1
         else:
-            tp_rank = 0
+            tp_rank=0
             self.tp_size = 1
 
         self.num_embeddings = num_embeddings
@@ -302,6 +345,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+
+        self.cpu_offload = cpu_offload
+        if cpu_offload:
+            logger.info(f"Vocab Using CPU_OFFLOAD.")
+            self.weight.data=self.weight.data.cpu()
 
     @classmethod
     def _get_indices(
@@ -452,11 +500,13 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
-    def forward(self, input_):
+    def forward(self, input_, global_sp_token_num=None, enable_sp=False, skip_pre_comm=False):
         if self.tp_size > 1:
+            g_input=self.pre_comm(input_, global_sp_token_num, skip_pre_comm)
+
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
-                input_,
+                g_input,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
                 self.shard_indices.num_org_vocab_padding,
@@ -466,22 +516,56 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
+        device = masked_input.device
+        if self.cpu_offload:
+            masked_input = masked_input.cpu()
         output_parallel = self.linear_method.embedding(self, masked_input.long())
+        if self.cpu_offload:
+            output_parallel = output_parallel.to(device)
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # Reduce across all the model parallel GPUs.
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            output=self.post_comm(output_parallel, global_sp_token_num, enable_sp)
         else:
             output = output_parallel
+            if enable_sp:
+                output=get_attn_tp_group().split_tensor(output, global_sp_token_num)
         return output
+
+    def pre_comm(self, input, global_sp_token_num, skip_pre_comm):
+        if not __is_npu__:
+            return input
+        else:
+            if get_attn_tp_group().world_size!=self.comm_group.world_size and not skip_pre_comm:
+                sp_attn_input=get_attn_tp_group().split_tensor(input, global_sp_token_num)
+                input=self.comm_group.gather_tensor(sp_attn_input, global_sp_token_num)
+                return input
+            else:
+                return input
+
+    def post_comm(self, output, global_sp_token_num, enable_sp):
+        if not __is_npu__:
+            return self.comm_group.all_reduce(output)
+        else:
+            if get_attn_tp_group().world_size!=self.comm_group.world_size:
+                sp_output = self.comm_group.scatter_tensor(output, global_sp_token_num)
+                if enable_sp:
+                    return sp_output
+                else:
+                    output = get_attn_tp_group().gather_tensor(sp_output, global_sp_token_num)
+                    return output
+            else:
+                if enable_sp:
+                    return self.comm_group.scatter_tensor(output, global_sp_token_num)
+                else:
+                    return self.comm_group.all_reduce(output)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
         s += f", embedding_dim={self.embedding_dim}"
         s += f", org_vocab_size={self.org_vocab_size}"
         s += f", num_embeddings_padded={self.num_embeddings_padded}"
-        if self.enable_tp:
+        if self.tp_group is not None:
             s += f", tp_size={self.tp_size}"
         return s
 

@@ -5,7 +5,6 @@ import torch
 from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, Tuple, List
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.distributed.utils import divide
 
 class KimiLinearConfig(PretrainedConfig):
@@ -153,6 +152,7 @@ class KimiLinearConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Tuple[List[Tuple[int, int]], Tuple[int, int, int], torch.dtype, torch.dtype, List[int]]:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
         world_size = get_attention_tp_size()
 
         num_heads=self.linear_attn_config["num_heads"]

@@ -24,6 +24,8 @@ import psutil
 import setproctitle
 import zmq
 
+# noinspection PyUnusedImports
+import sglang.srt.distributed  # 解决循环import
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,

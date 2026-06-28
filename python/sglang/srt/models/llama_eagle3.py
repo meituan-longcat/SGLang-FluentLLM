@@ -1,5 +1,3 @@
-from sglang.srt.utils import add_prefix
-
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
@@ -10,6 +8,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.layers.dense.mlp import ParallelMLP
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -22,14 +21,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
-from sglang.srt.models.longcat_flash import LlamaMLP
-
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils import add_prefix, get_colorful_logger
 
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.layers.dp_attention import get_attention_tp_group, get_dense_tp_group
 
 logger = get_colorful_logger(__name__)
+
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
@@ -49,8 +47,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             self.self_attn.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            tp_rank=self.self_attn.attn_tp_rank,
-            tp_size=self.self_attn.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
 
@@ -59,7 +55,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         else:
             inter_size = config.intermediate_size
 
-        self.mlp = LlamaMLP(
+        self.mlp = ParallelMLP(
             config.hidden_size, inter_size, config.hidden_act, quant_config, prefix=f"{prefix}.mlp",
         )
 
@@ -113,7 +109,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         tp_num_tokens: int = 0,
         final_norm: RMSNorm = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         if tp_num_tokens < global_server_args_dict["flashinfer_comm_max_num_tokens"]:
             return self.forward_low_latency(
                 positions,
@@ -168,6 +163,7 @@ class LlamaModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
         self.num_fc_input_dim = len(config.eagle_aux_hidden_state_layer_ids) if hasattr(config, "eagle_aux_hidden_state_layer_ids") else 3
@@ -191,6 +187,10 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[-1] != embeds.shape[-1]:
             hidden_states = self.fc(hidden_states)
 
+        # embeds.shape[0] is 0 in idle batch run, set hidden_states eq to embeds
+        if embeds.shape[0] == 0:
+            hidden_states = embeds.clone()
+
         residual = None
         tp_num_tokens = hidden_states.shape[0]
         hidden_states, residual = self.midlayer(
@@ -208,6 +208,7 @@ class LlamaModel(nn.Module):
             hidden_states_to_logits, hidden_states_to_aux = self.norm(
                 hidden_states, residual
             )
+
             hidden_states_to_logits, _ = self.midlayer.decoder_comm_manager.post_final_norm_comm(hidden_states_to_logits, None, tp_num_tokens)
             hidden_states_to_aux, _ = self.midlayer.decoder_comm_manager.post_final_norm_comm(hidden_states_to_aux, None, tp_num_tokens)
 

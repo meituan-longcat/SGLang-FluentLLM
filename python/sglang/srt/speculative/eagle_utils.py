@@ -4,30 +4,38 @@ import dataclasses
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.utils import get_colorful_logger, is_cuda_available
+from sglang.srt.utils import get_colorful_logger, is_cuda_available, is_npu
+from sglang.srt.utils.common import get_device
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 
-from sglang.srt.utils import is_npu
 __is_npu__ = is_npu()
 
 logger = get_colorful_logger(__name__)
 
-if is_cuda_available():
-    from flashinfer.sampling import top_k_renorm_prob, top_p_renorm_probs, verify_chain_greedy, chain_speculative_sampling_target_only
+if __is_npu__:
+    from sglang.srt.speculative.npu_eagle_utils import (
+        npu_create_extend_spec_info,
+        npu_verify,
+    )
+else:
+    from sglang.srt.speculative.gpu_eagle_utils import (
+        gpu_verify,
+        generate_draft_decode_kv_indices,
+        generate_attn_arg_v2,
+        generate_attn_arg_prefill,
+        update_oe_metadata_kernel,
+    )
 
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-from sglang.srt.env import global_server_args_dict
 
 
 @dataclasses.dataclass
@@ -71,22 +79,26 @@ class EagleDraftInput:
             pt += extend_seq_len
 
     def prepare_extend_after_decode(self, forward_batch: ForwardBatch, use_oe: bool=False):
-        new_verified_id = torch.empty_like(self.accept_length, dtype=torch.long)
-        create_extend_spec_info[(forward_batch.batch_size,)](
-            self.verified_id,
-            new_verified_id,
-            self.accept_length,
-            forward_batch.oe_column_starts,
-            forward_batch.oe_req_lens,
-            forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.verified_lens,
-            self.draft_token_num,
-            forward_batch.batch_size,
-            use_oe
-        )
-        # Accepted tokens (padded)
+        new_verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+        if __is_npu__:
+            npu_create_extend_spec_info(
+                self.verified_id, self.accept_index, self.accept_length, new_verified_id
+            )
+        else:
+            create_extend_spec_info[(forward_batch.batch_size,)](
+                self.verified_id,
+                new_verified_id,
+                self.accept_length,
+                forward_batch.oe_column_starts,
+                forward_batch.oe_req_lens,
+                forward_batch.req_pool_indices,
+                forward_batch.req_to_token_pool.verified_lens,
+                self.draft_token_num,
+                forward_batch.batch_size,
+                use_oe
+            )
+
         forward_batch.input_ids = self.verified_id
-        # Extract the last accepted token for each request
         self.verified_id = new_verified_id
         return self.verified_id
 
@@ -165,10 +177,11 @@ class EagleVerifyInput:
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
-    spec_steps: int
+    spec_steps: int  # TODO: 废弃tree模式后，此参数不再有意义
     capture_hidden_mode: CaptureHiddenMode
     is_all_greedy: bool
     grammar: BaseGrammarObject = None
+    cumulated_scaling_penalties: torch.Tensor = None
 
     @classmethod
     def create(
@@ -183,8 +196,8 @@ class EagleVerifyInput:
     ):
         if is_idle:
             return cls(
-                torch.empty(0, dtype=torch.int32, device="cuda"),
-                torch.empty(0, dtype=torch.int32, device="cuda"),
+                torch.empty(0, dtype=torch.int32, device=get_device()),
+                torch.empty(0, dtype=torch.int32, device=get_device()),
                 0,
                 spec_steps,
                 CaptureHiddenMode.LAST,
@@ -214,122 +227,49 @@ class EagleVerifyInput:
     ) -> torch.Tensor:
         bs = forward_batch.batch_size
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-        predict = torch.zeros(predict_shape, dtype=torch.int32, device="cuda")
-        accept_index = torch.full(
-            (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
-        )
-        accept_length = torch.empty((bs,), dtype=torch.int32, device="cuda")
 
-        # Apply grammar mask
+        apply_scaling_penalties(logits_output.next_token_logits, torch.repeat_interleave(
+            forward_batch.spec_info.cumulated_scaling_penalties, self.draft_token_num, dim=0
+        ))
+
         if vocab_mask is not None:
             assert self.grammar is not None
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        if forward_batch.spec_info.is_all_greedy:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
-            verify_chain_greedy(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates.to(torch.int32),
-                target_predict=target_predict,
-                batch_size=bs,
-                num_draft_tokens=self.draft_token_num
+        if __is_npu__:
+            predicts, accept_length, rearranged_accept_index = npu_verify(
+                self, forward_batch, logits_output, candidates, bs
             )
         else:
-            sampling_info = forward_batch.sampling_info
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
-            )  # (bs * draft_token_num, 1)
+            predicts, accept_length, rearranged_accept_index = gpu_verify(
+                self, forward_batch, logits_output, candidates, bs
+            )
 
-            target_probs = F.softmax(
-                logits_output.next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_p_renorm_probs(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
-            target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
-
-            draft_probs = torch.zeros(
-                target_probs.shape, dtype=torch.float32, device="cuda"
-            )
-            coins = torch.rand_like(candidates, dtype=torch.float32, device="cuda")
-            coins_for_final_sampling = torch.rand(
-                (bs,), dtype=torch.float32, device="cuda"
-            )
-            chain_speculative_sampling_target_only(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
-                candidates=candidates.to(torch.int32),
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=global_server_args_dict[
-                    "speculative_accept_threshold_single"
-                ],
-                threshold_acc=global_server_args_dict[
-                    "speculative_accept_threshold_acc"
-                ],
-                deterministic=True,
-            )
-        rearranged_accept_index = torch.zeros_like(predict)
-        rearrange_accept_index[(bs,)](
-            accept_index_ptr=accept_index,
-            accept_length_ptr=accept_length,
-            output_ptr=rearranged_accept_index,
-            num_tokens_per_req_upper=triton.next_power_of_2(self.draft_token_num),
-            accept_index_stride=accept_index.shape[1],
-        )
-        return predict, logits_output, accept_length, rearranged_accept_index
+        return predicts, logits_output, accept_length, rearranged_accept_index
 
 
 def update_oe_metadata(forward_batch: ForwardBatch, draft_decode_step: int, spec_num_steps: int):
-    bs = forward_batch.batch_size
-    update_oe_metadata_kernel[(bs,)](
-        oe_out_column_starts_ptr=forward_batch.oe_out_column_starts,
-        oe_column_starts_ptr=forward_batch.oe_column_starts,
-        oe_out_req_lens_ptr=forward_batch.oe_out_req_lens,
-        oe_req_lens_ptr=forward_batch.oe_req_lens,
-        verified_len_ptr=forward_batch.req_to_token_pool.verified_lens,
-        req_pool_indices_ptr=forward_batch.req_pool_indices,
-        draft_decode_step=draft_decode_step,
-        spec_num_steps=spec_num_steps
-    )
-
-@triton.jit
-def update_oe_metadata_kernel(
-    oe_out_column_starts_ptr,
-    oe_column_starts_ptr,
-    oe_out_req_lens_ptr,
-    oe_req_lens_ptr,
-    verified_len_ptr,
-    req_pool_indices_ptr,
-    draft_decode_step: tl.constexpr,
-    spec_num_steps: tl.constexpr
-):
-    pid = tl.program_id(axis=0)
-    req_idx = tl.load(req_pool_indices_ptr + pid)
-    veridied_len = tl.load(verified_len_ptr + req_idx)
-    tl.store(oe_out_column_starts_ptr + pid, veridied_len + 1 + draft_decode_step)
-    tl.store(oe_out_req_lens_ptr + pid, 1)
-    if draft_decode_step < spec_num_steps - 1:
-        tl.store(oe_column_starts_ptr + pid, veridied_len + 1 + draft_decode_step)
-        tl.store(oe_req_lens_ptr + pid, 1)
+    if __is_npu__:
+        verified_lens=forward_batch.req_to_token_pool.verified_lens[forward_batch.req_pool_indices]
+        forward_batch.oe_out_column_starts[:forward_batch.batch_size]= verified_lens+1+ draft_decode_step
+        forward_batch.oe_out_req_lens[:forward_batch.batch_size]=1
+        if draft_decode_step<spec_num_steps-1:
+            forward_batch.oe_column_starts[:forward_batch.batch_size] = verified_lens+1+ draft_decode_step
+            forward_batch.oe_req_lens[:forward_batch.batch_size]=1
+    else:
+        bs=forward_batch.batch_size
+        update_oe_metadata_kernel[(bs,)](
+            oe_out_column_starts_ptr=forward_batch.oe_out_column_starts,
+            oe_column_starts_ptr=forward_batch.oe_column_starts,
+            oe_out_req_lens_ptr=forward_batch.oe_out_req_lens,
+            oe_req_lens_ptr=forward_batch.oe_req_lens,
+            verified_len_ptr=forward_batch.req_to_token_pool.verified_lens,
+            req_pool_indices_ptr=forward_batch.req_pool_indices,
+            draft_decode_step=draft_decode_step,
+            spec_num_steps=spec_num_steps
+        )
 
 @triton.jit
 def update_draft_decode_cache_kernel(
@@ -376,7 +316,7 @@ def create_extend_spec_info(
     verified_lens_ptr,
     spec_num_tokens: int,
     batch_size: int,
-    use_oe: tl.constexpr 
+    use_oe: tl.constexpr
 ):
     pid = tl.program_id(axis=0)
     if pid >= batch_size:
@@ -391,137 +331,6 @@ def create_extend_spec_info(
     tl.store(accept_length_ptr + pid, accept_len + 1)
     tl.store(new_verified_id + pid, last_verified_id)
 
-@triton.jit
-def rearrange_accept_index(
-    accept_index_ptr,
-    accept_length_ptr,
-    output_ptr,
-    num_tokens_per_req_upper: tl.constexpr,
-    accept_index_stride: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    accept_len = tl.load(accept_length_ptr + pid) + 1
-    cum_accept_len = 0
-    for i in range(pid):
-        cum_accept_len += (tl.load(accept_length_ptr + i) + 1)
-    store_offset = tl.arange(0, num_tokens_per_req_upper)
-    accept_index_load_offset = (
-        tl.arange(0, num_tokens_per_req_upper) + pid * accept_index_stride
-    )
-    accept_index = tl.load(accept_index_ptr + accept_index_load_offset)
-    tl.store(
-        output_ptr + store_offset + cum_accept_len,
-        accept_index,
-        mask=store_offset < accept_len,
-    )
-
-
-@triton.jit
-def assign_req_to_token_pool(
-    req_pool_indices,
-    req_to_token,
-    start_offset,
-    end_offset,
-    out_cache_loc,
-    pool_len: tl.constexpr,
-    bs_upper: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 32
-    pid = tl.program_id(axis=0)
-    kv_start = tl.load(start_offset + pid)
-    kv_end = tl.load(end_offset + pid)
-    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
-
-    length_offset = tl.arange(0, bs_upper)
-    start = tl.load(start_offset + length_offset, mask=length_offset < pid)
-    end = tl.load(end_offset + length_offset, mask=length_offset < pid)
-    out_offset = tl.sum(end - start, axis=0)
-
-    out_cache_ptr = out_cache_loc + out_offset
-
-    save_offset = tl.arange(0, BLOCK_SIZE) + kv_start
-    load_offset = tl.arange(0, BLOCK_SIZE)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for _ in range(num_loop):
-        mask = save_offset < kv_end
-        data = tl.load(out_cache_ptr + load_offset, mask=mask)
-        tl.store(token_pool + save_offset, data, mask=mask)
-        save_offset += BLOCK_SIZE
-        load_offset += BLOCK_SIZE
-
-if not __is_npu__:
-    @triton.jit(
-        do_not_specialize_on_alignment=["num_seqs", "kv_indices_stride"],
-    )
-    def generate_draft_decode_kv_indices(
-        req_pool_indices,
-        req_to_token,
-        paged_kernel_lens,
-        kv_indices,  # shape: [self.speculative_num_steps, forward_batch.batch_size * self.topk * self.max_context_len], records slot address for topk at each position for each step
-        kv_indptr,  # shape: [self.speculative_num_steps, max_batch_size * topk + 1], records starting address of topk for each step
-        positions,
-        num_seqs: int,
-        kv_indices_stride: int,
-        topk: tl.constexpr,
-        pool_len: tl.constexpr,
-        kv_indptr_stride: tl.constexpr,
-        max_bs: tl.constexpr,
-        iter_upper: tl.constexpr,
-        max_num_tokens: tl.constexpr,
-    ):
-        """
-        Rewrite req to token mapping from request-isolated to spec_step-isolated in kv_indices
-        """
-        BLOCK_SIZE: tl.constexpr = 128
-        iters = tl.program_id(axis=0)  # Which round of draft
-        bid = tl.program_id(axis=1)  # Specific seq in batch
-        topk_id = tl.program_id(axis=2)  # Which one in topk
-
-        kv_indices += kv_indices_stride * iters
-        kv_indptr += kv_indptr_stride * iters
-        iters += 1
-
-        load_offset = tl.arange(0, max_bs)
-        # Lengths of all seqs in batch
-        seq_lens = tl.load(paged_kernel_lens + load_offset, mask=load_offset < bid)
-        # Current seq length
-        seq_len = tl.load(paged_kernel_lens + bid)
-        cum_seq_len = tl.sum(seq_lens)
-
-        kv_offset = cum_seq_len * topk + bid * iters * topk + topk_id * (seq_len + iters)
-        # Write position
-        kv_ptr = kv_indices + kv_offset
-        token_pool_ptr = req_to_token + tl.load(req_pool_indices + bid) * pool_len
-
-        kv_offset = tl.arange(0, BLOCK_SIZE)
-        num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-        # Block copy, copy info from original req_token_pool to buffer
-        for _ in range(num_loop):
-            mask = kv_offset < seq_len
-            data = tl.load(token_pool_ptr + kv_offset, mask=mask)
-            tl.store(kv_ptr + kv_offset, data, mask=mask)
-            kv_offset += BLOCK_SIZE
-
-        extend_offset = tl.arange(0, iter_upper)
-        # Block copy, copy slot addresses from corresponding positions in req_to_token to kv_indices
-        extend_data = tl.load(
-            token_pool_ptr + seq_len + tl.arange(0, iter_upper) * topk + topk_id,
-            mask=extend_offset < iters,
-        )
-        tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)
-
-        # Update kv_indptr
-        bs_offset = tl.arange(0, max_num_tokens)
-
-        zid = bid * topk + topk_id
-        if zid == 0:
-            zid = num_seqs * topk
-        positions = tl.load(positions + bs_offset, mask=bs_offset < zid)
-        base = tl.sum(positions)
-        tl.store(kv_indptr + zid, base + zid * iters)
-
-
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index
@@ -530,92 +339,6 @@ def fast_topk(values, topk, dim):
     else:
         # Use topk for efficiency with larger k values
         return torch.topk(values, topk, dim=dim)
-
-def generate_attn_arg_v2(
-    draft_token_num: int,
-    req_pool_indices: torch.Tensor,
-    paged_kernel_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    kv_indices_buf: torch.Tensor,
-    is_draft_decode: bool = False,
-    draft_decode_step: int = None
-):
-    batch_size = req_pool_indices.shape[0]
-    qo_indptr = torch.empty((batch_size + 1,), device="cuda", dtype=torch.int32)
-    cum_kv_lens = torch.empty((batch_size + 1,), device="cuda", dtype=torch.int32)
-    assert kv_indices_buf is not None
-    generate_attn_arg_v2_kernel[(batch_size,)](
-        req_pool_indices_ptr=req_pool_indices,
-        paged_kernel_lens_ptr=paged_kernel_lens,
-        req_to_token_ptr=req_to_token,
-        qo_indptr=qo_indptr,
-        cum_kv_seq_len_ptr=cum_kv_lens,
-        kv_indices_ptr=kv_indices_buf,
-        req_to_token_ptr_stride=req_to_token.size(1),
-        draft_token_num=draft_token_num,
-        draft_decode_step=draft_decode_step,
-        is_draft_decode=is_draft_decode,
-        bs_upper=triton.next_power_of_2(batch_size)
-    )
-    return kv_indices_buf, cum_kv_lens, qo_indptr
-
-@triton.jit
-def generate_attn_arg_v2_kernel(
-    req_pool_indices_ptr,
-    paged_kernel_lens_ptr,
-    req_to_token_ptr,
-    qo_indptr,
-    cum_kv_seq_len_ptr,
-    kv_indices_ptr,
-    req_to_token_ptr_stride: tl.constexpr,
-    draft_token_num: tl.constexpr,
-    draft_decode_step: tl.constexpr,
-    bs_upper: tl.constexpr,
-    is_draft_decode: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 4096
-    bx = tl.program_id(axis=0)
-    if bx == 0:
-        tl.store(qo_indptr, 0)
-        tl.store(cum_kv_seq_len_ptr, 0)
-
-    indices = tl.arange(0, bs_upper)
-    paged_kernel_lens = tl.load(paged_kernel_lens_ptr + indices, mask=(indices <= bx), other=0)
-    if is_draft_decode:
-        paged_kernel_lens += tl.where(paged_kernel_lens != 0, draft_decode_step + 1, 0)
-    else:
-        paged_kernel_lens += tl.where(paged_kernel_lens != 0, draft_token_num, 0)
-
-    cum_kv_len = tl.sum(paged_kernel_lens)
-    if is_draft_decode:
-        tl.store(qo_indptr + bx + 1, bx + 1)
-    else:
-        tl.store(qo_indptr + bx + 1, (bx + 1) * draft_token_num)
-
-    tl.store(cum_kv_seq_len_ptr + bx + 1, cum_kv_len)
-
-    req_pool_index = tl.load(req_pool_indices_ptr + bx)
-    cur_paged_kernel_len = tl.sum(tl.where(indices==bx, paged_kernel_lens, 0))
-    #kv_indices_offset = cum_kv_len - tl.load(paged_kernel_lens_ptr + bx)
-    kv_indices_offset = cum_kv_len - cur_paged_kernel_len
-
-    kv_start = 0
-    kv_end = cur_paged_kernel_len
-    #kv_end = tl.load(paged_kernel_lens_ptr + bx)
-
-    num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < kv_end - kv_start
-        data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
-            mask=mask,
-        )
-        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
-
 
 @triton.jit
 def prepare_for_multi_step_draft_kernel(
@@ -626,7 +349,7 @@ def prepare_for_multi_step_draft_kernel(
     seq_lens_sum_ptr,
     req_to_token_ptr,
     out_cache_loc_ptr,
-    req_to_token_ptr_stride: tl.constexpr, 
+    req_to_token_ptr_stride: tl.constexpr,
     spec_num_steps: tl.constexpr,
     bs: tl.constexpr,
     bs_upper: tl.constexpr
@@ -675,57 +398,6 @@ def prepare_for_multi_step_draft_kernel(
                     data,
                     mask=mask,
                 )
-
-
-def generate_attn_arg_prefill(
-    draft_token_num: int,
-    req_pool_indices: torch.Tensor,
-    paged_kernel_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    kv_indices_buf: torch.Tensor = None,
-    draft_decode_step: int = None
-):
-    batch_size = req_pool_indices.shape[0]
-    if draft_decode_step is not None:
-        qo_indptr = torch.arange(
-            0,
-            (1 + batch_size),
-            step=1,
-            dtype=torch.int32,
-            device="cuda",
-        )
-    else:
-        qo_indptr = torch.arange(
-            0,
-            (1 + batch_size) * draft_token_num,
-            step=draft_token_num,
-            dtype=torch.int32,
-            device="cuda",
-        )
-
-    cum_kv_seq_len = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
-
-    if draft_decode_step is None:
-        paged_kernel_lens = paged_kernel_lens + draft_token_num
-    else:
-        paged_kernel_lens = paged_kernel_lens + draft_decode_step + 1
-
-    cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-    if kv_indices_buf is not None:
-        kv_indices = kv_indices_buf
-    else:
-        # Prevent kv_indices out of bounds in large steps
-        kv_indices = torch.empty(cum_kv_seq_len[-1] + 256, dtype=torch.int32, device="cuda")
-    create_flashinfer_kv_indices_triton[(batch_size,)](
-        req_to_token,
-        req_pool_indices,
-        paged_kernel_lens,
-        cum_kv_seq_len,
-        None,
-        kv_indices,
-        req_to_token.size(1),
-    )
-    return kv_indices, cum_kv_seq_len, qo_indptr, None
 
 
 # copied from sglang: https://github.com/sgl-project/sglang
@@ -840,3 +512,36 @@ def generate_token_bitmask(
 
     verify_input.grammar = outer_grammar
     return allocate_token_bitmask
+
+
+@triton.jit
+def cumulate_output_tokens_kernel(
+    output_ids_ptr,  # [batch_size * tokens_per_request]
+    accept_lens_ptr,  # [batch_size]
+    req_pool_indices_ptr,  # [batch_size]
+    cumulated_penalty_ptr,  # [pool_size, vocab_size]
+    scaling_penalties_ptr, # [batch_size]
+    tokens_per_request: tl.constexpr,
+    vocab_size: tl.constexpr,
+):
+    """
+    Triton kernel to cumulate output tokens for penalty calculation.
+
+    Each program handles one request in the batch.
+    For each request, we iterate through the accepted tokens and update the penalty matrix.
+    """
+    pid = tl.program_id(0)
+    accept_len = tl.load(accept_lens_ptr + pid)
+    pool_idx = tl.load(req_pool_indices_ptr + pid)
+    output_start = pid * tokens_per_request
+    scaling_penalty = tl.load(scaling_penalties_ptr + pid)
+
+    for i in range(tokens_per_request):
+        # 1 is for bouns token
+        if i < accept_len + 1:
+            # Load the token id
+            token_id = tl.load(output_ids_ptr + output_start + i)
+
+            # Calculate the position in the penalty matrix
+            penalty_offset = pool_idx * vocab_size + token_id
+            tl.store(cumulated_penalty_ptr + penalty_offset, scaling_penalty)

@@ -153,6 +153,12 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    decode_cache_hit_rate: float = 0.0  # decode cache hit rate
+    
+    # HiCache L1/L2/L3 hit rates
+    hicache_l1_hit_rate: float = 0.0  # GPU cache hit rate
+    hicache_l2_hit_rate: float = 0.0  # CPU/Host cache hit rate
+    hicache_l3_hit_rate: float = 0.0  # Storage cache hit rate
 
     # Retract
     total_retracted_reqs: int = 0
@@ -278,6 +284,32 @@ class SchedulerMetricsCollector:
         self.kv_transfer_latency_ms = Gauge(
             name="sglang:kv_transfer_latency_ms",
             documentation="The transfer latency of the KV cache in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.decode_cache_hit_rate = Gauge(
+            name="sglang:decode_cache_hit_rate",
+            documentation="The decode cache hit rate (prefix_len / origin_input_ids).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        
+        # HiCache L1/L2/L3 metrics
+        self.hicache_l1_hit_rate = Gauge(
+            name="sglang:hicache_l1_hit_rate",
+            documentation="The HiCache L1 (GPU) cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l2_hit_rate = Gauge(
+            name="sglang:hicache_l2_hit_rate",
+            documentation="The HiCache L2 (Host/CPU) cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.hicache_l3_hit_rate = Gauge(
+            name="sglang:hicache_l3_hit_rate",
+            documentation="The HiCache L3 (Storage) cache hit rate.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -552,6 +584,10 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
+        self._log_gauge(self.decode_cache_hit_rate, stats.decode_cache_hit_rate)
+        self._log_gauge(self.hicache_l1_hit_rate, stats.hicache_l1_hit_rate)
+        self._log_gauge(self.hicache_l2_hit_rate, stats.hicache_l2_hit_rate)
+        self._log_gauge(self.hicache_l3_hit_rate, stats.hicache_l3_hit_rate)
 
         # Retract
         self._log_gauge(self.total_retracted_reqs, stats.total_retracted_reqs)
@@ -570,6 +606,10 @@ class SchedulerMetricsCollector:
             # PD disaggregation metrics
             self.cat_reporter.log_count("PrefillPreallocQueueReqs", stats.num_prefill_prealloc_queue_reqs)
             self.cat_reporter.log_count("PrefillInflightQueueReqs", stats.num_prefill_inflight_queue_reqs)
+            # HiCache metrics
+            self.cat_reporter.log_count("HiCacheL1HitRate", stats.hicache_l1_hit_rate * 100)
+            self.cat_reporter.log_count("HiCacheL2HitRate", stats.hicache_l2_hit_rate * 100)
+            self.cat_reporter.log_count("HiCacheL3HitRate", stats.hicache_l3_hit_rate * 100)
         else:
             self.cat_reporter.log_count("GenThroughput", stats.gen_throughput)
             if stats.spec_accept_length != 0:
@@ -577,6 +617,7 @@ class SchedulerMetricsCollector:
             # PD disaggregation metrics
             self.cat_reporter.log_count("DecodePreallocQueueReqs", stats.num_decode_prealloc_queue_reqs)
             self.cat_reporter.log_count("DecodeTransferQueueReqs", stats.num_decode_transfer_queue_reqs)
+            self.cat_reporter.log_count("DecodeCacheHitRate", stats.decode_cache_hit_rate * 100)
 
         #   9.22 SGLang open source community has not yet implemented actual recording of KVTransferSpeedGBs and other data, pending future cherry-pick
         #   self.cat_reporter.log_count("KVTransferSpeedGBs", stats.kv_transfer_speed_gb_s)
@@ -608,6 +649,10 @@ class SchedulerMetricsCollector:
             self._log_llm_platform(stats, is_prefill)
 
         self.last_log_time = time.time()
+
+    def observe_module_time_in_scheduler(self, step_time: float, name: str="scheduler_module"):
+        if self.enable_cat:
+            self.cat_reporter.log_duration(name, step_time)
 
 
 class TokenizerMetricsCollector:
@@ -784,12 +829,12 @@ class TokenizerMetricsCollector:
             self.cat_reporter.log_duration("RequestTime", e2e_latency)
             self.cat_reporter.log_duration("TokenizedTime", tokenized_duration)
 
-    def observe_time_to_first_token(self, value: float):
+    def observe_time_to_first_token(self, value: float, name: str = "TTFT"):
         if self.enable_prometheus:
             self.histogram_time_to_first_token.labels(**self.labels).observe(value)
 
         if self.enable_cat:
-            self.cat_reporter.log_duration("TTFT", value)
+            self.cat_reporter.log_duration(name, value)
 
     def observe_inter_token_latency(self, internval: float, num_new_tokens: int, name: str="TPOT"):
         adjusted_interval = internval / num_new_tokens
@@ -807,7 +852,7 @@ class TokenizerMetricsCollector:
 
         if self.enable_cat:
             self.cat_reporter.log_duration(name, adjusted_interval)
-        
+
     def observe_request_arrival(self, batch_size: int = 1):
         if self.enable_prometheus:
             pass
@@ -828,14 +873,14 @@ class ErrorMetricsCollector:
         # Currently only cat logging is supported
         if not self.enable_cat:
             return
-        
+
         if "KVTransferError" in error_message:
             match = re.search(r'remote_endpoint=([^,\)]+)', error_message)
             remote_dir = match.group(1) if match else "not found"
             formatted_error = f"KVTransferError, remote_dir={remote_dir}"
         else:
             formatted_error = "OtherError"
-            
+
         self.cat_reporter.log_error(formatted_error)
 
 class KVTransferMetricsCollector:
@@ -860,12 +905,40 @@ class KVTransferMetricsCollector:
             return
 
         self.cat_reporter.log_count(f"KVTransferFailed", 1)
-    
+
     def log_kv_transfer_size(self, transfer_size_bytes: int) -> None:
         if not self.enable_cat:
             return
 
         self.cat_reporter.log_count("KVTransferSizeBytes", transfer_size_bytes)
+
+    def log_kv_transfer_time(self, transfer_time: float) -> None:
+        if not self.enable_cat:
+            return
+
+        self.cat_reporter.log_duration("KVTransferTime", transfer_time)
+
+class EPLBMetricsCollector:
+    def __init__(self, labels: Dict[str, str], metrics_reporters: List[str]) -> None:
+        self.enable_cat = 'cat' in metrics_reporters
+
+        if self.enable_cat:
+            self.cat_reporter = get_cat_reporter(
+                labels.get('model_name', 'DefaultModel'),
+                labels.get('app_key', 'DefaultAppKey')
+            )
+
+    def log_gpu_unbalancedness(self, per_device_metrics) -> None:
+        if not self.enable_cat:
+            return
+
+        self.cat_reporter.log_duration(f"PerDeviceUnbalancedness", per_device_metrics * 100)
+
+    def log_expert_unbalancedness(self, per_expert_metrics) -> None:
+        if not self.enable_cat:
+            return
+
+        self.cat_reporter.log_duration(f"PerExpertUnbalancedness", per_expert_metrics * 100)
 
 @dataclass
 class StorageMetrics:

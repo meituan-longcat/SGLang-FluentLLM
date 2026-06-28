@@ -15,30 +15,32 @@
 from dataclasses import dataclass
 from enum import Enum, auto
 import math
+import os
 from typing import Callable, NamedTuple, Optional, Protocol, runtime_checkable
 from typing_extensions import TypeGuard
 
 import torch
 import torch.nn.functional as F
 
-import flashinfer
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.utils import get_compiler_backend, get_bool_env_var, is_cuda, is_npu
-from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers import expert_location_dispatch
 from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo, topk_ids_logical_to_physical
-
-
-try:
-    from flashinfer import topk_softmax, moe_fused_gate
-except ImportError as e:
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.error(f"Failed to import from flashinfer: {e}")
-    raise
+from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+if not _is_npu:
+    import flashinfer
+    try:
+        from flashinfer import topk_softmax, moe_fused_gate
+    except ImportError as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to import from flashinfer: {e}")
+        raise
 
 
 _USE_EPS_TOPK_SIGMOID = get_bool_env_var("USE_EPS_TOPK_SIGMOID", "true")
@@ -280,15 +282,16 @@ class TopKOutput(Protocol):
         """The format of the output."""
         ...
 
+if not _is_npu:
+    class TopKOutputChecker:
 
-class TopKOutputChecker:
+        @staticmethod
+        def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
+            return topk_output.format.is_standard()
 
-    @staticmethod
-    def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        return topk_output.format.is_standard()
-
-    def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
-        return topk_output.format.is_bypassed()
+        # commit 25cf2e6bcd7ea54e353387de75781129e4f9459b “remove triton_kernels (#518)”中删除了@staticmethod，疑为误删。
+        def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
+            return topk_output.format.is_bypassed()
 
 
 class TopK(CustomOp):
@@ -775,7 +778,6 @@ def select_experts(
         topk_config.apply_routed_scaling_factor_on_output
     )
 
-    from sglang.srt.managers import expert_location_dispatch
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
             router_logits=router_logits,

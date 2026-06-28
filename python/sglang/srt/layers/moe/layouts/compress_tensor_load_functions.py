@@ -31,6 +31,7 @@ def _load_model_weight_or_group_weight_scale(
     shard_id: str,
     loaded_weight: torch.tensor,
     tp_rank: int,
+    use_presharded_weights: bool = False,
 ):
     # Load grouped weight scales for group quantization
     # or model weights
@@ -41,6 +42,7 @@ def _load_model_weight_or_group_weight_scale(
             loaded_weight=loaded_weight,
             expert_data=expert_data,
             tp_rank=tp_rank,
+            use_presharded_weights=use_presharded_weights,
         )
     elif shard_id in ("w1", "w3"):
         _load_w13(
@@ -49,6 +51,7 @@ def _load_model_weight_or_group_weight_scale(
             loaded_weight=loaded_weight,
             expert_data=expert_data,
             tp_rank=tp_rank,
+            use_presharded_weights=use_presharded_weights,
         )
 
 def _load_per_channel_weight_scale(
@@ -57,6 +60,7 @@ def _load_per_channel_weight_scale(
     shard_id: str,
     loaded_weight: torch.tensor,
     tp_rank: int,
+    use_presharded_weights: bool = False,
 ):
     # for per channel weight quantization
     if shard_id == "w2":
@@ -68,6 +72,7 @@ def _load_per_channel_weight_scale(
             loaded_weight=loaded_weight,
             expert_data=expert_data,
             tp_rank=tp_rank,
+            use_presharded_weights=use_presharded_weights,
         )
 
 def _load_w13(
@@ -76,12 +81,12 @@ def _load_w13(
     shard_id: str,
     loaded_weight: torch.tensor,
     tp_rank: int,
+    use_presharded_weights: bool = False,
 ):
 
     # Index the loaded weight for tp sharding.
     # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
     shard_size = expert_data.shape[shard_dim] // 2
-    use_presharded_weights = False
 
     if not use_presharded_weights:
         loaded_weight = loaded_weight.narrow(
@@ -104,13 +109,13 @@ def _load_w2(
     shard_id: str,
     loaded_weight: torch.tensor,
     tp_rank: int,
+    use_presharded_weights: bool = False,
 ):
 
     # Index the loaded weight for tp sharding.
     # down_proj: "RowParallel" so tp sharding on input_dim
     # Narrow parameter and load.
     shard_size = expert_data.shape[shard_dim]
-    use_presharded_weights = False
 
     if not use_presharded_weights:
         loaded_weight = loaded_weight.narrow(

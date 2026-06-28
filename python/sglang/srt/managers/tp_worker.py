@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 import os
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.utils import get_colorful_logger, is_npu
 import threading
@@ -67,10 +68,24 @@ class TpModelWorker:
         is_draft_worker: bool = False,
         req_to_token_pool= None,
         kv_allocator=None,
-        oe_token_table=None
+        oe_token_table=None,
+        enable_overlap: bool = False,
+        is_multi_head_eagle: bool = False,
     ):
         # Parse args
+        self.server_args = server_args
+        self.gpu_id = gpu_id
         self.attn_tp_rank = attn_tp_rank
+        self.pp_rank = global_rank // server_args.tp_size
+        self.pp_size=server_args.pp_size
+        self.moe_ep_rank = moe_ep_rank
+        self.global_rank = global_rank
+        self.nccl_port = nccl_port
+        self.is_draft_worker = is_draft_worker
+        self.req_to_token_pool = req_to_token_pool
+        self.kv_allocator = kv_allocator
+        self.oe_token_table = oe_token_table
+        self.is_multi_head_eagle = is_multi_head_eagle
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
@@ -107,8 +122,16 @@ class TpModelWorker:
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             kv_allocator=kv_allocator,
-            oe_token_table=oe_token_table
+            oe_token_table=oe_token_table,
+            enable_overlap=enable_overlap,
+            draft_model_idx=0 if self.is_multi_head_eagle and is_draft_worker else None
         )
+        if is_draft_worker:
+            self.model_runner_list = []
+            self.model_runner_list.append(self.model_runner)
+        if self.is_multi_head_eagle:
+            self._init_multi_layer_eagle_model_runners()
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -154,9 +177,9 @@ class TpModelWorker:
         if get_attention_tp_size() > 1:
             self.random_seed = broadcast_pyobj(
                 [server_args.random_seed],
-                self.model_runner.attention_tp_group.rank,
+                self.model_runner.attention_tp_group.rank if not _is_npu else self.model_runner.tp_group.rank,
                 self.model_runner.attention_tp_group.cpu_group if not _is_npu else self.model_runner.tp_group.cpu_group,
-                src=self.model_runner.attention_tp_group.ranks[0],
+                src=self.model_runner.attention_tp_group.ranks[0] if not _is_npu else self.model_runner.tp_group.ranks[0],
             )[0]
         else:
             self.random_seed = server_args.random_seed
@@ -168,6 +191,30 @@ class TpModelWorker:
 
         # for hicache load
         self.hicache_layer_transfer_counter = None
+        self.pp_group=get_pp_group()
+
+    def _init_multi_layer_eagle_model_runners(self):
+        for i in range(1, self.server_args.speculative_num_steps):
+            self.model_runner_list.append(
+                ModelRunner(
+                    model_config=self.model_config,
+                    mem_fraction_static=self.server_args.mem_fraction_static,
+                    gpu_id=self.gpu_id,
+                    attn_tp_rank=self.attn_tp_rank,
+                    attn_tp_size=self.server_args.attn_tp_size,
+                    world_size=self.server_args.world_size,
+                    moe_ep_rank=self.moe_ep_rank,
+                    moe_ep_size=self.server_args.ep_size,
+                    global_rank=self.global_rank,
+                    nccl_port=self.nccl_port,
+                    server_args=self.server_args,
+                    is_draft_worker=self.is_draft_worker,
+                    req_to_token_pool=self.req_to_token_pool,
+                    kv_allocator=self.kv_allocator,
+                    oe_token_table=self.oe_token_table,
+                    draft_model_idx=i
+                )
+            )
 
     def get_worker_info(self):
         return (
@@ -211,6 +258,7 @@ class TpModelWorker:
     def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -230,24 +278,28 @@ class TpModelWorker:
         if launch_done:
             launch_done.set()
 
-        if skip_sample:
-            next_token_ids = None
-            next_token_multi_ids = None
-        else:
-            next_token_ids = self.model_runner.sample(logits_output, forward_batch)
-            if forward_batch.temp_multi_ids is not None:
-                # Multi id decoding is completed by multimodal module itself
-                assert next_token_ids.shape == (forward_batch.batch_size, )
-                assert len(forward_batch.temp_multi_ids.shape) == 2 and forward_batch.temp_multi_ids.shape[0] == forward_batch.batch_size, f"\033[31m[{forward_batch=}]\033[0m"
-                next_token_multi_ids = forward_batch.temp_multi_ids
+        if get_pp_group().is_last_rank:
+            if skip_sample:
+                next_token_ids=None
+                next_token_multi_ids=None
             else:
-                next_token_multi_ids = None
-            if model_worker_batch.sampling_info.thinking_budgets is not None:  # check whether thinking budget is out of
-                model_worker_batch.sampling_info.apply_thinking_budgets(model_worker_batch.seq_lens, next_token_ids)
-            if model_worker_batch.disagg_set_aux_fn is not None:
-                model_worker_batch.disagg_set_aux_fn(next_token_ids, logits_output)
+                next_token_ids=self.model_runner.sample(logits_output, forward_batch)
+                if forward_batch.temp_multi_ids is not None:
+                    # Multi id decoding is completed by multimodal module itself
+                    assert next_token_ids.shape==(forward_batch.batch_size,)
+                    assert len(forward_batch.temp_multi_ids.shape)==2 and forward_batch.temp_multi_ids.shape[
+                        0]==forward_batch.batch_size, f"\033[31m[{forward_batch=}]\033[0m"
+                    next_token_multi_ids=forward_batch.temp_multi_ids
+                else:
+                    next_token_multi_ids=None
+                if model_worker_batch.sampling_info.thinking_budgets is not None:  # check whether thinking budget is out of
+                    model_worker_batch.sampling_info.apply_thinking_budgets(model_worker_batch.seq_lens, next_token_ids)
+                if model_worker_batch.disagg_set_aux_fn is not None:
+                    model_worker_batch.disagg_set_aux_fn(next_token_ids, logits_output)
 
-        return logits_output, next_token_ids, next_token_multi_ids
+            return logits_output, next_token_ids, next_token_multi_ids
+        else:
+            return logits_output, None, None
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -284,7 +336,7 @@ class TpModelWorker:
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
                 # TODO(2025-09-06 yanghao32): Support weight update for different parallel modes, currently only supports attn_tp_size==dense_dp_size case
-                recv_req.serialized_named_tensors[self.attn_tp_rank]
+                recv_req.serialized_named_tensors[self.global_rank]
             ),
             load_format=recv_req.load_format,
         )

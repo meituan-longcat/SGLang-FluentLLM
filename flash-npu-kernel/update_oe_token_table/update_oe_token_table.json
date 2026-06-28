@@ -1,0 +1,57 @@
+[
+  {
+    "op": "UpdateOeTokenTable",
+    "attr": [
+      {
+        "name": "batch_size",
+        "param_type": "required",
+        "type": "int"
+      },
+      {
+        "name": "max_context_len",
+        "param_type": "required",
+        "type": "int"
+      }
+    ],
+    "input_desc": [
+      {
+        "name": "tokens",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "req_lens",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "row_indices",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      },
+      {
+        "name": "column_starts",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int64"]
+      },
+      {
+        "name": "ignore_tokens",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      }
+    ],
+    "output_desc": [
+      {
+        "name": "oe_token_table",
+        "param_type": "required",
+        "format": ["ND"],
+        "type": ["int32"]
+      }
+    ]
+  }
+]

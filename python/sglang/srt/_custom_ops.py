@@ -6,15 +6,15 @@ import torch
 from sglang.srt.utils import get_colorful_logger, is_npu
 
 logger = get_colorful_logger(__name__)
-
-try:
-    from flashinfer.comm import vllm_ar as flashinfer_ar
-except ImportError:
-    raise ImportError("flashinfer not correctly installed!")
+__is_npu__ = is_npu()
 
 
+if not __is_npu__:
+    try:
+        from flashinfer.comm import vllm_ar as flashinfer_ar
+    except ImportError:
+        raise ImportError("flashinfer not correctly installed!")
 
-if not is_npu():
     custom_op = flashinfer_ar
 
     # custom allreduce

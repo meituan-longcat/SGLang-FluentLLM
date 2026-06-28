@@ -1,0 +1,251 @@
+From e7a9b4dbae6864305f2e71caa27c4a44ac667903 Mon Sep 17 00:00:00 2001
+From: Chl_SolaAir <Chl_SolaAir@noreply.gitcode.com>
+Date: Wed, 28 Jan 2026 17:50:36 +0800
+Subject: [PATCH 3/4] oe
+
+---
+ codegen/custom_op/custom_reg_op.h             | 27 ++++----
+ .../auto_generated_ge_raw_ops.py              | 65 ++++++++++---------
+ ..._gram_ids.py => npu_compute_n_gram_ids.py} | 42 ++++++------
+ .../include/ops/op_proto/inc/array_ops.h      | 16 +++++
+ 4 files changed, 89 insertions(+), 61 deletions(-)
+ rename python/torchair/_ge_concrete_graph/ge_converter/custom/{mlp_compute_n_gram_ids.py => npu_compute_n_gram_ids.py} (54%)
+
+diff --git a/codegen/custom_op/custom_reg_op.h b/codegen/custom_op/custom_reg_op.h
+index 03bab8d0..197df85f 100644
+--- a/codegen/custom_op/custom_reg_op.h
++++ b/codegen/custom_op/custom_reg_op.h
+@@ -3,17 +3,22 @@
+ #include "graph/operator_reg.h"
+ 
+ namespace ge {
+-// REG_OP(Add)
+-//    .INPUT(x1, TensorType({DT_FLOAT, DT_INT32, DT_INT64, DT_FLOAT16, DT_BF16, DT_INT16,
+-//                           DT_INT8, DT_UINT8, DT_DOUBLE, DT_COMPLEX128,
+-//                           DT_COMPLEX64, DT_STRING}))
+-//    .INPUT(x2, TensorType({DT_FLOAT, DT_INT32, DT_INT64, DT_FLOAT16, DT_BF16, DT_INT16,
+-//                           DT_INT8, DT_UINT8, DT_DOUBLE, DT_COMPLEX128,
+-//                           DT_COMPLEX64, DT_STRING}))
+-//    .OUTPUT(y, TensorType({DT_FLOAT, DT_INT32, DT_INT64, DT_FLOAT16, DT_BF16, DT_INT16,
+-//                           DT_INT8, DT_UINT8, DT_DOUBLE, DT_COMPLEX128,
+-//                           DT_COMPLEX64, DT_STRING}))
+-//    .OP_END_FACTORY_REG(Add)
++REG_OP(ComputeNGramIds)
++    .INPUT(oe_weights, ge::TensorType::ALL())
++    .INPUT(oe_mods, ge::TensorType::ALL())
++    .INPUT(exclusive_oe_embeder_size_sums, ge::TensorType::ALL())
++    .INPUT(tokens, ge::TensorType::ALL())
++    .INPUT(exclusive_req_len_sums, ge::TensorType::ALL())
++    .INPUT(oe_token_table, ge::TensorType::ALL())
++    .INPUT(row_indices, ge::TensorType::ALL())
++    .INPUT(column_starts, ge::TensorType::ALL())
++    .OUTPUT(oe_n_gram_ids, ge::TensorType::ALL())
++    .REQUIRED_ATTR(batch_size, Int)
++    .REQUIRED_ATTR(oe_n, Int)
++    .REQUIRED_ATTR(oe_k, Int)
++    .REQUIRED_ATTR(max_context_len, Int)
++    .OP_END_FACTORY_REG(ComputeNGramIds);
++
+ }
+ 
+ #endif  // ASCENDADAPTER2_CUSTOM_REG_OP_H
+diff --git a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+index 7ba02da4..869ce4ff 100644
+--- a/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
++++ b/python/torchair/_ge_concrete_graph/auto_generated_ge_raw_ops.py
+@@ -27,41 +27,44 @@ from torchair.ge import attr
+ # IR PartitionedCall skipped as graph
+ # IR StatefulPartitionedCall skipped as graph
+ 
+-# This api is auto-generated from IR MlpComputeNGramIds
+-@auto_convert_to_tensor([False, False, False, False, False, False, False], [False, False, False, False, False, False, False], inputs_tensor_type=[TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL])
+-def MlpComputeNGramIds(oe_weights: Tensor, oe_mods: Tensor, over_embedding_input_ids: Tensor, ignore_token_flags: Tensor, oe_exclusive_req_len_sums: Tensor, oe_exclusive_oe_info_len_sums: Tensor, oe_exclusive_embeder_size_sums: Tensor, *, seq_len: int, batch_size: int, over_embedding_n: int, over_embedding_k: int, dependencies=[], node_name=None):
+-    """REG_OP(MlpComputeNGramIds)\n
++
++# This api is auto-generated from IR ComputeNGramIds
++@auto_convert_to_tensor([False, False, False, False, False, False, False, False], [False, False, False, False, False, False, False, False], inputs_tensor_type=[TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL, TensorType.TT_ALL])
++def ComputeNGramIds(oe_weights: Tensor, oe_mods: Tensor, exclusive_oe_embeder_size_sums: Tensor, tokens: Tensor, exclusive_req_len_sums: Tensor, oe_token_table: Tensor, row_indices: Tensor, column_starts: Tensor, *, batch_size: int, oe_n: int, oe_k: int, max_context_len: int, dependencies=[], node_name=None):
++    """REG_OP(ComputeNGramIds)\n
+ .INPUT(oe_weights, ge::TensorType::ALL())\n
+ .INPUT(oe_mods, ge::TensorType::ALL())\n
+-.INPUT(over_embedding_input_ids, ge::TensorType::ALL())\n
+-.INPUT(ignore_token_flags, ge::TensorType::ALL())\n
+-.INPUT(oe_exclusive_req_len_sums, ge::TensorType::ALL())\n
+-.INPUT(oe_exclusive_oe_info_len_sums, ge::TensorType::ALL())\n
+-.INPUT(oe_exclusive_embeder_size_sums, ge::TensorType::ALL())\n
++.INPUT(exclusive_oe_embeder_size_sums, ge::TensorType::ALL())\n
++.INPUT(tokens, ge::TensorType::ALL())\n
++.INPUT(exclusive_req_len_sums, ge::TensorType::ALL())\n
++.INPUT(oe_token_table, ge::TensorType::ALL())\n
++.INPUT(row_indices, ge::TensorType::ALL())\n
++.INPUT(column_starts, ge::TensorType::ALL())\n
+ .OUTPUT(oe_n_gram_ids, ge::TensorType::ALL())\n
+-.REQUIRED_ATTR(seq_len, Int)\n
+ .REQUIRED_ATTR(batch_size, Int)\n
+-.REQUIRED_ATTR(over_embedding_n, Int)\n
+-.REQUIRED_ATTR(over_embedding_k, Int)\n
++.REQUIRED_ATTR(oe_n, Int)\n
++.REQUIRED_ATTR(oe_k, Int)\n
++.REQUIRED_ATTR(max_context_len, Int)\n
+ """
+ 
+     # process inputs
+     inputs = {
+         "oe_weights": oe_weights,
+         "oe_mods": oe_mods,
+-        "over_embedding_input_ids": over_embedding_input_ids,
+-        "ignore_token_flags": ignore_token_flags,
+-        "oe_exclusive_req_len_sums": oe_exclusive_req_len_sums,
+-        "oe_exclusive_oe_info_len_sums": oe_exclusive_oe_info_len_sums,
+-        "oe_exclusive_embeder_size_sums": oe_exclusive_embeder_size_sums,
++        "exclusive_oe_embeder_size_sums": exclusive_oe_embeder_size_sums,
++        "tokens": tokens,
++        "exclusive_req_len_sums": exclusive_req_len_sums,
++        "oe_token_table": oe_token_table,
++        "row_indices": row_indices,
++        "column_starts": column_starts,
+     }
+ 
+     # process attrs
+     attrs = {
+-        "seq_len": attr.Int(seq_len),
+         "batch_size": attr.Int(batch_size),
+-        "over_embedding_n": attr.Int(over_embedding_n),
+-        "over_embedding_k": attr.Int(over_embedding_k),
++        "oe_n": attr.Int(oe_n),
++        "oe_k": attr.Int(oe_k),
++        "max_context_len": attr.Int(max_context_len),
+     }
+ 
+     # process outputs
+@@ -70,26 +73,28 @@ def MlpComputeNGramIds(oe_weights: Tensor, oe_mods: Tensor, over_embedding_input
+     ]
+ 
+     return ge_op(
+-        op_type="MlpComputeNGramIds",
++        op_type="ComputeNGramIds",
+         inputs=inputs,
+         attrs=attrs,
+         outputs=outputs,
+         dependencies=dependencies,
+-        ir=IrDef("MlpComputeNGramIds") \
++        ir=IrDef("ComputeNGramIds") \
+         .input("oe_weights", "") \
+         .input("oe_mods", "") \
+-        .input("over_embedding_input_ids", "") \
+-        .input("ignore_token_flags", "") \
+-        .input("oe_exclusive_req_len_sums", "") \
+-        .input("oe_exclusive_oe_info_len_sums", "") \
+-        .input("oe_exclusive_embeder_size_sums", "") \
+-        .required_attr("seq_len", attr.Int) \
++        .input("exclusive_oe_embeder_size_sums", "") \
++        .input("tokens", "") \
++        .input("exclusive_req_len_sums", "") \
++        .input("oe_token_table", "") \
++        .input("row_indices", "") \
++        .input("column_starts", "") \
+         .required_attr("batch_size", attr.Int) \
+-        .required_attr("over_embedding_n", attr.Int) \
+-        .required_attr("over_embedding_k", attr.Int) \
++        .required_attr("oe_n", attr.Int) \
++        .required_attr("oe_k", attr.Int) \
++        .required_attr("max_context_len", attr.Int) \
+         .output("oe_n_gram_ids" , "")
+     )
+ 
++
+ # This api is auto-generated from IR MlpSplitSwiglu
+ @auto_convert_to_tensor([False, False], [False, False], inputs_tensor_type=[TensorType.TT_ALL, TensorType.TT_ALL])
+ def MlpSplitSwiglu(x: Tensor, group_list: Tensor, *, local_expert_start: int, local_expert_end: int, dependencies=[], node_name=None):
+diff --git a/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_compute_n_gram_ids.py b/python/torchair/_ge_concrete_graph/ge_converter/custom/npu_compute_n_gram_ids.py
+similarity index 54%
+rename from python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_compute_n_gram_ids.py
+rename to python/torchair/_ge_concrete_graph/ge_converter/custom/npu_compute_n_gram_ids.py
+index fdfc6de3..7facd22b 100644
+--- a/python/torchair/_ge_concrete_graph/ge_converter/custom/mlp_compute_n_gram_ids.py
++++ b/python/torchair/_ge_concrete_graph/ge_converter/custom/npu_compute_n_gram_ids.py
+@@ -16,31 +16,33 @@ from typing import (
+ 
+ # ... 省略前面不变的代码 ...
+ 
+-@register_fx_node_ge_converter(torch.ops.npu.mlp_compute_n_gram_ids.default)
+-def convert_npu_mlp_compute_n_gram_ids(
++@register_fx_node_ge_converter(torch.ops.npu.compute_n_gram_ids.default)
++def convert_npu_compute_n_gram_ids(
+         oe_weights: Tensor,
+         oe_mods: Tensor,
+-        over_embedding_input_ids: Tensor,
+-        ignore_token_flags: Tensor,
+-        oe_exclusive_req_len_sums: Tensor,
+-        oe_exclusive_oe_info_len_sums: Tensor,
+-        oe_exclusive_embeder_size_sums: Tensor,
+-        seq_len: int,
++        exclusive_oe_embeder_size_sums: Tensor,
++        tokens: Tensor,
++        exclusive_req_len_sums: Tensor,
++        oe_token_table: Tensor,
++        row_indices: Tensor,
++        column_starts: Tensor,
+         batch_size: int,
+-        over_embedding_n: int,
+-        over_embedding_k: int
++        oe_n: int,
++        oe_k: int,
++        max_context_len: int
+ ):
+-    # 调用自定义算子 MlpComputeNGramIds
+-    return ge.MlpComputeNGramIds(
++    # 调用自定义算子 ComputeNGramIds
++    return ge.ComputeNGramIds(
+         oe_weights,
+         oe_mods,
+-        over_embedding_input_ids,
+-        ignore_token_flags,
+-        oe_exclusive_req_len_sums,
+-        oe_exclusive_oe_info_len_sums,
+-        oe_exclusive_embeder_size_sums,
+-        seq_len=seq_len,
++        exclusive_oe_embeder_size_sums,
++        tokens,
++        exclusive_req_len_sums,
++        oe_token_table,
++        row_indices,
++        column_starts,
+         batch_size=batch_size,
+-        over_embedding_n=over_embedding_n,
+-        over_embedding_k=over_embedding_k
++        oe_n=oe_n,
++        oe_k=oe_k,
++        max_context_len=max_context_len
+     )
+\ No newline at end of file
+diff --git a/third_party/ascend/include/ops/op_proto/inc/array_ops.h b/third_party/ascend/include/ops/op_proto/inc/array_ops.h
+index 5bdc105d..08b27943 100755
+--- a/third_party/ascend/include/ops/op_proto/inc/array_ops.h
++++ b/third_party/ascend/include/ops/op_proto/inc/array_ops.h
+@@ -101,6 +101,22 @@ REG_OP(ReverseSequence)
+     .ATTR(batch_dim, Int, 0)
+     .OP_END_FACTORY_REG(ReverseSequence)
+ 
++REG_OP(ComputeNGramIds)
++    .INPUT(oe_weights, ge::TensorType::ALL())
++    .INPUT(oe_mods, ge::TensorType::ALL())
++    .INPUT(exclusive_oe_embeder_size_sums, ge::TensorType::ALL())
++    .INPUT(tokens, ge::TensorType::ALL())
++    .INPUT(exclusive_req_len_sums, ge::TensorType::ALL())
++    .INPUT(oe_token_table, ge::TensorType::ALL())
++    .INPUT(row_indices, ge::TensorType::ALL())
++    .INPUT(column_starts, ge::TensorType::ALL())
++    .OUTPUT(oe_n_gram_ids, ge::TensorType::ALL())
++    .REQUIRED_ATTR(batch_size, Int)
++    .REQUIRED_ATTR(oe_n, Int)
++    .REQUIRED_ATTR(oe_k, Int)
++    .REQUIRED_ATTR(max_context_len, Int)
++    .OP_END_FACTORY_REG(ComputeNGramIds);
++
+ /**
+ *@brief Copies a tensor setting everything outside a central band in each innermost matrix. \n
+ 
+-- 
+2.39.5 (Apple Git-154)
+

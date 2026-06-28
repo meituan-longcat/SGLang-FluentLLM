@@ -315,6 +315,49 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
+        if self.load_config.draft_model_idx is not None:
+            import re
+
+            pattern = r"model.mtp.layers.(\d+)."
+            filtered_weights = []
+
+            # Convert iterator to list to allow multiple passes
+            weights_list = list(weights_iterator)
+
+            # First pass: check if any weight matches the specified idx
+            has_target_idx = False
+            for name, tensor in weights_list:
+                group = re.match(pattern, name)
+                if group is not None:
+                    idx = int(group.group(1))
+                    if idx == self.load_config.draft_model_idx:
+                        has_target_idx = True
+                        break
+
+            # If no weight matches the specified idx, fall back to layer 0
+            target_idx = self.load_config.draft_model_idx if has_target_idx else 0
+            if not has_target_idx and self.load_config.draft_model_idx != 0:
+                logger.warning(
+                    f"No weights found for draft_model_idx={self.load_config.draft_model_idx}, "
+                    f"falling back to layer 0"
+                )
+            elif has_target_idx:
+                logger.info(
+                    f"Loading number {self.load_config.draft_model_idx} MTP Layer..."
+                )
+
+            for name, tensor in weights_list:
+                group = re.match(pattern, name)
+                if group is not None:
+                    idx = int(group.group(1))
+                    if idx != target_idx:
+                        continue
+                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                else:
+                    new_name = name
+                filtered_weights.append((source.prefix + new_name, tensor))
+            return tuple(filtered_weights)
+
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 

@@ -54,6 +54,7 @@ runtime_common = [
     "dill==0.4.0",
     "nvidia-ml-py==13.580.82",
     "einops",
+    "torch-memory-saver==0.0.9"
 ]
 srt = [
     "fluentllm[runtime_common]",
@@ -81,11 +82,14 @@ cuda_sm80 = [
 ]
 
 cuda_sm90 = [
-    "fluentllm[dev]"
+    "fluentllm[dev]",
+    "duo_flash_attn_3 @ https://s3plus.sankuai.com/ai-compiler-bj/duo-attn/duo_flash_attn_3-3.3.0b6-cp39-abi3-linux_x86_64.whl",
+    "duo_flash_mla_swap @ https://s3plus-bj02.sankuai.com/friday-ml-deploy/FluentLLM/sm90/duo_flash_mla_swap-1.1.1+d5a98b8-cp311-cp311-linux_x86_64.whl",
+    "flash_attn_3 @ https://s3plus-bj02.sankuai.com/friday-ml-deploy/FluentLLM/sm90/flash_attn_3-3.0.0-cp39-abi3-linux_x86_64.whl",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/meituan-longcat/FluentLLM"
+"Homepage" = "https://dev.sankuai.com/code/repo-detail/mptech-llmp/fluentllm/file/list"
 
 [tool.setuptools.package-data]
 "fluentllm" = [

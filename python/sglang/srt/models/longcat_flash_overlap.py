@@ -173,9 +173,9 @@ class FLASHDecoderLayerOverlap(FLASHDecoderLayer):
                 attn = self.self_attn[1]
                 comm_manager = self.mlp_branch_decoder_comm_manager[1]
                 if attn.no_absorb(forward_batch):
-                    hidden_states_mlp = attn.forward_normal_chunked_kv_core(q, k, v, forward_batch)
+                    hidden_states_mlp = attn.forward_normal_chunked_kv_core(q, k, v, comm_manager, forward_batch)
                 else:
-                    hidden_states_mlp = attn.forward_absorb_attn_o_proj(Q, K, forward_batch)
+                    hidden_states_mlp = attn.forward_absorb_attn_o_proj(Q, K, forward_batch, comm_manager)
 
                 block_scale  = None
 
@@ -361,7 +361,28 @@ class FLASHDecoderLayerOverlap(FLASHDecoderLayer):
 
                 return hidden_states, residual, None
         else:
-            raise RuntimeError("DP Attention Not supported yet")
+            moe_hidden_states = self.forward_mlp(
+                self.moe_branch_decoder_comm_manager,
+                self.mlp,
+                hidden_states,
+                residual,
+                forward_batch,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                tp_num_tokens
+            )
+            if (
+                global_server_args_dict["attn_parallel_strategy"] == AttnParallelStrategy.DATA_PARALLEL
+                and
+                global_server_args_dict["dense_parallel_strategy"] == DenseParallelStategy.TENSOR_PARALLEL
+            ):
+                hidden_states, residual = self.forward_mlp_branch(self.mlp_branch_decoder_comm_manager, positions, hidden_states, residual, forward_batch, num_global_tokens, max_num_tokens_per_gpu, tp_num_tokens)
+                # do emtpy tensor calculation, not None
+                hidden_states = hidden_states + moe_hidden_states
+            else:
+                hidden_states = moe_hidden_states
+
+            return hidden_states, residual, None
             
     def _dispatch_a(self, hidden_states, topk_idx, tok_weights, forward_mode):
         self.deepep_dispatcher.dispatch_a(

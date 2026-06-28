@@ -141,6 +141,14 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def flush(self) -> Tuple[str, list[ToolCallItem]]:
+        """Flush any incomplete streaming state at end-of-stream."""
+        if not self.tools:
+            return "", []
+        sp_result = self.detector.flush(self.tools)
+        normal_text = sp_result.normal_text or ""
+        return normal_text, sp_result.calls or []
+
     def get_structure_tag(self) -> StructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.

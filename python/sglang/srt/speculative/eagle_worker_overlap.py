@@ -7,13 +7,17 @@ from queue import Queue
 import psutil
 import torch
 
+from sglang.srt.env import ENV
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
-from sglang.srt.speculative.eagle_utils import EagleDraftOutput
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils import (
+    get_colorful_logger,
+    is_npu,
+)
 from sglang.utils import get_exception_traceback
 
 logger = get_colorful_logger(__name__)
+
+__is_npu__ = is_npu()
 
 import triton
 import triton.language as tl
@@ -67,20 +71,33 @@ def resolve_future_input(
     spec_steps: int,
     future_last_verifed_ids_map: torch.Tensor,
     future_token_list_map: torch.Tensor,
-) -> EagleDraftOutput:
+) -> None:
     if batch.spec_info is None:
         return
-    bs = len(batch.seq_lens)
-    token_list = batch.spec_info.token_list
-    resolve_future_input_kernel[(bs,)](
-        last_verified_ids_ptr=batch.spec_info.last_verified_ids,
-        token_list_ptr=batch.spec_info.token_list,
-        future_last_map_ptr=future_last_verifed_ids_map,
-        future_tokens_ptr=future_token_list_map,
-        spec_steps=spec_steps,
-        token_list_stride_0=token_list.stride(0),
-        future_tokens_stride_0=future_token_list_map.stride(0),
-    )
+    if __is_npu__:
+        indices = torch.clamp(-batch.spec_info.last_verified_ids, min=0)
+        batch.spec_info.last_verified_ids[:] = torch.where(
+            batch.spec_info.last_verified_ids < 0,
+            future_last_verifed_ids_map[indices],
+            batch.spec_info.last_verified_ids,
+        )
+        batch.spec_info.token_list[:] = torch.where(
+            batch.spec_info.token_list < 0,
+            future_token_list_map[indices],
+            batch.spec_info.token_list,
+        )
+    else:
+        bs = len(batch.seq_lens)
+        token_list = batch.spec_info.token_list
+        resolve_future_input_kernel[(bs,)](
+            last_verified_ids_ptr=batch.spec_info.last_verified_ids,
+            token_list_ptr=batch.spec_info.token_list,
+            future_last_map_ptr=future_last_verifed_ids_map,
+            future_tokens_ptr=future_token_list_map,
+            spec_steps=spec_steps,
+            token_list_stride_0=token_list.stride(0),
+            future_tokens_stride_0=future_token_list_map.stride(0),
+        )
 
 
 class EagleWorkerOverlapped:
@@ -94,7 +111,13 @@ class EagleWorkerOverlapped:
         target_worker,
         global_rank,
     ):
-        self.worker = EAGLEWorker(
+        if server_args.is_multi_head_eagle:
+            from sglang.srt.speculative.multi_head_eagle_worker import MultiHeadEAGLEWorker
+            WorkerCls = MultiHeadEAGLEWorker
+        else:
+            from sglang.srt.speculative.eagle_worker import EAGLEWorker
+            WorkerCls = EAGLEWorker
+        self.worker = WorkerCls(
             server_args,
             gpu_id,
             attn_tp_rank,
@@ -120,6 +143,13 @@ class EagleWorkerOverlapped:
         self.future_token_ids_limit = future_max_num_tokens
         future_map_size = self.future_token_ids_limit + self.worker.max_running_requests
 
+        # 第一次 launch 的 batch 在 GPU 上执行时, 第二次调度的 batch 可能已经 launch
+        # 而第三次的 launch 一定在第一次 launch 的 batch 执行完之后 (由 copy_done 保证)
+        # 所以需要在 forward 线程上保留两次 launch 的 batch 数量的引用, 防止 torch 回收
+        # model_worker_batch（生命周期短） 中的张量空间导致 illeagl memory access。
+        self.num_continuous_decode_steps = self.worker.server_args.num_continuous_decode_steps
+        self.keep_batch_reference_num = 2 * self.num_continuous_decode_steps
+
         # These two queues are used to communicate with main schedule loop
         self.input_queue = Queue()
         self.output_queue = Queue()
@@ -142,6 +172,10 @@ class EagleWorkerOverlapped:
             )
 
         self.forward_stream = torch.get_device_module(self.device).Stream()
+        if __is_npu__ and ENV.npu_enable_graph:
+            with torch.get_device_module(self.device).stream(self.forward_stream):
+                self.worker.target_worker.model_runner.init_npu_graphs()
+                self.worker.init_npu_graphs()
         self.parent_process = psutil.Process().parent()
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
@@ -150,6 +184,8 @@ class EagleWorkerOverlapped:
         self.scheduler_stream: torch.Stream = torch.get_device_module(
             self.device
         ).current_stream()
+        if __is_npu__:
+            torch.npu.set_stream_limit(self.scheduler_stream, 8, 16)
         if self.device == "cpu":
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 
@@ -165,7 +201,7 @@ class EagleWorkerOverlapped:
     @torch.no_grad()
     def forward_thread_func_(self):
         batch_pt = 0
-        batch_lists = [None] * 2
+        batch_lists = [None] * self.keep_batch_reference_num
         while True:
             (batch, future_token_ids_ct) = self.input_queue.get()
             if not batch:
@@ -174,7 +210,7 @@ class EagleWorkerOverlapped:
             # Keep a reference of model_worker_batch by storing it into a list.
             # Otherwise, the tensor members of model_worker_batch will be released
             # by pytorch and cause CUDA illegal memory access errors.
-            batch_lists[batch_pt % 2] = batch
+            batch_lists[batch_pt % self.keep_batch_reference_num] = batch
             batch_pt += 1
 
             launch_done = threading.Event()
@@ -198,14 +234,22 @@ class EagleWorkerOverlapped:
             # Trigger D2D copy, prepare for next kernel launch
             bs = len(batch.seq_lens)
             if not batch.forward_mode.is_idle():
-                copy_for_next_launch[(bs,)](
-                    future_last_verified_id_ptr=self.future_last_verified_ids,
-                    future_token_list_ptr=self.future_token_list,
-                    new_verified_id_ptr=new_verified_id,
-                    token_list_ptr=token_list,
-                    future_token_ids_ct=future_token_ids_ct,
-                    spec_steps=self.spec_steps
-                )
+                if __is_npu__:
+                    self.future_last_verified_ids[
+                        future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
+                    ] = new_verified_id
+                    self.future_token_list[
+                        future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
+                    ] = token_list
+                else:
+                    copy_for_next_launch[(bs,)](
+                        future_last_verified_id_ptr=self.future_last_verified_ids,
+                        future_token_list_ptr=self.future_token_list,
+                        new_verified_id_ptr=new_verified_id,
+                        token_list_ptr=token_list,
+                        future_token_ids_ct=future_token_ids_ct,
+                        spec_steps=self.spec_steps
+                    )
                 if logits_output.hidden_states is not None:
                     logits_output.hidden_states = logits_output.hidden_states.to(
                         "cpu", non_blocking=True
@@ -302,3 +346,10 @@ class EagleWorkerOverlapped:
             new_verified_id,
             token_list,
         )
+
+    def renew_scaling_penalty(self, req_pool_indices: torch.Tensor):
+        self.worker.renew_scaling_penalty(req_pool_indices)
+
+    def update_weights_from_tensor(self, recv_req):
+        success, message = self.worker.update_weights_from_tensor(recv_req)
+        return success, message

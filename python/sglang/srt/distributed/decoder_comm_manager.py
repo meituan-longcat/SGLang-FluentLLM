@@ -112,11 +112,11 @@ def get_dense_rsag():
             _DENSE_RSAG = _ATTN_RSAG
     return _DENSE_RSAG
 
-if not __is_npu__:
+def get_attn_rsag():
     if is_sm90_supported() and not global_server_args_dict["force_deterministic_rsag"]:
-        get_attn_rsag = get_attn_rsag_v2
+        return get_attn_rsag_v2()
     else:
-        get_attn_rsag = get_attn_rsag_v1
+        return get_attn_rsag_v1()
 
 
 class DecoderCommMananger(object):
@@ -143,11 +143,11 @@ class DecoderCommMananger(object):
 
         self.attn_rsag = None
         self.dense_rsag = None
-        self.attn_rsag = None
-        if self.attn_tp_size > 1:
-            self.attn_rsag = get_attn_rsag()
-        if self.dense_tp_size > 1:
-            self.dense_rsag = get_dense_rsag()
+        if not __is_npu__:
+            if self.attn_tp_size > 1:
+                self.attn_rsag = get_attn_rsag()
+            if self.dense_tp_size > 1:
+                self.dense_rsag = get_dense_rsag()
 
     def pre_attn_comm(self, hidden_states, tp_num_tokens, is_second_attn=False):
         if FLLM_IS_CP:
@@ -387,7 +387,12 @@ class DecoderCommMananger(object):
         output = torch.empty(local_global_num_tokens[self.dense_tp_rank], hidden_states.shape[-1], device=device, dtype=dtype)
         split_tensors = torch.split(hidden_states, local_global_num_tokens, dim=0)
         input_list = list(split_tensors)
-        torch.distributed.reduce_scatter(output, input_list, op=torch.distributed.ReduceOp.SUM, group=self.dense_tp_group)
+        torch.distributed.reduce_scatter(
+            output,
+            input_list,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.dense_tp_group.device_group,
+        )
         return output
 
     def all_gather_torch(self, hidden_states: torch.Tensor, forward_batch):
@@ -395,7 +400,9 @@ class DecoderCommMananger(object):
         device = hidden_states.device
         dtype = hidden_states.dtype
         gathered_tensors = [torch.empty(num_tokens, hidden_states.shape[-1], dtype=dtype, device=device) for num_tokens in local_global_num_tokens]
-        torch.distributed.all_gather(gathered_tensors, hidden_states, group=self.dense_tp_group)
+        torch.distributed.all_gather(
+            gathered_tensors, hidden_states, self.dense_tp_group.device_group
+        )
         gathered_tensors = torch.concat(gathered_tensors)
         return gathered_tensors
 

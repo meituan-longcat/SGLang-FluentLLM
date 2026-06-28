@@ -82,14 +82,6 @@ if [ ${SM} = "sm90" ]; then
     rm -rf fast_hadamard_transform.egg-info/ build/
     python3 setup.py install
     cd -
-
-    echo "install fa3"
-    pip3 uninstall -y flash-attn-3
-    cd 3rdparty/flash-attention
-    git submodule update --init
-    cd hopper
-    python3 setup.py install
-    cd -
 fi
 
 pip3 install openai-harmony==0.0.3 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple

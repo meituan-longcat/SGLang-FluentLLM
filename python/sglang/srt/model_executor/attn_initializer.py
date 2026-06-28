@@ -3,24 +3,31 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.utils import get_colorful_logger, is_npu, is_sm90_supported
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa, get_nsa_index_head_dim
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.configs.model_config import AttentionArch, is_dsa, get_nsa_index_head_dim
 from sglang.srt.mem_cache.memory_pool import (
     NativeSparseMHATokenToKVPool,
     NativeSparseMLATokenToKVPool,
     MHATokenToKVPool,
+    NPUMHATokenToKVPool,
     MLATokenToKVPool,
+    MLAL1HalfTokenToKVPool,
     ReqToTokenPool,
     SWAKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     DSATokenToKVPool,
+    L1HalfDSATokenToKVPool,
 )
 from sglang.srt.mem_cache.allocator import KVAllocator
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
-if not is_npu():
+
+__is_npu__ = is_npu()
+if not __is_npu__:
     from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
     if is_sm90_supported():
         from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
@@ -31,9 +38,9 @@ if not is_npu():
     from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
     from sglang.srt.layers.attention.torch_native_mla_backend import TorchNativeMlaAttnBackend
 else:
-    from sglang.srt.layers.attention.npu_mla_backend import NpuMLAAttnBackend
+    from sglang.srt.layers.attention.npu_mla_backend import NpuMLAAttnBackend, NpuAttnBackend
 
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_tp_size, get_draft_attention_tp_size
 
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -50,11 +57,11 @@ class AttnInitializer(object):
         if (
             model_runner.model_config.attention_arch == AttentionArch.MLA
         ):
-            if not is_npu():
+            if not __is_npu__:
                 if model_runner.is_kimi_linear:
                     model_runner.server_args.attention_backend = "hybrid_linear_attn"
                     logger.info("MLA optimization is turned on. Use hybrid_linear_attn backend.")
-                elif is_deepseek_nsa(model_runner.model_config.hf_config):
+                elif is_dsa(model_runner.model_config.hf_config):
                     model_runner.server_args.attention_backend = "dsa"
                 elif model_runner.server_args.enable_flashinfer_mla:
                     if model_runner.server_args.attention_backend == "duo_attn":
@@ -121,8 +128,22 @@ class AttnInitializer(object):
                 f"Unsupported kv_cache_dtype: {model_runner.server_args.kv_cache_dtype}."
             )
         model_runner.kv_cache_quant_method = model_runner.server_args.kv_cache_quant_method
+        if model_runner.server_args.index_k_dtype == "fp8_e4m3":
+            model_runner.index_k_dtype = torch.float8_e4m3fn
+        elif model_runner.server_args.index_k_dtype == "bf16":
+            model_runner.index_k_dtype = torch.bfloat16
+        else:
+            raise ValueError(f"{model_runner.server_args.index_k_dtype=}")
 
         model_runner.max_total_num_tokens = AttnInitializer.profile_max_num_token(model_runner, total_gpu_memory)
+        if SGLANG_CI_SMALL_KV_SIZE:
+            model_runner.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
+
+        # this is the max token can be stored locally, will be different when enable_mla_l1_5_cache
+        if model_runner.server_args.enable_mla_l1_5_cache:
+            assert model_runner.model_config.attention_arch == AttentionArch.MLA, f"should be mla model"
+            assert getattr(model_runner.model_config.hf_config, "use_nsa_mla", False) == False
+            model_runner.max_total_num_tokens = model_runner.max_total_num_tokens * model_runner.server_args.attn_tp_size
 
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -134,9 +155,6 @@ class AttnInitializer(object):
                 ),
                 4096,
             )
-
-        if SGLANG_CI_SMALL_KV_SIZE:
-            model_runner.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
 
         if not model_runner.spec_algorithm.is_none():
             if model_runner.is_draft_worker:
@@ -162,10 +180,40 @@ class AttnInitializer(object):
                 "Not enough memory. Please try to increase --mem-fraction-static."
             )
 
-        model_runner.page_size = 128 if is_npu() else page_size
-        model_runner.max_total_num_tokens = model_runner.max_total_num_tokens // model_runner.page_size * model_runner.page_size
+        model_runner.page_size = page_size
+        if __is_npu__:
+            # 加参数--page-size 128
+            assert model_runner.page_size == 128
+
+        model_runner.max_total_pages = model_runner.max_total_num_tokens // model_runner.page_size
+        model_runner.max_total_num_tokens = model_runner.max_total_pages * model_runner.page_size
+        model_runner.local_max_num_tokens = model_runner.max_total_num_tokens
+        # each card reserve its 0th page for cuda graph padding
+        if model_runner.server_args.enable_mla_l1_5_cache and model_runner.max_total_pages > 0:
+            # max_batch_size is setting to max_num_reqs + 1
+            # reserved_block_num is 1 + max_batch_size
+            reserved_block_num = 1 + max_num_reqs + 1
+            # Align to attn_tp_size so local page indices never exceed local pool size.
+            model_runner.local_total_pages = model_runner.max_total_num_tokens // model_runner.server_args.attn_tp_size // model_runner.page_size
+            model_runner.max_total_pages = model_runner.local_total_pages * model_runner.server_args.attn_tp_size
+            model_runner.max_total_pages += reserved_block_num
+            model_runner.max_total_num_tokens = model_runner.max_total_pages * model_runner.page_size
+            model_runner.local_max_num_tokens = (model_runner.local_total_pages + reserved_block_num) * model_runner.page_size
         # Added page_size is reserved pad page
-        assert model_runner.max_total_num_tokens >= model_runner.model_config.context_len + model_runner.page_size, f"KV Cache allocation too small: {model_runner.max_total_num_tokens=}, {model_runner.model_config.context_len=}, {model_runner.page_size=}, may cause requests to enter Scheduler but cannot be scheduled, causing service to hang"
+        assert model_runner.max_total_num_tokens >= model_runner.model_config.context_len + model_runner.page_size, \
+            f"KV Cache allocation too small: {model_runner.max_total_num_tokens=}, {model_runner.model_config.context_len=}, {model_runner.page_size=}, may cause requests to enter Scheduler but cannot be scheduled, causing service to hang"
+        if global_server_args_dict['npu_enable_graph_cache']:
+            max_total_num_tokens_file_path = os.path.join(model_runner.server_args.model_path,
+                                                          "num_token_file_path",
+                                                          str(model_runner.global_rank))
+            os.makedirs(max_total_num_tokens_file_path, exist_ok=True)
+            max_total_num_tokens_file = os.path.join(max_total_num_tokens_file_path, "max_total_num_tokens.txt")
+            if os.path.exists(max_total_num_tokens_file):
+                with open(max_total_num_tokens_file, "r") as f:
+                    model_runner.max_total_num_tokens = int(f.read().strip())
+            else:
+                with open(max_total_num_tokens_file, "w") as f:
+                    f.write(str(model_runner.max_total_num_tokens))
 
         if model_runner.req_to_token_pool is None:
             if model_runner.mambaish_config:
@@ -220,11 +268,19 @@ class AttnInitializer(object):
         if model_runner.is_draft_worker:
             model_runner.model_config.num_attention_layers = getattr(model_runner.model_config.hf_config, "num_nextn_predict_layers", 1)
 
+        if model_runner.server_args.pp_size > 1:
+            model_runner.attn_start_layer = model_runner.model.attn_start_layer
+            model_runner.attn_end_layer = model_runner.model.attn_end_layer
+        else:
+            model_runner.attn_start_layer = 0
+            model_runner.attn_end_layer = model_runner.model_config.num_attention_layers
+
         if (
             model_runner.model_config.attention_arch == AttentionArch.MLA
             and not model_runner.mambaish_config
         ):
-            # for flash nsa+mla
+            # for flash nsa+
+            # todo chlpp
             if getattr(model_runner.model_config.hf_config, "use_nsa_mla", False):
                 model_runner.token_to_kv_pool = NativeSparseMLATokenToKVPool(
                     size=model_runner.max_total_num_tokens,
@@ -240,14 +296,16 @@ class AttnInitializer(object):
                     rank=model_runner.global_rank,
                     compressed_block_stride=model_runner.model_config.hf_config.stride
                 )
-            elif is_deepseek_nsa(model_runner.model_config.hf_config):
-                model_runner.token_to_kv_pool = DSATokenToKVPool(
-                    model_runner.max_total_num_tokens,
+            elif is_dsa(model_runner.model_config.hf_config):
+                model_runner.num_effective_layers=model_runner.attn_end_layer-model_runner.attn_start_layer
+                token_to_kv_pool_class = L1HalfDSATokenToKVPool if model_runner.server_args.enable_mla_l1_5_cache else DSATokenToKVPool
+                model_runner.token_to_kv_pool = token_to_kv_pool_class(
+                    model_runner.local_max_num_tokens,
                     model_dtype=model_runner.dtype,
                     dtype=model_runner.kv_cache_dtype,
                     kv_lora_rank=model_runner.model_config.kv_lora_rank,
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
-                    layer_num=model_runner.model_config.num_attention_layers,
+                    layer_num=model_runner.num_effective_layers,
                     device=model_runner.device,
                     enable_memory_saver=model_runner.server_args.enable_memory_saver,
                     max_batch_size=max_num_reqs + 1,
@@ -255,23 +313,29 @@ class AttnInitializer(object):
                     page_size=model_runner.page_size,
                     rank=model_runner.global_rank,
                     index_head_dim=get_nsa_index_head_dim(model_runner.model_config.hf_config),
-                    index_dtype=model_runner.kv_cache_dtype, # temporally use the same
+                    index_dtype=model_runner.index_k_dtype,
+                    start_layer=model_runner.attn_start_layer,
+                    end_layer=model_runner.attn_end_layer,
                 )
             else:
-                model_runner.token_to_kv_pool = MLATokenToKVPool(
-                    model_runner.max_total_num_tokens,
+                model_runner.num_effective_layers=model_runner.attn_end_layer-model_runner.attn_start_layer
+                token_to_kv_pool_class = MLAL1HalfTokenToKVPool if model_runner.server_args.enable_mla_l1_5_cache else MLATokenToKVPool
+                model_runner.token_to_kv_pool = token_to_kv_pool_class(
+                    model_runner.local_max_num_tokens,
                     model_dtype=model_runner.dtype,
                     dtype=model_runner.kv_cache_dtype,
                     quant_method=model_runner.kv_cache_quant_method,
                     kv_lora_rank=model_runner.model_config.kv_lora_rank,
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
-                    layer_num=model_runner.model_config.num_attention_layers,
+                    layer_num=model_runner.num_effective_layers,
                     device=model_runner.device,
                     enable_memory_saver=model_runner.server_args.enable_memory_saver,
                     max_batch_size=max_num_reqs + 1,
                     max_context_len=model_runner.model_config.context_len + model_runner.page_size * 4,
                     page_size=model_runner.page_size,
-                    rank=model_runner.global_rank
+                    rank=model_runner.global_rank,
+                    start_layer=model_runner.attn_start_layer,
+                    end_layer=model_runner.attn_end_layer,
                 )
         elif model_runner.mambaish_config:
             extra_args = {}
@@ -351,6 +415,20 @@ class AttnInitializer(object):
                         enable_kvcache_transpose=False,
                         device=model_runner.device,
                     )
+                elif model_runner.server_args.drafter_attention_backend == "npu":
+                    model_runner.token_to_kv_pool = NPUMHATokenToKVPool(
+                        model_runner.max_total_num_tokens,
+                        dtype=model_runner.kv_cache_dtype,
+                        head_num=model_runner.model_config.get_num_kv_heads(get_draft_attention_tp_size()),
+                        head_dim=model_runner.model_config.head_dim,
+                        layer_num=model_runner.model_config.num_attention_layers,
+                        device=model_runner.device,
+                        enable_memory_saver=model_runner.server_args.enable_memory_saver,
+                        max_batch_size=max_num_reqs * 2 + 1,
+                        max_context_len=model_runner.model_config.context_len + model_runner.page_size * 4,
+                        page_size=model_runner.page_size,
+                        rank=model_runner.global_rank
+                    )
                 else:
                     model_runner.token_to_kv_pool = MHATokenToKVPool(
                         model_runner.max_total_num_tokens,
@@ -403,6 +481,9 @@ class AttnInitializer(object):
         elif backend_name == "npu_mla":
             logger.info("========select NpuMLAAttnBackend=============")
             model_runner.attn_backend = NpuMLAAttnBackend(model_runner)
+        elif backend_name == "npu":
+            logger.info("========select NpuAttnBackend=============")
+            model_runner.attn_backend = NpuAttnBackend(model_runner)
         elif backend_name == "dsa":
             model_runner.attn_backend = DpskSparseAttnBackend(model_runner)
         elif backend_name == "hybrid_linear_attn":
@@ -448,6 +529,14 @@ class AttnInitializer(object):
             num_attention_layers = len(model_runner.model_config.hf_config.full_attention_layer_ids)
         else:
             num_attention_layers = model_runner.model_config.num_attention_layers
+
+        if model_runner.server_args.pp_size > 1:
+            if model_runner.server_args.pp_layer_nums is not None:
+                num_attention_layers = max(model_runner.server_args.pp_layer_nums) * 2
+            else:
+                num_attention_layers = (num_attention_layers + model_runner.server_args.pp_size) // model_runner.server_args.pp_size * 2
+            logger.info(f"will creating {num_attention_layers=} attention layers kv cache")
+
         # If using MTP or EAGLE, add one layer during profile (default to one for now)
         if model_runner.server_args.speculative_algorithm is not None:
             num_attention_layers += 1
@@ -478,6 +567,7 @@ class AttnInitializer(object):
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - model_runner.mem_fraction_static
         )
+        logger.info(f"{rest_memory=} {available_gpu_memory=} {total_gpu_memory=} {model_runner.mem_fraction_static}")
         if model_runner.is_hybrid_gdn:
             rest_memory -= (
                 model_runner.server_args.max_mamba_cache_size

@@ -54,7 +54,7 @@ def parse_args():
     parser.add_argument(
         "--output-length",
         type=int,
-        default=1,
+        default=1000,
         help="Length of each output",
     )
     parser.add_argument(
