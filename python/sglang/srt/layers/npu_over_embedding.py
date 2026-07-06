@@ -37,7 +37,8 @@ class NpuOverEmbedding(torch.nn.Module):
                  over_embedding_m: int,
                  over_embedding_k: int,
                  over_embedding_n: int,
-                 oe_ignore_tokens):
+                 oe_ignore_tokens,
+                 eos_token_id):
         super().__init__()
         self.num_embeddings=num_embeddings
         self.embedding_dim=embedding_dim
@@ -45,6 +46,8 @@ class NpuOverEmbedding(torch.nn.Module):
         self.over_embedding_k=over_embedding_k
         self.over_embedding_n=over_embedding_n
         self.oe_ignore_tokens=torch.tensor(oe_ignore_tokens)
+        self.eos_token_id=eos_token_id
+        logger.info(f"{self.eos_token_id=} {self.oe_ignore_tokens=}")
 
         # 初始化普通词表 [vocab_size, hidden_dim]
         self.word_embeder=VocabParallelEmbedding(
@@ -185,7 +188,8 @@ class NpuOverEmbedding(torch.nn.Module):
                 batch_size=forward_batch.req_pool_indices.shape[0],
                 oe_n=self.over_embedding_n,
                 oe_k=self.over_embedding_k,
-                max_context_len=forward_batch.oe_token_table.shape[1]
+                max_context_len=forward_batch.oe_token_table.shape[1],
+                eos_token_id=self.eos_token_id,
             )
 
             if is_draft and forward_batch.forward_mode == ForwardMode.EXTEND:

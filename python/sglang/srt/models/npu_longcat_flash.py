@@ -822,6 +822,7 @@ class NPUFlashModel(torch.nn.Module):
                 over_embedding_k=config.oe_split_num,
                 over_embedding_n=config.oe_neighbor_num,
                 oe_ignore_tokens=config.oe_ignore_tokens,
+                eos_token_id=config.eos_token_id,
             )
         else:
             self.embed_tokens=VocabParallelEmbedding(

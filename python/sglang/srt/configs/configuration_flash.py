@@ -193,3 +193,4 @@ class FLASHConfig(PretrainedConfig):
             self.oe_neighbor_num = emb_neighbor_num
             self.oe_split_num = emb_split_num
             self.oe_ignore_tokens = []
+            self.eos_token_id = eos_token_id
