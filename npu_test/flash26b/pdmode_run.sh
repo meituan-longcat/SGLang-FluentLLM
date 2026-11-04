@@ -1,66 +1,42 @@
-#!/bin/bash
-
-# 设置节点数量和每节点大小（设备数）
+#!/usr/bin/env bash
+# Decode hosts precede Prefill hosts in cluster_ip_list.
+set -eo pipefail
 prefill_nodes_num=$1
-prefill_nodes_size=$2  # 每个 prefill 节点的设备数 (ep_size)
-
+prefill_nodes_size=$2
 decode_nodes_num=$3
-decode_nodes_size=$4   # 每个 decode 节点的设备数 (ep_size)
-
-echo "prefill: nodes=${prefill_nodes_num}, size_per_node=${prefill_nodes_size}"
-echo "decode: nodes=${decode_nodes_num}, size_per_node=${decode_nodes_size}"
-
-# 默认每个服务器16个NPU设备
-npu_per_server=16
-
-currpath=`pwd`
-local_id=${Node_idx}
-
-# 计算总设备数
-total_prefill_devices=$(( prefill_nodes_num * prefill_nodes_size ))
-total_decode_devices=$(( decode_nodes_num * decode_nodes_size ))
-
-
-if [ ${local_id} -lt ${total_decode_devices} ]; then
-    # ========== DECODE 节点 ==========
-    # 计算该 rank 属于第几个 decode 节点
-    decode_idx=$(( local_id / decode_nodes_size ))
-    # 计算该 rank 在当前 decode 节点内的 rank
-    decode_rank=$(( local_id % decode_nodes_size ))
-    # 获取当前 decode 节点 rank0 的 IP (该节点的起始 local_id 对应的 IP)
-    ips=($(echo $cluster_ip_list | tr ',' ' '))
-    decode_rank0_local_id=$(( decode_idx * decode_nodes_size ))
-    MASTERIP="${MASTERIP:-${ips[${decode_rank0_local_id}]}}"
-
-    echo "Starting DECODE: local_id=${local_id}, decode_idx=${decode_idx}, decode_rank=${decode_rank}, MASTERIP=${MASTERIP}"
-
-    export MASTERIP=${MASTERIP}
-    bash npu_test/flash26b/run_decode.sh ${decode_rank} ${decode_nodes_size} &
+decode_nodes_size=$4
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+read -r -a ips <<< "${cluster_ip_list//,/ }"
+local_id=${Node_idx:?Set Node_idx.}
+total_decode=$((decode_nodes_num * decode_nodes_size))
+total_nodes=$((total_decode + prefill_nodes_num * prefill_nodes_size))
+(( local_id >= 0 && local_id < total_nodes )) || { echo "Invalid Node_idx." >&2; exit 2; }
+if (( local_id < total_decode )); then
+    rank=$((local_id % decode_nodes_size))
+    first=$((local_id / decode_nodes_size * decode_nodes_size))
+    export MASTERIP="${ips[first]}"
+    role_script=run_decode.sh
+    node_count=${decode_nodes_size}
 else
-    # ========== PREFILL 节点 ==========
-    # 计算在 prefill 集群内的偏移
-    prefill_local_id=$(( local_id - total_decode_devices ))
-    # 计算该 rank 属于第几个 prefill 节点
-    prefill_idx=$(( prefill_local_id / prefill_nodes_size ))
-    # 计算该 rank 在当前 prefill 节点内的 rank
-    prefill_rank=$(( prefill_local_id % prefill_nodes_size ))
-    # 获取当前 prefill 节点 rank0 的 IP (该节点的起始 local_id 对应的 IP)
-    ips=($(echo $cluster_ip_list | tr ',' ' '))
-    prefill_rank0_local_id=${local_id}  # 当前 prefill 节点的起始 local_id 就是当前 local_id 减去 rank 偏移
-    prefill_rank0_local_id=$(( total_decode_devices + prefill_idx * prefill_nodes_size ))
-    MASTERIP="${MASTERIP:-${ips[${prefill_rank0_local_id}]}}"
-
-    echo "Starting PREFILL: local_id=${local_id}, prefill_idx=${prefill_idx}, prefill_rank=${prefill_rank}, MASTERIP=${MASTERIP}"
-
-    export MASTERIP=${MASTERIP}
-    bash npu_test/flash26b/run_prefill.sh  ${prefill_rank} ${prefill_nodes_size} &
+    offset=$((local_id - total_decode))
+    rank=$((offset % prefill_nodes_size))
+    first=$((total_decode + offset / prefill_nodes_size * prefill_nodes_size))
+    export MASTERIP="${ips[first]}"
+    role_script=run_prefill.sh
+    node_count=${prefill_nodes_size}
 fi
-
-last_node=$(( total_prefill_devices + total_decode_devices -1 ))
-
-if [ ${local_id} -eq ${last_node} ]; then
-    echo "Starting minilb..."
-    bash npu_test/flash26b/run_minilb.sh ${prefill_nodes_num} ${prefill_nodes_size} ${decode_nodes_num} ${decode_nodes_size} &
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    bash "${SCRIPT_DIR}/${role_script}" "${rank}" "${node_count}"
+    if (( local_id == total_nodes - 1 )); then
+        bash "${SCRIPT_DIR}/run_minilb.sh" "$@"
+    fi
+    exit
 fi
-
-wait
+bash "${SCRIPT_DIR}/${role_script}" "${rank}" "${node_count}" &
+worker_pid=$!
+if (( local_id == total_nodes - 1 )); then
+    bash "${SCRIPT_DIR}/run_minilb.sh" "$@" &
+    router_pid=$!
+fi
+wait "${worker_pid}"
+if [[ -n "${router_pid:-}" ]]; then wait "${router_pid}"; fi

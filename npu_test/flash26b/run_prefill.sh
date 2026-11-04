@@ -1,122 +1,75 @@
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-WORKDIR=`pwd`
-
-if [ -z "${MODEL_PATH}" ]; then
-    MODEL_PATH=/workdir/npu_dev_test/models/flash_think_0901_iter7000_mtp_quant_allblock_int8
-    echo "MODEL_PATH 不存在，设置为默认值: $MODEL_PATH"
-else
-    echo "MODEL_PATH 已存在，值为: $MODEL_PATH"
+#!/usr/bin/env bash
+set -eo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export PYTHON_BIN="${PYTHON_BIN:-python3}"
+if [[ "${DRY_RUN:-0}" != 1 ]]; then
+    source "${ASCEND_TOOLKIT_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
+    source "${ATB_ENV:-/usr/local/Ascend/nnal/atb/set_env.sh}"
+    if [[ ! -f /etc/hccn.conf && ! -f "${HCCN_CONF_FILE:-}" ]]; then
+        echo "Set HCCN_CONF_FILE when /etc/hccn.conf is unavailable." >&2
+        exit 1
+    fi
 fi
-
-if [ ! -d "${MODEL_PATH}" ]; then
-    echo "错误: 路径 ${MODEL_PATH} 不存在"
-    exit 1
-fi
-
-ulimit -c unlimited
-
-export PYTHONPATH=$WORKDIR/python:$PYTHONPATH
-export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/Ascend/driver/lib64/driver/:$LD_LIBRARY_PATH
-export NPROCS_PER_NODE=16
+export PYTHONPATH="${REPO_ROOT}/python:${PYTHONPATH:-}"
+export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True,base_addr_aligned_kb:16}"
+export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-2}"
+export HCCL_INTRA_ROCE_ENABLE="${HCCL_INTRA_ROCE_ENABLE:-1}"
+export HCCL_INTRA_PCIE_ENABLE="${HCCL_INTRA_PCIE_ENABLE:-0}"
+export HCCL_RDMA_TC="${HCCL_RDMA_TC:-100}"
+export HCCL_RDMA_SL="${HCCL_RDMA_SL:-3}"
+export HCCL_RDMA_TIMEOUT="${HCCL_RDMA_TIMEOUT:-20}"
+export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-600}"
+export HCCL_OP_RETRY_ENABLE="${HCCL_OP_RETRY_ENABLE:-L0:0,L1:0,L2:0}"
+export NPU_ENABLE_WEIGHT_NZ="${NPU_ENABLE_WEIGHT_NZ:-0}"
+export NPU_ENABLE_MC2="${NPU_ENABLE_MC2:-0}"
+export SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK=1
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-
-if ! [ -e "/etc/hccn.conf" ]; then
-    custom_hccn_file=$(pwd)/hccn.conf
-    bash $(dirname "$0")/gen_hccn_conf.sh ${custom_hccn_file}
-    export HCCN_CONF_FILE=${custom_hccn_file}
+export VIDEO_MAX_FRAMES="${VIDEO_MAX_FRAMES:-128}"
+export VIDEO_MAX_PIXELS="${VIDEO_MAX_PIXELS:-150528}"
+export VIDEO_MIN_PIXELS="${VIDEO_MIN_PIXELS:-100352}"
+cd "${REPO_ROOT}"
+: "${MODEL_PATH:?Set MODEL_PATH.}"
+: "${MASTERIP:?Set MASTERIP.}"
+if [[ "${DRY_RUN:-0}" != 1 && ! -d "${MODEL_PATH}" ]]; then
+    echo "MODEL_PATH is not a directory." >&2; exit 1
 fi
-
-export OMP_NUM_THREADS=8
-# export ASCEND_LAUNCH_BLOCKING=1
-# export ASCEND_SLOG_PRINT_TO_STDOUT=1
-# export ASCEND_GLOBAL_LOG_LEVEL=1
-# export LOAD_NUMBER_LAYERS=2
+NODE_RANK=${NODE_RANK:-$1}
 NODE_NUM=${NODE_NUM:-$2}
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True,base_addr_aligned_kb:16
-num_910b=$(npu-smi info | grep 910B | wc -l)
-if [[ $num_910b -gt 0 ]]; then
-  echo 'CPU_AFFINITY_CONF 910B'
-  export CPU_AFFINITY_CONF=npu0:2-6,npu1:7-11,npu2:12-16,npu3:17-21,npu4:50-54,npu5:55-59,npu6:60-64,npu7:65-69,npu8:22-27,npu9:28-32,npu10:33-37,npu11:38-42,npu12:70-74,npu13:75-79,npu14:80-84,npu15:85-89
-else
-  echo 'CPU_AFFINITY_CONF 910C'
-  export CPU_AFFINITY_CONF=npu0:8-39,npu1:40-71,npu2:72-103,npu3:104-135,npu4:160-191,npu5:192-223,npu6:224-255,npu7:256-287,npu8:320-351,npu9:352-383,npu10:384-415,npu11:416-447,npu12:480-511,npu13:512-543,npu14:544-575,npu15:576-607
-  if [ "$NODE_NUM" -eq 1 ]; then
-    export TORCH_HCCL_ZERO_COPY=1
- fi
-fi
-export TASK_QUEUE_ENABLE=2
-
+export NPROCS_PER_NODE=16
+export UNBALANCED_MODEL_LOADING_TIMEOUT_S=9000
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT="${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-600}"
+export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT="${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-600}"
 export ENABLE_TORCH_COMPILE_CACHE=0
-export HCCL_INTRA_ROCE_ENABLE=1
-export HCCL_INTRA_PCIE_ENABLE=0
-export HCCL_RDMA_TC=100
-export HCCL_RDMA_SL=3
-export CPU_AFFINITY_CONF=1
-
-export HCCL_IF_BASE_PORT=8282
-
-export NPU_ENABLE_WEIGHT_NZ=0
-export NPU_ENABLE_MC2=0
-export HCCL_OP_RETRY_ENABLE="L0:0,L1:0,L2:0"
-export HCCL_RDMA_TIMEOUT=20
-# 幻觉兜底
-export TOOL_CHOICE_BYPASS_CHECK=true
-# tokenizer rayon线程池报错，限制最大线程数
-export RAYON_NUM_THREADS=8
-
-pkill -9 sglang
-ps -axu | grep "python3 -m sglang.launch_server" | awk '{ print $2 }' | xargs kill -9
-ps -axu | grep "sglang::" | awk '{ print $2 }' | xargs kill -9
-
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-8282}"
+export CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1}"
 export NPU_ENABLE_ALL2ALL_COMM=0
 export NPU_ENABLE_MOE_GATING_TOP_K=1
-
-# export SKIP_PREFILL=1
-NODE_RANK=${NODE_RANK:-$1}
-MASTERIP=${MASTERIP:-"0.0.0.0"}
-# 根据MAX_MODEL_LEN是否存在添加context-length
-if [ -n "$MAX_MODEL_LEN" ]; then
-    model_args="$model_args --context-length $MAX_MODEL_LEN"
+export TOOL_CHOICE_BYPASS_CHECK=true
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-8}"
+export ASCEND_AUTO_CONNECT="${ASCEND_AUTO_CONNECT:-1}"
+read -r -a shared_args <<< "${engine_subfix_cmd//$'\n'/ }"
+read -r -a role_args <<< "${prefill_args//$'\n'/ }"
+command=("${PYTHON_BIN}" -m sglang.launch_server "${shared_args[@]}" \
+  --device npu --attention-backend npu_mla --model-path "${MODEL_PATH}" \
+  --served-model-name "${served_model_name:-LongCat-2.5}" --trust-remote-code \
+  --host 0.0.0.0 --port "${SERVER_PORT:-6080}" --nprocs-per-node 16 \
+  --dense-parallel-strategy combine --moe-parallel-strategy ep "${role_args[@]}" \
+  --node-rank "${NODE_RANK}" --nnodes "${NODE_NUM}" \
+  --dist-init-addr "${MASTERIP}:${DIST_PORT:-6090}" \
+  --disaggregation-mode prefill --disaggregation-transfer-backend mooncake_async \
+  --context-length "${MAX_MODEL_LEN:-1048586}" \
+  --enable-metrics --metrics-reporters prometheus \
+  --schedule-conservativeness "${PREFILL_SCHEDULE_CONSERVATIVENESS:-5}" \
+  --show-time-cost --disable-cuda-graph --page-size 128 --disable-prefill-graph \
+  --disable-overlap-schedule --disable-custom-all-reduce \
+  --load-balance-method round_robin --tokenizer-executor-num-processes 24)
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    printf '%q ' "${command[@]}"
+    printf '\n'
+    exit 0
 fi
-
-#        export NPU_PROF_SAVE_DIR='/tmp/prof_dump'
-#        rm -rf /tmp/prof_dump;
-#        export NPU_PROF_WAIT_TIME=10
-#        export NPU_PROF_WARMUP_TIME=1
-#        export NPU_PROF_ACTIVE_TIME=6
-
-python3  -m sglang.launch_server ${engine_subfix_cmd}  \
-  --device npu \
-  --attention-backend npu_mla \
-  --model-path $MODEL_PATH \
-  --served-model-name Qwen3 \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 6080 \
-  --nprocs-per-node 16 \
-  --dense-parallel-strategy combine \
-  --moe-parallel-strategy ep ${prefill_args} \
-  --node-rank ${NODE_RANK} \
-  --nnodes ${NODE_NUM} \
-  --dist-init-addr ${MASTERIP}:6090 \
-  --disaggregation-mode prefill \
-  --disaggregation-transfer-backend mooncake_async $model_args \
-  --enable-metrics \
-  --schedule-conservativeness 5 \
-  --show-time-cost \
-  --max-running-requests 8 \
-  --disable-cuda-graph \
-  --page-size 128 \
-  --disable-prefill-graph \
-  --disable-overlap-schedule \
-  --disable-custom-all-reduce \
-  --app-key com.sankuai.hadoop.manabo \
-  --tool-call-parser longcat \
-  --load-balance-method round_robin \
-  --npu-smooth-quant \
-  --tokenizer-executor-num-processes 24 &
-SGLANG_PID=$!
-sleep 45
-python3 $(dirname "$0")/bind_core.py 0
-wait $SGLANG_PID
+exec "${command[@]}"

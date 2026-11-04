@@ -1038,7 +1038,7 @@ class ServerArgs:
             "--metrics-reporters",
             action="append",
             choices=["cat", "prometheus", "llm-platform"],
-            default=["cat"],
+            default=[],
             help="Select metrics reporter(can be specified multiple times)",
         )
 
