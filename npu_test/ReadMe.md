@@ -50,7 +50,7 @@ PyTorch版本：2.9
     # 下载项目源码，使用支持LongCat 2.5 W4A4及EPD分离部署的NPU版本
     git clone  https://github.com/meituan-longcat/SGLang-FluentLLM.git
     cd SGLang-FluentLLM
-    git checkout npu-longcat-2.5
+    git checkout longcat-2.5-npu
 
     # 安装依赖的python库
     pip3 install -r ./npu_test/requirements.txt --no-deps
