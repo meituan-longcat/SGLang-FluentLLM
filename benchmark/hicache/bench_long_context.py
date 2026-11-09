@@ -17,10 +17,9 @@ from bench_multiturn import (
     log_to_jsonl_file,
     parse_args,
 )
-from tqdm.asyncio import tqdm
-
-from sglang.bench_serving import get_tokenizer
 from data_processing import sample_fixed_sharegpt_requests
+from sglang.bench_serving import get_tokenizer
+from tqdm.asyncio import tqdm
 
 
 class ContextWorkloadGenerator(WorkloadGenerator):
@@ -186,7 +185,6 @@ class ContextWorkloadGenerator(WorkloadGenerator):
             except queue.Empty:
                 if self.pbar.n == self.pbar.total:
                     break
-                pass
 
     def run(self):
         request_thread = threading.Thread(target=self.request_sender, daemon=True)
@@ -244,16 +242,6 @@ class ContextWorkloadGenerator(WorkloadGenerator):
 
         # Note: user_generator is not used in long context benchmark
         # These stats are only relevant for multi-round benchmarks like mix.py
-        # user_stats = self.user_generator.user_stats
-        # input_stats = self.user_generator.input_stats
-        # output_stats = self.user_generator.output_stats
-        # print(f"round_ratios: {user_stats}")
-        # print(
-        #     f"mean_new_tokens_per_round: {[int(a/b) if b > 0 else 0 for a, b in input_stats]}"
-        # )
-        # print(
-        #     f"mean_return_tokens_per_round: {[int(a/b) if b > 0 else 0 for a, b in output_stats]}"
-        # )
         return performance_data
 
 

@@ -1,7 +1,8 @@
+# ruff: noqa: S105
 import json
 import logging
 import re
-from typing import List, Union, Literal
+from typing import Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -44,10 +45,7 @@ class MistralDetector(BaseFormatDetector):
         return self.bot_token in text
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -76,9 +74,7 @@ class MistralDetector(BaseFormatDetector):
                 function_call_arr = [function_call_arr]
             calls = self.parse_base_json(function_call_arr, tools, tool_choice)
         except json.JSONDecodeError as e:
-            logger.warning(
-                f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}"
-            )
+            logger.warning(f"Failed to parse JSON part: {json_array_str}, JSON parse error: {str(e)}")
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
@@ -94,9 +90,7 @@ class MistralDetector(BaseFormatDetector):
             return None
 
         # Start from the opening bracket after [TOOL_CALLS]
-        json_start = (
-            start_idx + len(self.bot_token) - 1
-        )  # -1 to include the opening bracket
+        json_start = start_idx + len(self.bot_token) - 1  # -1 to include the opening bracket
         bracket_count = 0
         in_string = False
         escape_next = False

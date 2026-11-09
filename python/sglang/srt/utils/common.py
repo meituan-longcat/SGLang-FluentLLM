@@ -43,10 +43,12 @@ import tempfile
 import threading
 import time
 import traceback
+import types
 import uuid
 import warnings
 from collections import OrderedDict, defaultdict
-from contextlib import contextmanager
+from collections.abc import Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
@@ -58,17 +60,11 @@ from pathlib import Path
 from typing import (
     Any,
     Callable,
-    Dict,
     Generic,
-    List,
-    Optional,
     Protocol,
-    Sequence,
-    Set,
-    Tuple,
     TypeVar,
-    Union,
 )
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import psutil
@@ -78,30 +74,28 @@ import torch
 import torch.distributed
 import torch.distributed as dist
 import triton
-import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
+from pydantic import BaseModel
 from starlette.routing import Mount
-from torch import nn
+from torch import Tensor, nn
 from torch.library import Library
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
-from sglang.srt.metrics.func_timer import enable_func_timer
+try:
+    from torchvision.io import decode_jpeg
+except ImportError:
+    decode_jpeg = None
+
+from sglang.srt.observability.metrics.func_timer import enable_func_timer
 
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
-
-# for NPU
-_NPU_910B_NUM_GPUS_PER_NODE = int(os.popen("npu-smi info | grep 910B | wc -l").read().strip())
-
-def get_910b_num_gpus_per_node():
-    assert _NPU_910B_NUM_GPUS_PER_NODE is not None
-    return _NPU_910B_NUM_GPUS_PER_NODE
 
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
@@ -112,10 +106,7 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
-if is_hip():
-    FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX
-else:
-    FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+FP8_E4M3_MAX = HIP_FP8_E4M3_FNUZ_MAX if is_hip() else torch.finfo(torch.float8_e4m3fn).max
 
 FP8_E4M3_MIN = -FP8_E4M3_MAX
 
@@ -142,16 +133,25 @@ def is_xpu() -> bool:
 def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
+
 __is_npu__ = is_npu()
+
+
+if is_npu():
+    # for NPU
+    _NPU_910B_NUM_GPUS_PER_NODE = int(os.popen("npu-smi info | grep 910B | wc -l").read().strip())  # noqa: S605
+else:
+    _NPU_910B_NUM_GPUS_PER_NODE = None
+
+
+def get_910b_num_gpus_per_node():
+    assert _NPU_910B_NUM_GPUS_PER_NODE is not None
+    return _NPU_910B_NUM_GPUS_PER_NODE
 
 
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return machine in ("x86_64", "amd64", "i386", "i686") and hasattr(torch, "cpu") and torch.cpu.is_available()
 
 
 def is_cpu() -> bool:
@@ -167,13 +167,15 @@ def get_cuda_version():
 def _check(cc_major):
     if not is_cuda():
         return False
-    return torch.cuda.get_device_capability()[0] == cc_major and tuple(
-        map(int, torch.version.cuda.split(".")[:2])
-    ) >= (12, 3)
+    return torch.cuda.get_device_capability()[0] == cc_major and tuple(map(int, torch.version.cuda.split(".")[:2])) >= (12, 3)
 
 
-is_ampere_with_cuda_12_3 = lambda: _check(8)
-is_hopper_with_cuda_12_3 = lambda: _check(9)
+def is_ampere_with_cuda_12_3():
+    return _check(8)
+
+
+def is_hopper_with_cuda_12_3():
+    return _check(9)
 
 
 @lru_cache(maxsize=1)
@@ -187,18 +189,22 @@ def is_blackwell():
 def is_sm100_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
-    return (torch.cuda.get_device_capability(device)[0] == 10) and (
-        torch.version.cuda >= "12.8"
-    )
+    return (torch.cuda.get_device_capability(device)[0] == 10) and (torch.version.cuda >= "12.8")
 
 
 @lru_cache(maxsize=1)
 def is_sm90_supported(device=None) -> bool:
     if not is_cuda_alike():
         return False
-    return (torch.cuda.get_device_capability(device)[0] == 9) and (
-        torch.version.cuda >= "12.3"
-    )
+    return (torch.cuda.get_device_capability(device)[0] == 9) and (torch.version.cuda >= "12.3")
+
+
+@lru_cache(maxsize=1)
+def is_sm89_supported():
+    if not is_cuda():
+        return False
+    device_capability = torch.cuda.get_device_capability()
+    return device_capability[0] == 8 and device_capability[1] == 9 and tuple(map(int, torch.version.cuda.split(".")[:2])) >= (11, 8)
 
 
 _warned_bool_env_var_keys = set()
@@ -214,9 +220,7 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
 
     if (value not in truthy_values) and (value not in falsy_values):
         if value not in _warned_bool_env_var_keys:
-            logger.warning(
-                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
-            )
+            logger.warning(f"get_bool_env_var({name}) see non-understandable value={value} and treat as false")
         _warned_bool_env_var_keys.add(value)
 
     return value in truthy_values
@@ -244,7 +248,7 @@ try:
     # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
     is_amx_tile_supported = torch._C._cpu._is_amx_tile_supported()
-except:
+except Exception:
     is_amx_tile_supported = False
 
 
@@ -276,9 +280,7 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
+_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var("SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false")
 
 
 class DynamicGradMode(_DecoratorContextManager):
@@ -323,7 +325,7 @@ class DynamicGradMode(_DecoratorContextManager):
         else:
             torch.set_grad_enabled(self.prev)
 
-    def clone(self) -> "DynamicGradMode":
+    def clone(self) -> DynamicGradMode:
         r"""
         Create a copy of this class
         """
@@ -365,7 +367,7 @@ def mark_start(name, interval=0.1, color=0, indent=0):
     if not show_time_cost:
         return
     torch.cuda.synchronize()
-    if time_infos.get(name, None) is None:
+    if time_infos.get(name) is None:
         time_infos[name] = TimeInfo(name, interval, color, indent)
     time_infos[name].acc_time -= time.perf_counter()
 
@@ -399,9 +401,7 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-def get_available_gpu_memory(
-    device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
-):
+def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True, cpu_group=None):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
@@ -466,12 +466,11 @@ def get_available_gpu_memory(
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
-        torch.distributed.all_reduce(
-            tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
-        )
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group)
         free_gpu_memory = tensor.item()
 
     return free_gpu_memory / (1 << 30)
+
 
 def check_and_clear_cache(threshold_gb):
     reserved_gb = torch.cuda.memory_reserved() / (1024**3)
@@ -495,48 +494,52 @@ def check_and_clear_cache(threshold_gb):
             f"New Allocated Total: {allocated_gb_after:.2f} GB."
         )
 
-def set_memory_threshold(topk : int, hidden_size: int):
+
+def set_memory_threshold(topk: int, hidden_size: int):
     from sglang.srt.env import global_server_args_dict
+
     max_prefill_tokens, dp_size = global_server_args_dict["max_prefill_tokens"], global_server_args_dict["dp_size"]
     memory_remained = get_available_gpu_memory("cuda", torch.cuda.current_device(), empty_cache=False)
     memory_reserved_base = torch.cuda.memory_reserved() / (1024**3)
     # extreme_gate_up_out_size == global_tokens * topk * hidden_size_x2 * sizeof(bfloat16) / 1024**3
     space_hint = (max_prefill_tokens * dp_size * topk) * (hidden_size * 2) * 2 / (1024**3)
     max_memory_reserved = memory_reserved_base + space_hint
-    logger.info(f"memory_reserved_base={memory_reserved_base:.2f} GB, "
-                f"space_hint={space_hint/2:.2f} GB, "
-                f"max_memory_reserved={max_memory_reserved:.2f} GB, "
-                f"memory_remained={memory_remained:.2f} GB")
+    logger.info(
+        f"memory_reserved_base={memory_reserved_base:.2f} GB, "
+        f"space_hint={space_hint / 2:.2f} GB, "
+        f"max_memory_reserved={max_memory_reserved:.2f} GB, "
+        f"memory_remained={memory_remained:.2f} GB"
+    )
     # [TODO] how many memory space should be reserved for moe
-    assert space_hint < memory_remained, \
-        "Not enough memory for torch allocator. Set a smaller max_prefill_tokens or mem_fraction_static."
+    assert space_hint < memory_remained, "Not enough memory for torch allocator. Set a smaller max_prefill_tokens or mem_fraction_static."
 
     return max_memory_reserved
+
 
 def is_pin_memory_available() -> bool:
     return torch.cuda.is_available()
 
 
 class LayerFn(Protocol):
-
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
 
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
-    pp_rank: Optional[int] = None,
-    pp_size: Optional[int] = None,
+    pp_rank: int | None = None,
+    pp_size: int | None = None,
     prefix: str = "",
     return_tuple: bool = False,
     return_index: int = 0,
-    offloader_kwargs: Optional[Dict[str, Any]] = None,
-) -> Tuple[torch.nn.Module, int, int]:
+    return_indices: tuple[int, ...] | None = None,
+    return_kwarg_names: tuple[str, ...] | None = None,
+    offloader_kwargs: dict[str, Any] | None = None,
+) -> tuple[torch.nn.Module, int, int]:
     """Make a list of layers with the given layer function"""
-    from sglang.srt.offloader import get_offloader
     # circula imports
-    from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
+    from sglang.srt.model_executor.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -549,16 +552,26 @@ def make_layers(
         else (0, num_hidden_layers)
     )
     modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple, return_index=return_index) for _ in range(start_layer)]
+        [
+            PPMissingLayer(
+                return_tuple=return_tuple,
+                return_index=return_index,
+                return_indices=return_indices,
+                return_kwarg_names=return_kwarg_names,
+            )
+            for _ in range(start_layer)
+        ]
         + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
+            (layer_fn(idx=idx, prefix=add_prefix(idx, prefix)) for idx in range(start_layer, end_layer)),
             **(offloader_kwargs or {}),
         )
         + [
-            PPMissingLayer(return_tuple=return_tuple)
+            PPMissingLayer(
+                return_tuple=return_tuple,
+                return_index=return_index,
+                return_indices=return_indices,
+                return_kwarg_names=return_kwarg_names,
+            )
             for _ in range(end_layer, num_hidden_layers)
         ]
     )
@@ -583,11 +596,9 @@ def get_cmo_stream():
 
 
 def prepare_weight_cache(handle, cache):
-    import torch_npu
+    import torch_npu  # noqa: F401 - registers device/operator implementations
 
-    NPU_PREFETCH_MAX_SIZE_BYTES = (
-        1000000000  # 1GB, a large value to prefetch entire weight
-    )
+    NPU_PREFETCH_MAX_SIZE_BYTES = 1000000000  # 1GB, a large value to prefetch entire weight
     stream = get_cmo_stream()
     stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
@@ -619,11 +630,12 @@ def set_random_seed(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     if __is_npu__:
-        import torch_npu
+        import torch_npu  # noqa: F401 - registers device/operator implementations
+
         torch_npu.npu.manual_seed_all(seed)
 
 
-def find_process_using_port(port: int) -> Optional[psutil.Process]:
+def find_process_using_port(port: int) -> psutil.Process | None:
     for conn in psutil.net_connections(kind="inet"):
         if conn.laddr.port == port:
             try:
@@ -635,9 +647,7 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
-def wait_port_available(
-    port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True
-) -> bool:
+def wait_port_available(port: int, port_name: str, timeout_s: int = 30, raise_exception: bool = True) -> bool:
     for i in range(timeout_s):
         if is_port_available(port):
             return True
@@ -645,21 +655,15 @@ def wait_port_available(
         if i > 10 and i % 5 == 0:
             process = find_process_using_port(port)
             if process is None:
-                logger.warning(
-                    f"The port {port} is in use, but we could not find the process that uses it."
-                )
+                logger.warning(f"The port {port} is in use, but we could not find the process that uses it.")
 
             pid = process.pid
             error_message = f"{port_name} is used by a process already. {process.name()=}' {process.cmdline()=} {process.status()=} {pid=}"
-            logger.info(
-                f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}"
-            )
+            logger.info(f"port {port} is in use. Waiting for {i} seconds for {port_name} to be available. {error_message}")
         time.sleep(0.1)
 
     if raise_exception:
-        raise ValueError(
-            f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}"
-        )
+        raise ValueError(f"{port_name} at {port} is not available in {timeout_s} seconds. {error_message}")
     return False
 
 
@@ -671,7 +675,7 @@ def is_port_available(port):
             s.bind(("", port))
             s.listen(1)
             return True
-        except socket.error:
+        except OSError:
             return False
         except OverflowError:
             return False
@@ -728,9 +732,7 @@ def decode_video_base64(video_base64):
     else:
         # Find each JPEG start (0xFFD8) to isolate images
         i = 0
-        while (
-            i < len(video_bytes) - 1
-        ):  # Adjusted for the length of the JPEG SOI signature
+        while i < len(video_bytes) - 1:  # Adjusted for the length of the JPEG SOI signature
             # Check if we found the start of a JPEG file
             if video_bytes[i] == 0xFF and video_bytes[i + 1] == 0xD8:
                 img_starts.append(i)
@@ -743,11 +745,7 @@ def decode_video_base64(video_base64):
     for start_idx in img_starts:
         # Assuming each image is back-to-back, the end of one image is the start of another
         # The last image goes until the end of the byte string
-        end_idx = (
-            img_starts[img_starts.index(start_idx) + 1]
-            if img_starts.index(start_idx) + 1 < len(img_starts)
-            else len(video_bytes)
-        )
+        end_idx = img_starts[img_starts.index(start_idx) + 1] if img_starts.index(start_idx) + 1 < len(img_starts) else len(video_bytes)
         img_bytes = video_bytes[start_idx:end_idx]
 
         # Convert bytes to a PIL Image
@@ -769,9 +767,7 @@ def decode_video_base64(video_base64):
         )  # Return an empty array and size tuple if no frames were found
 
 
-def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
-) -> np.ndarray:
+def load_audio(audio_file: str, sr: int | None = None, mono: bool = True) -> np.ndarray:
     # Use soundfile here, since librosa use it under the hood,
     # and librosa will not support audio loading in the future
     import soundfile as sf
@@ -785,9 +781,7 @@ def load_audio(
         audio, original_sr = sf.read(BytesIO(audio_file))
     elif audio_file.startswith("data:"):
         audio_file = audio_file.split(",")[1]
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(audio_file, validate=True))
-        )
+        audio, original_sr = sf.read(BytesIO(pybase64.b64decode(audio_file, validate=True)))
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
         response = requests.get(audio_file, stream=True, timeout=timeout)
@@ -814,63 +808,114 @@ def load_audio(
 @dataclass
 class ImageData:
     url: str
-    detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    detail: Literal["auto", "low", "high"] | None = "auto"
+    max_dynamic_patch: int | None = None
+
+
+image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
+    """
+    Check three conditions:
+    1. whether CUDA is available.
+    2. whether torchvision decode_jpeg is available.
+    3. whether input is recognized as JPEG.
+    4. whether GPU image decode is enabled (some models such as CPM forcibly disable this).
+    """
+    if decode_jpeg is None or not is_cuda() or not gpu_image_decode:
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
+
+
+def _load_image(
+    image_bytes: bytes = b"",
+    image_file: str = "",
+    gpu_image_decode: bool = True,
+) -> torch.Tensor | Image.Image:
+    """
+    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    otherwise fallback to decode with PIL on CPU and return a PIL Image.
+    Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
+    """
+    if image_file != "":
+        image_bytes = get_image_bytes(image_file)
+    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
+        try:
+            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+            image_tensor = decode_jpeg(encoded_image, device="cuda")  # type: ignore[misc]
+            return image_tensor
+        except Exception as e:
+            logger.warning(f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}")
+    return Image.open(BytesIO(image_bytes))
 
 
 def load_image(
-    image_file: Union[Image.Image, str, ImageData, bytes],
-) -> tuple[Image.Image, tuple[int, int]]:
+    image_file: Image.Image | str | ImageData | bytes,
+    gpu_image_decode: bool = True,
+) -> tuple[torch.Tensor | Image.Image, tuple[int, int] | None]:
+    """
+    Load image from multiple input formats, including:
+    ImageData, PIL Image, bytes, URL, file path, or base64 string.
+    """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
 
-    image = image_size = None
+    image = None
+    image_size: tuple[int, int] | None = None
     if isinstance(image_file, Image.Image):
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = Image.open(BytesIO(image_file))
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
-        try:
-            response.raise_for_status()
-            image = Image.open(response.raw)
-            image.load()  # Force loading to avoid issues after closing the stream
-        finally:
-            response.close()
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
-        image = Image.open(image_file)
-    elif image_file.startswith("data:"):
-        image_file = image_file.split(",")[1]
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
-    elif isinstance(image_file, str):
-        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+    elif isinstance(image_file, str) and image_file.startswith("file://"):
+        image = _load_image(
+            image_file=unquote(urlparse(image_file).path),
+            gpu_image_decode=gpu_image_decode,
+        )
+    elif (
+        isinstance(image_file, str)
+        and image_file.lower().endswith(image_extension_names)
+        or isinstance(image_file, str)
+        and image_file.startswith("data:")
+        or isinstance(image_file, str)
+    ):
+        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
-
     return image, image_size
 
 
-def get_image_bytes(image_file: Union[str, bytes]):
+def get_image_bytes(image_file: str | bytes) -> bytes:
+    """Normalize various image inputs into raw bytes."""
     if isinstance(image_file, bytes):
         return image_file
-    elif image_file.startswith("http://") or image_file.startswith("https://"):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+    if image_file.startswith(("http://", "https://")):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "30"))
         response = requests.get(image_file, timeout=timeout)
-        return response.content
-    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        try:
+            response.raise_for_status()
+            result = response.content
+        finally:
+            response.close()
+        return result
+    if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
-        return pybase64.b64decode(image_file)
+        return pybase64.b64decode(image_file, validate=True)
     elif isinstance(image_file, str):
-        return pybase64.b64decode(image_file)
+        return pybase64.b64decode(image_file, validate=True)
     else:
         raise NotImplementedError(f"Invalid image: {image_file}")
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+def load_video(video_file: str | bytes, use_gpu: bool = True):
     # We import decord here to avoid a strange Segmentation fault (core dumped) issue.
     from decord import VideoReader, cpu, gpu
 
@@ -882,47 +927,47 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     except Exception:
         ctx = cpu(0)
 
-    tmp_file = None
+    tmp_file_path = None
     vr = None
     try:
         if isinstance(video_file, bytes):
-            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tmp_file.write(video_file)
-            tmp_file.close()
-            vr = VideoReader(tmp_file.name, ctx=ctx)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+                tmp_file.write(video_file)
+                tmp_file_path = tmp_file.name
+            vr = VideoReader(tmp_file_path, ctx=ctx)
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
                 response = requests.get(video_file, stream=True, timeout=timeout)
                 response.raise_for_status()
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                for chunk in response.iter_content(chunk_size=8192):
-                    tmp_file.write(chunk)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        tmp_file.write(chunk)
+                    tmp_file_path = tmp_file.name
+                vr = VideoReader(tmp_file_path, ctx=ctx)
             elif video_file.startswith("data:"):
                 _, encoded = video_file.split(",", 1)
                 video_bytes = pybase64.b64decode(encoded)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+                    tmp_file.write(video_bytes)
+                    tmp_file_path = tmp_file.name
+                vr = VideoReader(tmp_file_path, ctx=ctx)
             elif os.path.isfile(video_file):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file)
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_file.write(video_bytes)
-                tmp_file.close()
-                vr = VideoReader(tmp_file.name, ctx=ctx)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+                    tmp_file.write(video_bytes)
+                    tmp_file_path = tmp_file.name
+                vr = VideoReader(tmp_file_path, ctx=ctx)
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
         return vr
 
     finally:
-        if tmp_file and os.path.exists(tmp_file.name):
-            os.unlink(tmp_file.name)
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
 
 
 def encode_video(video_path, frame_count_limit=None):
@@ -936,10 +981,10 @@ def encode_video(video_path, frame_count_limit=None):
     if frame_count_limit == 0:
         return []
 
-    def uniform_sample(l, n):
-        gap = len(l) / n
+    def uniform_sample(seq, n):
+        gap = len(seq) / n
         idxs = [int(i * gap + gap / 2) for i in range(n)]
-        return [l[i] for i in idxs]
+        return [seq[i] for i in idxs]
 
     vr = VideoReader(video_path, ctx=cpu(0))
     sample_fps = round(vr.get_avg_fps() / 1)  # FPS
@@ -953,9 +998,7 @@ def encode_video(video_path, frame_count_limit=None):
 
 
 def suppress_other_loggers():
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
+    warnings.filterwarnings("ignore", category=UserWarning, message="The given NumPy array is not writable")
 
     try:
         from vllm.logger import logger as vllm_default_logger
@@ -963,12 +1006,8 @@ def suppress_other_loggers():
         return
 
     vllm_default_logger.setLevel(logging.WARN)
-    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
-        logging.WARN
-    )
-    logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
-        logging.WARN
-    )
+    logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(logging.WARN)
+    logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(logging.WARN)
     logging.getLogger("vllm.config").setLevel(logging.ERROR)
 
 
@@ -977,14 +1016,10 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
         installed_version = version(pkg)
         if pkg_version.parse(installed_version) < pkg_version.parse(min_version):
             raise Exception(
-                f"{pkg} is installed with version {installed_version}, which "
-                f"is less than the minimum required version {min_version}. " + message
+                f"{pkg} is installed with version {installed_version}, which is less than the minimum required version {min_version}. " + message
             )
-    except PackageNotFoundError:
-        raise Exception(
-            f"{pkg} with minimum required version {min_version} is not installed. "
-            + message
-        )
+    except PackageNotFoundError as e:
+        raise Exception(f"{pkg} with minimum required version {min_version} is not installed. " + message) from e
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -1006,10 +1041,8 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
     for child in children:
         if child.pid == skip_pid:
             continue
-        try:
+        with suppress(psutil.NoSuchProcess):
             child.kill()
-        except psutil.NoSuchProcess:
-            pass
 
     if include_parent:
         try:
@@ -1034,14 +1067,14 @@ def monkey_patch_p2p_access_check():
 
     import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
 
-    setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
+    tgt.gpu_p2p_access_check = lambda *arg, **kwargs: True
 
     # Suppress the warnings from this delete function when using sglang.bench_one_batch
     from sglang.srt.distributed.device_communicators.custom_all_reduce import (
         CustomAllreduce,
     )
 
-    setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
+    CustomAllreduce.__del__ = lambda *args, **kwargs: None
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -1061,9 +1094,7 @@ def set_ulimit(target_soft_limit=65535):
     target_soft_limit_stack_size = 1024 * target_soft_limit
     if current_soft < target_soft_limit_stack_size:
         try:
-            resource.setrlimit(
-                resource_type, (target_soft_limit_stack_size, current_hard)
-            )
+            resource.setrlimit(resource_type, (target_soft_limit_stack_size, current_hard))
         except ValueError as e:
             logger.warning(f"Fail to set RLIMIT_STACK: {e}")
 
@@ -1090,14 +1121,11 @@ def add_api_key_middleware(app, api_key: str):
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
-    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
-        if not os.path.exists(model_path):
-            from modelscope import snapshot_download
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE") and not os.path.exists(model_path):
+        from modelscope import snapshot_download
 
-            model_path = snapshot_download(model_path)
-            tokenizer_path = snapshot_download(
-                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
-            )
+        model_path = snapshot_download(model_path)
+        tokenizer_path = snapshot_download(tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"])
     return model_path, tokenizer_path
 
 
@@ -1110,10 +1138,7 @@ def configure_logger(server_args, prefix: str = ""):
 
     if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
         if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
-            raise Exception(
-                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
-                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
-            )
+            raise Exception(f"Setting SGLANG_LOGGING_CONFIG_PATH from env with {SGLANG_LOGGING_CONFIG_PATH} but it does not exist!")
         with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
         logging.config.dictConfig(custom_config)
@@ -1145,9 +1170,7 @@ def configure_logger(server_args, prefix: str = ""):
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
-def replace_submodule(
-    model: nn.Module, module_name: str, new_module: nn.Module
-) -> nn.Module:
+def replace_submodule(model: nn.Module, module_name: str, new_module: nn.Module) -> nn.Module:
     """Replace a submodule in a model with a new module."""
     parent = model.get_submodule(".".join(module_name.split(".")[:-1]))
     target_name = module_name.split(".")[-1]
@@ -1157,7 +1180,7 @@ def replace_submodule(
 
 def set_weight_attrs(
     weight: torch.Tensor,
-    weight_attrs: Optional[Dict[str, Any]],
+    weight_attrs: dict[str, Any] | None,
 ):
     """Set attributes on a weight tensor.
 
@@ -1176,9 +1199,9 @@ def set_weight_attrs(
 
 
 def broadcast_pyobj(
-    data: List[Any],
+    data: list[Any],
     rank: int,
-    dist_group: Optional[torch.distributed.ProcessGroup] = None,
+    dist_group: torch.distributed.ProcessGroup | None = None,
     src: int = 0,
     force_cpu_device: bool = True,
 ):
@@ -1186,9 +1209,7 @@ def broadcast_pyobj(
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
     """
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu")
     if __is_npu__ and not force_cpu_device:
         device = "npu"
 
@@ -1200,9 +1221,7 @@ def broadcast_pyobj(
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
 
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            ).to(device)
+            tensor_data = torch.ByteTensor(np.frombuffer(serialized_data, dtype=np.uint8)).to(device)
             tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
@@ -1220,14 +1239,14 @@ def broadcast_pyobj(
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        data = pickle.loads(serialized_data)  # noqa: S301
         return data
 
 
 def point_to_point_pyobj(
-    data: List[Any],
+    data: list[Any],
     rank: int,
-    group: Optional[torch.distributed.ProcessGroup] = None,
+    group: torch.distributed.ProcessGroup | None = None,
     src: int = 0,
     dst: int = 1,
     async_send: bool = False,
@@ -1235,10 +1254,7 @@ def point_to_point_pyobj(
     """Send data from src to dst in group."""
     from sglang.srt.distributed.parallel_state import P2PWork
 
-    if async_send:
-        send_func = dist.isend
-    else:
-        send_func = dist.send
+    send_func = dist.isend if async_send else dist.send
     if rank == src:
         # if len(data) > 0:
         #     if not isinstance(data[0], (List, Tuple)) or (isinstance(data[0], (List, Tuple)) and (len(data[0]) > 0)):
@@ -1255,9 +1271,7 @@ def point_to_point_pyobj(
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
-            tensor_data = torch.ByteTensor(
-                np.frombuffer(serialized_data, dtype=np.uint8)
-            )
+            tensor_data = torch.ByteTensor(np.frombuffer(serialized_data, dtype=np.uint8))
             tensor_size = torch.tensor([size], dtype=torch.long)
 
             work = send_func(tensor_size, dst, group=group)
@@ -1288,7 +1302,7 @@ def point_to_point_pyobj(
         work.wait()
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        data = pickle.loads(serialized_data)  # noqa: S301
         # if len(data)>0:
         #     if not isinstance(data[0], (List, Tuple)) or (isinstance(data[0], (List, Tuple)) and (len(data[0]) > 0)):
         #         logger.info(f"point_to_point_recv {rank=} {src=} {dst=} {data=}")
@@ -1312,62 +1326,26 @@ def pytorch_profile(name, func, *args, data_size=-1):
     """
     global step_counter
     os.makedirs("trace", exist_ok=True)
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-        # on_trace_ready=tensorboard_trace_handler('./log_dir'),
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-    ) as prof:
-        with record_function(name):
-            with open(f"trace/size_{step_counter}.json", "w") as f:
-                json.dump({"size": data_size}, f)
-            result = func(*args)
+    with (
+        profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            # schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+            # on_trace_ready=tensorboard_trace_handler('./log_dir'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof,
+        record_function(name),
+    ):
+        with open(f"trace/size_{step_counter}.json", "w") as f:
+            json.dump({"size": data_size}, f)
+        result = func(*args)
     prof.export_chrome_trace(f"trace/{name}_{step_counter}.json")
     step_counter += 1
     return result
 
 
-def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-) -> zmq.Socket:
-    mem = psutil.virtual_memory()
-    total_mem = mem.total / 1024**3
-    available_mem = mem.available / 1024**3
-    if total_mem > 32 and available_mem > 16:
-        buf_size = int(0.5 * 1024**3)
-    else:
-        buf_size = -1
-
-    socket = context.socket(socket_type)
-    if endpoint.find("[") != -1:
-        socket.setsockopt(zmq.IPV6, 1)
-
-    def set_send_opt():
-        socket.setsockopt(zmq.SNDHWM, 0)
-        socket.setsockopt(zmq.SNDBUF, buf_size)
-
-    def set_recv_opt():
-        socket.setsockopt(zmq.RCVHWM, 0)
-        socket.setsockopt(zmq.RCVBUF, buf_size)
-
-    if socket_type == zmq.PUSH:
-        set_send_opt()
-    elif socket_type == zmq.PULL:
-        set_recv_opt()
-    elif socket_type == zmq.DEALER:
-        set_send_opt()
-        set_recv_opt()
-    else:
-        raise ValueError(f"Unsupported socket type: {socket_type}")
-
-    if bind:
-        socket.bind(endpoint)
-    else:
-        socket.connect(endpoint)
-
-    return socket
+from sglang.srt.utils.network import get_zmq_socket as get_zmq_socket  # noqa: E402
 
 
 def dump_to_file(dirpath, name, value):
@@ -1425,9 +1403,7 @@ def set_prometheus_multiproc_dir():
 
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
-        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
-        )
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
@@ -1459,12 +1435,9 @@ def bind_port(port):
 def get_amdgpu_memory_capacity():
     try:
         # Run rocm-smi and capture the output
-        result = subprocess.run(
-            [
-                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        result = subprocess.run(  # noqa: S602
+            ["rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"],
+            capture_output=True,
             shell=True,
             text=True,
         )
@@ -1472,10 +1445,7 @@ def get_amdgpu_memory_capacity():
             raise RuntimeError(f"rocm-smi error: {result.stderr.strip()}")
 
         # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split("(")[0].strip()) / 1024
-            for mem in result.stdout.strip().split("\n")
-        ]
+        memory_values = [float(mem.split("(")[0].strip()) / 1024 for mem in result.stdout.strip().split("\n")]
 
         if not memory_values:
             raise ValueError("No GPU memory values found.")
@@ -1483,10 +1453,8 @@ def get_amdgpu_memory_capacity():
         # Return the minimum memory value
         return min(memory_values)
 
-    except FileNotFoundError:
-        raise RuntimeError(
-            "rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible."
-        )
+    except FileNotFoundError as e:
+        raise RuntimeError("rocm-smi not found. Ensure AMD ROCm drivers are installed and accessible.") from e
 
 
 def get_device_sm():
@@ -1501,8 +1469,7 @@ def get_nvgpu_memory_capacity():
         # Run nvidia-smi and capture the output
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
         )
 
@@ -1510,38 +1477,29 @@ def get_nvgpu_memory_capacity():
             raise RuntimeError(f"nvidia-smi error: {result.stderr.strip()}")
 
         # Parse the output to extract memory values
-        memory_values = [
-            float(mem)
-            for mem in result.stdout.strip().split("\n")
-            if re.match(r"^\d+(\.\d+)?$", mem.strip())
-        ]
+        memory_values = [float(mem) for mem in result.stdout.strip().split("\n") if re.match(r"^\d+(\.\d+)?$", mem.strip())]
 
         if not memory_values:
             # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
             # typically in NVIDIA MIG mode.
             if torch.cuda.is_available():
-                logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
-                )
+                logger.warning("Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info().")
                 return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
         return min(memory_values)
 
-    except FileNotFoundError:
-        raise RuntimeError(
-            "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
-        )
+    except FileNotFoundError as e:
+        raise RuntimeError("nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible.") from e
 
 
 def get_hpu_memory_capacity():
     try:
         # Run hl-smi and capture the output
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S602
             ["hl-smi --query | grep 'Total'"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             shell=True,
             text=True,
         )
@@ -1550,9 +1508,7 @@ def get_hpu_memory_capacity():
             raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
 
         # Parse the output to extract memory values in MiB
-        memory_values = [
-            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
-        ]
+        memory_values = [float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")]
 
         if not memory_values:
             raise ValueError("No GPU memory values found.")
@@ -1560,19 +1516,17 @@ def get_hpu_memory_capacity():
         # Return the minimum memory value
         return min(memory_values)
 
-    except FileNotFoundError:
-        raise RuntimeError(
-            "hl-smi not found. Ensure Habana drivers are installed and accessible."
-        )
+    except FileNotFoundError as e:
+        raise RuntimeError("hl-smi not found. Ensure Habana drivers are installed and accessible.") from e
 
 
 def get_npu_memory_capacity():
     try:
-        import torch_npu
+        import torch_npu  # noqa: F401
 
         return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
     except ImportError as e:
-        raise ImportError("torch_npu is required when run on npu device.")
+        raise ImportError("torch_npu is required when run on npu device.") from e
 
 
 def get_cpu_memory_capacity():
@@ -1588,7 +1542,7 @@ def get_cpu_memory_capacity():
         file_prefix = "/sys/devices/system/node/"
         for numa_id in range(n_numa_node):
             file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
+            with open(os.path.join(file_prefix, file_meminfo)) as f:
                 # 1st line contains 'MemTotal'
                 line = f.read().split("\n")[0]
                 numa_mem_list.append(int(line.split()[3]))
@@ -1642,9 +1596,7 @@ def init_custom_process_group(
         rendezvous,
     )
 
-    assert (store is None) or (
-        init_method is None
-    ), "Cannot specify both init_method and store."
+    assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
 
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"
@@ -1652,10 +1604,7 @@ def init_custom_process_group(
     elif init_method is None:
         init_method = "env://"
 
-    if backend:
-        backend = Backend(backend)
-    else:
-        backend = Backend("undefined")
+    backend = Backend(backend) if backend else Backend("undefined")
 
     if timeout is None:
         timeout = default_pg_timeout
@@ -1673,9 +1622,7 @@ def init_custom_process_group(
     # NOTE: The pg_options parameter was renamed into backend_options in PyTorch 2.6.0
     # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
     # We need to determine the appropriate parameter name based on PyTorch version
-    pg_options_param_name = (
-        "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
-    )
+    pg_options_param_name = "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
     pg, _ = _new_process_group_helper(
         world_size,
         rank,
@@ -1697,8 +1644,10 @@ def crash_on_warnings():
     # Crash on warning if we are running CI tests
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
+
 def check_memory_debug():
     return get_bool_env_var("FLLM_CHECK_MEMORY_DEBUG")
+
 
 def print_warning_once(msg: str) -> None:
     # Set the stacklevel to 2 to print the caller's line info
@@ -1730,43 +1679,39 @@ def is_habana_available() -> bool:
 
 
 @lru_cache(maxsize=8)
-def get_device(device_id: Optional[int] = None) -> str:
+def get_device(device_id: int | None = None) -> str:
     if is_cpu():
         if cpu_has_amx_support():
             logger.info("Intel AMX is detected, using CPU with Intel AMX support.")
         else:
-            logger.warning(
-                "CPU device enabled, using torch native backend, low performance expected."
-            )
+            logger.warning("CPU device enabled, using torch native backend, low performance expected.")
         return "cpu"
 
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
-        return "cuda:{}".format(device_id)
+        return f"cuda:{device_id}"
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        if device_id == None:
+        if device_id is None:
             return "xpu"
-        return "xpu:{}".format(device_id)
+        return f"xpu:{device_id}"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
-        if device_id == None:
+        if device_id is None:
             return "npu"
-        return "npu:{}".format(device_id)
+        return f"npu:{device_id}"
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
-                if device_id == None:
+                if device_id is None:
                     return "hpu"
-                return "hpu:{}".format(device_id)
+                return f"hpu:{device_id}"
         except ImportError as e:
-            raise ImportError(
-                "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
-            )
+            raise ImportError("Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'.") from e
 
     raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
 
@@ -1787,7 +1732,7 @@ def get_device_count() -> int:
 
     if is_habana_available():
         try:
-            import habana_frameworks.torch.hpu
+            import habana_frameworks.torch.hpu  # noqa: F401
 
             if torch.hpu.is_available():
                 return torch.hpu.device_count()
@@ -1804,15 +1749,13 @@ def get_device_core_count(device_id: int = 0) -> int:
     return 0
 
 
-def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
+def get_device_capability(device_id: int = 0) -> tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
-        major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
-            "."
-        )
+        major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(".")
         major, minor = int(major), int(minor)
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
@@ -1822,11 +1765,10 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
             # major, minor = torch.hpu.get_device_capability(device_id)
             major, minor = None, None
         except Exception as e:
-            raise RuntimeError(
-                f"An error occurred while getting device capability of hpu: {e}."
-            ) from e
+            raise RuntimeError(f"An error occurred while getting device capability of hpu: {e}.") from e
 
     return major, minor
+
 
 def device_synchronize(device_id: int = 0) -> None:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
@@ -1835,12 +1777,6 @@ def device_synchronize(device_id: int = 0) -> None:
     if hasattr(torch, "npu") and torch.npu.is_available():
         torch.npu.synchronize()
 
-def get_device_module():
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return torch.cuda
-
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        return torch.npu
 
 def get_npu_compiler_config():
     config = {
@@ -1851,7 +1787,32 @@ def get_npu_compiler_config():
     return config
 
 
-def get_compiler_backend() -> str:
+def _install_torchair_compile_sync():
+    """Install during serial startup; leave GE replay unchanged.
+
+    Supported GE paths compile after input preprocessing and run on the same
+    caller stream. Hook the low-level compile, not the per-call outer method.
+    """
+    if os.environ.get("SGLANG_NPU_SYNC_GRAPH_INIT", "1") == "0":
+        return
+
+    from torchair.core._backend import TorchNpuGraph
+
+    original_compile = TorchNpuGraph.compile
+    if getattr(original_compile, "_sglang_compile_sync", False):
+        return
+
+    @functools.wraps(original_compile)
+    def compile(graph, *args, **kwargs):
+        result = original_compile(graph, *args, **kwargs)
+        torch.npu.current_stream().synchronize()
+        return result
+
+    compile._sglang_compile_sync = True
+    TorchNpuGraph.compile = compile
+
+
+def get_compiler_backend(offload_args=None) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
@@ -1861,22 +1822,37 @@ def get_compiler_backend() -> str:
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
             from torchair.configs.compiler_config import CompilerConfig
         except ImportError as e:
-            raise ImportError(
-                "NPU detected, but torchair package is not installed. "
-                "Please install torchair for torch.compile support on NPU."
-            )
+            raise ImportError("NPU detected, but torchair package is not installed. Please install torchair for torch.compile support on NPU.") from e
+        _install_torchair_compile_sync()
         compiler_config = CompilerConfig()
+        if (offload_args is not None and offload_args.offload_cache
+                and offload_args.disaggregation_mode != "prefill"):
+            from sglang.srt.npu.offload_compile_config import (
+                AliasSafeCompilerConfig,
+                require_compatible_ge_initialization,
+            )
+            require_compatible_ge_initialization()
+            compiler_config = AliasSafeCompilerConfig()
+            logger.info("Alias-safe Offload GE option: ge.op_compiler_cache_mode=disable")
         predefined_config = get_npu_compiler_config()
         for k, v in predefined_config.items():
             setattr(compiler_config.experimental_config, k, v)
-        # compiler_config.debug.graph_dump.type = "pbtxt"
-        # compiler_config.debug.graph_dump.type = "py"
-        # compiler_config.debug.graph_dump.path = "./test"
-        compiler_config.ge_config.optimization_switch = "InplaceAddRmsNormFusionPass:off"
+        graph_dump_path = os.getenv("SGLANG_NPU_GRAPH_DUMP_PATH")
+        if graph_dump_path:
+            graph_dump_type = os.getenv("SGLANG_NPU_GRAPH_DUMP_TYPE", "pbtxt")
+            compiler_config.debug.graph_dump.type = graph_dump_type
+            compiler_config.debug.graph_dump.path = graph_dump_path
+            logger.info(
+                "NPU graph dump enabled: path=%s type=%s",
+                graph_dump_path,
+                graph_dump_type,
+            )
+        compiler_config.ge_config.optimization_switch = "InplaceAddRmsNormFusionPass:off;AddRmsNormFusionGraphPass:off"
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
     return "inductor"
+
 
 @torch.compile(backend=get_compiler_backend(), fullgraph=True, dynamic=True)
 def print_npu_graph_tensor(prefix, x):
@@ -1884,7 +1860,7 @@ def print_npu_graph_tensor(prefix, x):
     # from sglang.srt.distributed import get_tensor_model_parallel_rank
 
     # if get_tensor_model_parallel_rank() == 0:
-        # torchair.ops.npu_print("print npu graph tensor:", x)
+    # torchair.ops.npu_print("print npu graph tensor:", x)
     torchair.ops.npu_print(prefix + " print npu graph tensor:", x)
 
 
@@ -1900,9 +1876,9 @@ def supports_custom_op() -> bool:
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
-    mutates_args: List[str],
-    fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
+    mutates_args: list[str],
+    fake_impl: Callable | None = None,
+    target_lib: Library | None = None,
 ):
     """
     `torch.library.custom_op` can have significant overhead because it
@@ -1932,9 +1908,7 @@ def direct_register_custom_op(
     try:
         # Try to access the operator to see if it's already registered
         lib_name = my_lib.m.name if hasattr(my_lib.m, "name") else "sglang"
-        if hasattr(torch.ops, lib_name) and hasattr(
-            getattr(torch.ops, lib_name), op_name
-        ):
+        if hasattr(torch.ops, lib_name) and hasattr(getattr(torch.ops, lib_name), op_name):
             # Operator already exists, skip registration
             return
     except (AttributeError, RuntimeError):
@@ -1954,17 +1928,82 @@ def direct_register_custom_op(
         my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
-    except RuntimeError as error:
+    except RuntimeError as e:
         if "Tried to register an operator" in str(e) and "multiple times" in str(e):
             # Silently ignore duplicate registration errors
             # This can happen in multi-engine scenarios
             pass
         else:
             # Re-raise other RuntimeErrors
-            raise error
-    except AttributeError as error:
+            raise
+    except AttributeError:
         # Always re-raise AttributeError as it indicates missing dependencies
-        raise error
+        raise
+
+
+def _parse_cpu_list(cpu_list: str) -> list[int]:
+    cpu_ids = []
+    for part in cpu_list.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            cpu_ids.extend(range(int(start), int(end) + 1))
+        else:
+            cpu_ids.append(int(part))
+    return sorted(set(cpu_ids))
+
+
+def _read_cpuset_cpus() -> set[int] | None:
+    cpuset_files = (
+        "/sys/fs/cgroup/cpuset/cpuset.cpus",
+        "/sys/fs/cgroup/cpuset.cpus.effective",
+        "/sys/fs/cgroup/cpuset.cpus",
+    )
+    for path in cpuset_files:
+        try:
+            with open(path) as f:
+                cpu_list = f.read().strip()
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            logger.warning(f"Failed to read cpuset file {path}: {e}")
+            continue
+
+        if cpu_list:
+            return set(_parse_cpu_list(cpu_list))
+    return None
+
+
+def _get_allowed_cpus_by_numa() -> dict[int, list[int]]:
+    cpuset_cpus = _read_cpuset_cpus()
+    allowed_cpus = set(psutil.Process().cpu_affinity())
+    if cpuset_cpus is not None:
+        allowed_cpus &= cpuset_cpus
+
+    node_to_cpus = defaultdict(list)
+    for cpu, _, _, node in parse_lscpu_topology():
+        if cpu in allowed_cpus:
+            node_to_cpus[node].append(cpu)
+
+    return {node: sorted(set(cpu_ids)) for node, cpu_ids in node_to_cpus.items() if cpu_ids}
+
+
+def _split_cpu_ids(cpu_ids: list[int], slot: int, total_slots: int) -> list[int]:
+    if not cpu_ids:
+        return []
+
+    total_slots = max(total_slots, 1)
+    slot = min(slot, total_slots - 1)
+    start = len(cpu_ids) * slot // total_slots
+    end = len(cpu_ids) * (slot + 1) // total_slots
+    bind_cpu_ids = cpu_ids[start:end]
+    if bind_cpu_ids:
+        return bind_cpu_ids
+
+    # When CPUs are fewer than ranks, allow CPU sharing instead of producing an empty affinity.
+    return [cpu_ids[slot % len(cpu_ids)]]
 
 
 def set_gpu_proc_affinity(
@@ -1976,25 +2015,45 @@ def set_gpu_proc_affinity(
     pid = os.getpid()
     p = psutil.Process(pid)
 
-    tp_size_per_node = world_size // nnodes
+    tp_size_per_node = max(world_size // nnodes, 1)
+    local_gpu_id = gpu_id % tp_size_per_node
+    bind_cpu_ids = []
 
-    # total physical cores
-    total_pcores = psutil.cpu_count(logical=False)
-    # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = total_pcores // tp_size_per_node
+    try:
+        node_to_cpus = _get_allowed_cpus_by_numa()
+    except Exception as e:
+        logger.warning(f"Failed to get NUMA-aware CPU topology: {e}")
+        node_to_cpus = {}
 
-    # able to handle multiple DP per node
-    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
-    end_cpu_id = start_cpu_id + num_cores_bind
+    if node_to_cpus:
+        numa_nodes = sorted(node_to_cpus)
+        gpu_start = 0
 
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
-    else:
-        # HT off
-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
+        for node_idx, node in enumerate(numa_nodes):
+            gpus_per_numa = tp_size_per_node // len(numa_nodes)
+            if node_idx < tp_size_per_node % len(numa_nodes):
+                gpus_per_numa += 1
+            if gpus_per_numa == 0:
+                continue
+
+            gpu_end = gpu_start + gpus_per_numa
+            if local_gpu_id < gpu_end:
+                numa_local_gpu_id = local_gpu_id - gpu_start
+                bind_cpu_ids = _split_cpu_ids(node_to_cpus[node], numa_local_gpu_id, gpus_per_numa)
+                logger.info(
+                    f"NUMA-aware CPU affinity selection for gpu_id={gpu_id}: "
+                    f"local_gpu_id={local_gpu_id}, numa_node={node}, "
+                    f"numa_local_gpu_id={numa_local_gpu_id}, "
+                    f"available_cpu_count={len(node_to_cpus[node])}, "
+                    f"selected_cpus={bind_cpu_ids}"
+                )
+                break
+            gpu_start = gpu_end
+
+    if not bind_cpu_ids:
+        allowed_cpu_ids = sorted(p.cpu_affinity())
+        bind_cpu_ids = _split_cpu_ids(allowed_cpu_ids, local_gpu_id, tp_size_per_node)
+        logger.warning(f"Falling back to flat CPU affinity for gpu_id={gpu_id}, local_gpu_id={local_gpu_id}, selected_cpus={bind_cpu_ids}")
 
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
@@ -2006,9 +2065,7 @@ def disable_request_logging() -> bool:
     return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
-def dataclass_to_string_truncated(
-    data, max_length=2048, skip_names: Optional[Set[str]] = None
-):
+def dataclass_to_string_truncated(data, max_length=2048, skip_names: set[str] | None = None):
     if skip_names is None:
         skip_names = set()
     if isinstance(data, str):
@@ -2024,24 +2081,12 @@ def dataclass_to_string_truncated(
         else:
             return str(data)
     elif isinstance(data, dict):
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
+        return "{" + ", ".join(f"'{k}': {dataclass_to_string_truncated(v, max_length)}" for k, v in data.items() if k not in skip_names) + "}"
     elif dataclasses.is_dataclass(data):
         fields = dataclasses.fields(data)
         return (
             f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-                if f.name not in skip_names
-            )
+            + ", ".join(f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}" for f in fields if f.name not in skip_names)
             + ")"
         )
     else:
@@ -2124,9 +2169,7 @@ def debug_timing(func):
             indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
             num_tokens = len(indices) if indices is not None else 0
             throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
-            logger.debug(
-                f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s"
-            )
+            logger.debug(f"Transfer time: {elapsed} ms, throughput: {throughput} tokens/s")
             return result
         else:
             return func(*args, **kwargs)
@@ -2146,9 +2189,7 @@ def pyspy_dump_schedulers():
         pid = psutil.Process().pid
         # Command to run py-spy with the PID
         cmd = f"py-spy dump --pid {pid}"
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, check=True
-        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)  # noqa: S602
         logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
@@ -2167,13 +2208,9 @@ def kill_itself_when_parent_died():
 def set_uvicorn_logging_configs():
     from uvicorn.config import LOGGING_CONFIG
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["fmt"] = "[%(asctime)s] %(levelprefix)s %(message)s"
     LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["fmt"] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
     LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
 
 
@@ -2240,14 +2277,12 @@ def configure_ipv6(dist_init_addr):
             raise ValueError("received IPv6 address format: expected ':' after ']'")
 
     if not port_str:
-        raise ValueError(
-            "a port must be specified in IPv6 address (format: [ipv6]:port)"
-        )
+        raise ValueError("a port must be specified in IPv6 address (format: [ipv6]:port)")
 
     try:
         port = int(port_str)
-    except ValueError:
-        raise ValueError(f"invalid port in IPv6 address: '{port_str}'")
+    except ValueError as e:
+        raise ValueError(f"invalid port in IPv6 address: '{port_str}'") from e
     return port, host
 
 
@@ -2287,9 +2322,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
     try:
         loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host}:{port}"
-        )
+        logger.info(f"Dummy health check server scheduled on existing loop at {host}:{port}")
         loop.create_task(server.serve())
 
     except RuntimeError:
@@ -2316,7 +2349,7 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+triton.next_power_of_2 = next_power_of_2
 
 
 class EmptyContextManager:
@@ -2344,7 +2377,7 @@ def add_prefix(name: str, prefix: str) -> str:
     return name if not prefix else f"{prefix}.{name}"
 
 
-def is_remote_url(url: Union[str, Path]) -> bool:
+def is_remote_url(url: str | Path) -> bool:
     """
     Check if the URL is a remote URL of the format:
     <connector_type>://<host>:<port>/<model_name>
@@ -2382,18 +2415,14 @@ def retry(
             return fn()
         except Exception as e:
             if try_index >= max_retry:
-                raise Exception(f"retry() exceed maximum number of retries.")
+                raise Exception("retry() exceed maximum number of retries.") from e
 
             if not should_retry(e):
-                raise Exception(f"retry() observe errors that should not be retried.")
+                raise Exception("retry() observe errors that should not be retried.") from e
 
-            delay = min(initial_delay * (2**try_index), max_delay) * (
-                0.75 + 0.25 * random.random()
-            )
+            delay = min(initial_delay * (2**try_index), max_delay) * (0.75 + 0.25 * random.random())  # noqa: S311
 
-            logger.warning(
-                f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}"
-            )
+            logger.warning(f"retry() failed once ({try_index}th try, maximum {max_retry} retries). Will delay {delay:.2f}s and retry. Error: {e}")
             traceback.print_exc()
 
             time.sleep(delay)
@@ -2401,19 +2430,13 @@ def retry(
 
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
-        return [
-            item for sublist in nested_list for item in flatten_nested_list(sublist)
-        ]
+        return [item for sublist in nested_list for item in flatten_nested_list(sublist)]
     else:
         return [nested_list]
 
 
 def is_non_idle_and_non_empty(forward_mode, hidden_states):
-    return (
-        (forward_mode is not None)
-        and not forward_mode.is_idle()
-        and hidden_states.shape[0] > 0
-    )
+    return (forward_mode is not None) and not forward_mode.is_idle() and hidden_states.shape[0] > 0
 
 
 def fast_topk(values, topk, dim):
@@ -2433,107 +2456,6 @@ def bind_or_assign(target, source):
         return source
 
 
-def get_local_ip_by_nic(interface: str = None) -> Optional[str]:
-    if not (interface := interface or os.environ.get("SGLANG_LOCAL_IP_NIC", None)):
-        return None
-    try:
-        import netifaces
-    except ImportError as e:
-        raise ImportError(
-            "Environment variable SGLANG_LOCAL_IP_NIC requires package netifaces, please install it through 'pip install netifaces'"
-        ) from e
-
-    try:
-        addresses = netifaces.ifaddresses(interface)
-        if netifaces.AF_INET in addresses:
-            for addr_info in addresses[netifaces.AF_INET]:
-                ip = addr_info.get("addr")
-                if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-                    return ip
-        if netifaces.AF_INET6 in addresses:
-            for addr_info in addresses[netifaces.AF_INET6]:
-                ip = addr_info.get("addr")
-                if ip and not ip.startswith("fe80::") and ip != "::1":
-                    return ip.split("%")[0]
-    except (ValueError, OSError) as e:
-        logger.warning(
-            f"{e} Can not get local ip from NIC. Please verify whether SGLANG_LOCAL_IP_NIC is set correctly."
-        )
-    return None
-
-
-def get_local_ip_by_remote() -> Optional[str]:
-    # try ipv4
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        pass
-
-    try:
-        hostname = socket.gethostname()
-        ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
-            return ip
-    except Exception:
-        pass
-
-    # try ipv6
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-        # Google's public DNS server, see
-        # https://developers.google.com/speed/public-dns/docs/using#addresses
-        s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
-        return s.getsockname()[0]
-    except Exception:
-        logger.warning("Can not get local ip by remote")
-    return None
-
-
-def get_local_ip_auto(fallback: str = None) -> str:
-    """
-    Automatically detect the local IP address using multiple fallback strategies.
-
-    This function attempts to obtain the local IP address through several methods.
-    If all methods fail, it returns the specified fallback value or raises an exception.
-
-    Args:
-        fallback (str, optional): Fallback IP address to return if all detection
-            methods fail. For server applications, explicitly set this to
-            "0.0.0.0" (IPv4) or "::" (IPv6) to bind to all available interfaces.
-            Defaults to None.
-
-    Returns:
-        str: The detected local IP address, or the fallback value if detection fails.
-
-    Raises:
-        ValueError: If IP detection fails and no fallback value is provided.
-
-    Note:
-        The function tries detection methods in the following order:
-        1. Direct IP detection via get_ip()
-        2. Network interface enumeration via get_local_ip_by_nic()
-        3. Remote connection method via get_local_ip_by_remote()
-    """
-    # Try environment variable
-    host_ip = os.getenv("SGLANG_HOST_IP", "") or os.getenv("HOST_IP", "")
-    if host_ip:
-        return host_ip
-    logger.debug("get_ip failed")
-    # Fallback
-    if ip := get_local_ip_by_nic():
-        return ip
-    logger.debug("get_local_ip_by_nic failed")
-    # Fallback
-    if ip := get_local_ip_by_remote():
-        return ip
-    logger.debug("get_local_ip_by_remote failed")
-    if fallback:
-        return fallback
-    raise ValueError("Can not get local ip")
-
-
 def is_page_size_one(server_args):
     return server_args.page_size == 1
 
@@ -2542,9 +2464,7 @@ def is_page_size_one(server_args):
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk is not None
-        and server_args.speculative_eagle_topk == 1
-        and is_page_size_one(server_args)
+        server_args.speculative_eagle_topk is not None and server_args.speculative_eagle_topk == 1 and is_page_size_one(server_args)
     )
 
 
@@ -2560,7 +2480,6 @@ def is_fa3_default_architecture(hf_config):
         "Gemma3ForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
-        "Glm4MoeForCausalLM",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
@@ -2603,7 +2522,7 @@ T = TypeVar("T")
 
 class Withable(Generic[T]):
     def __init__(self):
-        self._value: Optional[T] = None
+        self._value: T | None = None
 
     @property
     def value(self) -> T:
@@ -2626,23 +2545,18 @@ class Withable(Generic[T]):
 
 def require_mlp_tp_gather(server_args):
     """
-    Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+    Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens
+    when each MLP TP group contains multiple attention DP groups.
     """
     if server_args.enable_dp_attention:
-        assert server_args.dp_size > 1, "dp_size must be greater than 1"
+        if server_args.dp_size <= 1:
+            raise AssertionError("dp_size must be greater than 1")
         if (
-            server_args.moe_dense_tp_size is None
+            server_args.moe_dense_tp_size is None or not server_args.enable_dp_lm_head or server_args.moe_a2a_backend == "none"
         ):  # TODO(ch-wan): some MoE models do not have dense layers
             return True
-        elif not server_args.enable_dp_lm_head:
-            return True
-        elif server_args.moe_a2a_backend == "none":
-            return True
         else:
-            return (
-                server_args.moe_dense_tp_size
-                > server_args.world_size // server_args.dp_size
-            )
+            return server_args.moe_dense_tp_size > server_args.world_size // server_args.dp_size
     else:
         return False
 
@@ -2651,7 +2565,8 @@ def require_attn_tp_gather(server_args):
     """
     Check if the input of attention is scattered.
     """
-    assert server_args.moe_dense_tp_size in [1, None]
+    if server_args.moe_dense_tp_size not in [1, None]:
+        raise AssertionError("moe_dense_tp_size must be 1 or None")
     if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.world_size
@@ -2669,7 +2584,7 @@ def require_mlp_sync(server_args):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
-def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optional[str]:
+def find_local_repo_dir(repo_id: str, revision: str | None = None) -> str | None:
     import huggingface_hub as hf
 
     # Build cache path
@@ -2708,7 +2623,7 @@ def read_system_prompt_from_file(model_name: str) -> str:
         if local_repo_dir:
             system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
             if os.path.exists(system_prompt_file):
-                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                with open(system_prompt_file, encoding="utf-8") as f:
                     return f.read()
 
         return ""
@@ -2731,13 +2646,11 @@ def dim_is_supported(weight):
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
-    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    assert len(devices) == 1, "Expects all weights to be on the same device"
     device = devices.pop()
 
     if transpose_dims:
-        assert len(weight_names) == len(
-            transpose_dims
-        ), "len(weight_names) should be equal to len(transpose_dims)"
+        assert len(weight_names) == len(transpose_dims), "len(weight_names) should be equal to len(transpose_dims)"
 
     for i, weight_name in enumerate(weight_names):
         weight_tensor = getattr(module, weight_name)
@@ -2762,15 +2675,9 @@ def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> 
         packed_weight.__dict__ = weight_tensor.__dict__
         setattr(module, weight_name, packed_weight)
 
-    module.use_intel_amx_backend = (
-        device == torch.device("cpu") and cpu_has_amx_support()
-    )
+    module.use_intel_amx_backend = device == torch.device("cpu") and cpu_has_amx_support()
 
-    if (
-        module.use_intel_amx_backend
-        and hasattr(module, "bias")
-        and module.bias is not None
-    ):
+    if module.use_intel_amx_backend and hasattr(module, "bias") and module.bias is not None:
         module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)
 
 
@@ -2799,9 +2706,7 @@ class LazyValue:
 def dynamic_import(func_path: str):
     parts = func_path.split(".")
     if len(parts) < 2:
-        raise ValueError(
-            "func_path should contain both module name and func name (such as 'module.func')"
-        )
+        raise ValueError("func_path should contain both module name and func name (such as 'module.func')")
     module_path = ".".join(parts[:-1])
     func_name = parts[-1]
     module = importlib.import_module(module_path)
@@ -2845,12 +2750,7 @@ def freeze_gc(context: str):
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
-    logger.info(
-        f"Freezing GC in {context} process. "
-        f"gen0: {g0_before}->{g0_after}, "
-        f"gen1: {g1_before}->{g1_after}, "
-        f"gen2: {g2_before}->{g2_after}"
-    )
+    logger.info(f"Freezing GC in {context} process. gen0: {g0_before}->{g0_after}, gen1: {g1_before}->{g1_after}, gen2: {g2_before}->{g2_after}")
 
 
 def configure_gc_logger():
@@ -2872,7 +2772,7 @@ def configure_gc_logger():
             logger.info(
                 f"GC end: Time {time.time()} | Generation {gen} | "
                 f"Duration: {duration:.4f}s | Collected: {collected} | Uncollectable: {uncollectable} "
-                f'{"(LONG GC)" if duration > 0.1 else ""}'
+                f"{'(LONG GC)' if duration > 0.1 else ''}"
             )
 
     gc.callbacks.append(gc_callback)
@@ -2891,18 +2791,16 @@ def ceil_div(x: int, y: int) -> int:
 def parse_lscpu_topology():
     try:
         # Get CPU topology: CPU,Core,Socket,Node
-        output = subprocess.check_output(
-            ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
-        )
+        output = subprocess.check_output(["lscpu", "-p=CPU,Core,Socket,Node"], text=True)
     except Exception as e:
-        raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
+        raise RuntimeError(f"Unexpected error running 'lscpu': {e}") from e
 
     # Parse only data lines (skip comments)
     cpu_info = []
     for line in output.splitlines():
         if not line.startswith("#"):
-            cpu, core, socket, node = map(int, line.strip().split(","))
-            cpu_info.append((cpu, core, socket, node))
+            cpu, core, socket_id, node = map(int, line.strip().split(","))
+            cpu_info.append((cpu, core, socket_id, node))
 
     # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
     return cpu_info
@@ -2917,12 +2815,10 @@ def get_physical_cpus_by_numa():
     # 5: {(214,1): 214, (215,1): 215}
     physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
 
-    for cpu, core, socket, node in cpu_info:
-        key = (core, socket)
+    for cpu, core, socket_id, node in cpu_info:
+        key = (core, socket_id)
         if key not in physical_by_node[node]:
-            physical_by_node[node][
-                key
-            ] = cpu  # pick first CPU seen for that physical core
+            physical_by_node[node][key] = cpu  # pick first CPU seen for that physical core
 
     # Retrieves CPUs that the current process is allowed to run on
     cpus_allowed_list = psutil.Process().cpu_affinity()
@@ -2946,21 +2842,14 @@ def get_physical_cpus_by_numa():
 def get_cpu_ids_by_node():
     node_to_cpus = get_physical_cpus_by_numa()
     # Sort by NUMA node index
-    cpu_ids = [
-        ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
-    ]
+    cpu_ids = [",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)]
 
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
     return cpu_ids
 
 
 def is_shm_available(dtype, world_size, local_size):
-    return (
-        cpu_has_amx_support()
-        and dtype in [torch.bfloat16, torch.float]
-        and world_size >= 1
-        and world_size == local_size
-    )
+    return cpu_has_amx_support() and dtype in [torch.bfloat16, torch.float] and world_size >= 1 and world_size == local_size
 
 
 def lru_cache_frozenset(maxsize=128):
@@ -2968,20 +2857,16 @@ def lru_cache_frozenset(maxsize=128):
         try:
             hash(o)
             return o
-        except TypeError:
+        except TypeError as e:
             # Not hashable; convert based on type
             if isinstance(o, (dict)):
-                return frozenset(
-                    (_to_hashable(k), _to_hashable(v)) for k, v in o.items()
-                )
+                return frozenset((_to_hashable(k), _to_hashable(v)) for k, v in o.items())
             elif isinstance(o, set):
                 return frozenset(_to_hashable(v) for v in o)
-            elif isinstance(o, (list, tuple)) or (
-                isinstance(o, Sequence) and not isinstance(o, (str, bytes))
-            ):
+            elif isinstance(o, (list, tuple)) or (isinstance(o, Sequence) and not isinstance(o, (str, bytes))):
                 return tuple(_to_hashable(v) for v in o)
             else:
-                raise TypeError(f"Cannot make hashable: {type(o)}")
+                raise TypeError(f"Cannot make hashable: {type(o)}") from e
 
     def decorator(func):
         cache = OrderedDict()
@@ -2989,9 +2874,7 @@ def lru_cache_frozenset(maxsize=128):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             h_args = tuple(_to_hashable(a) for a in args)
-            h_kwargs = frozenset(
-                (_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items()
-            )
+            h_kwargs = frozenset((_to_hashable(k), _to_hashable(v)) for k, v in kwargs.items())
             key = (h_args, h_kwargs)
             if key in cache:
                 cache.move_to_end(key)
@@ -3013,9 +2896,7 @@ def get_origin_rid(rid):
 
 
 def apply_module_patch(target_module, target_function, wrappers):
-    original_module, original_function = parse_module_path(
-        target_module, target_function, False
-    )
+    original_module, original_function = parse_module_path(target_module, target_function, False)
 
     original_function_id = id(original_function)
 
@@ -3025,12 +2906,8 @@ def apply_module_patch(target_module, target_function, wrappers):
     if target_function is not None:
         setattr(original_module, target_function, candidate)
 
-    for key, value in sys.modules.copy().items():
-        if (
-            target_function is not None
-            and hasattr(value, target_function)
-            and id(getattr(value, target_function)) == original_function_id
-        ):
+    for _key, value in sys.modules.copy().items():
+        if target_function is not None and hasattr(value, target_function) and id(getattr(value, target_function)) == original_function_id:
             setattr(value, target_function, candidate)
 
 
@@ -3080,18 +2957,14 @@ def parse_module_path(module_path, function_name, create_dummy):
                     setattr(current_module, function_name, ph_func)
                     return current_module, ph_func
                 if function_name:
-                    raise AttributeError(
-                        f"Function {function_name} missing in {current_path}"
-                    )
+                    raise AttributeError(f"Function {function_name} missing in {current_path}") from None
             else:
                 if not create_dummy:
                     raise
                 # Create and register dummy module
                 current_module = create_dummy_module(
                     current_path,
-                    parent=(
-                        importlib.import_module(parent_path) if parent_path else None
-                    ),
+                    parent=(importlib.import_module(parent_path) if parent_path else None),
                 )
 
         processed_path.append(part)
@@ -3255,13 +3128,9 @@ def get_physical_device_id(pytorch_device_id: int) -> int:
     Convert PyTorch logical device ID to physical device ID.
     """
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    assert (
-        cuda_visible_devices is not None
-    ), "CUDA_VISIBLE_DEVICES should be set in a scheduler"
+    assert cuda_visible_devices is not None, "CUDA_VISIBLE_DEVICES should be set in a scheduler"
     device_list = cuda_visible_devices.split(",")
-    assert (
-        len(device_list) == 1
-    ), "CUDA_VISIBLE_DEVICES should be set to a single device in a scheduler"
+    assert len(device_list) == 1, "CUDA_VISIBLE_DEVICES should be set to a single device in a scheduler"
     return int(device_list[0])
 
 
@@ -3300,19 +3169,14 @@ def numa_bind_to_node(node: int):
 def json_list_type(value):
     try:
         return json.loads(value)
-    except json.JSONDecodeError:
-        raise argparse.ArgumentTypeError(
-            f"Invalid JSON list: {value}. Please provide a valid JSON list."
-        )
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"Invalid JSON list: {value}. Please provide a valid JSON list.") from e
 
 
 @contextmanager
 def temp_set_cuda_visible_devices(gpu_id: int):
     original_cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if original_cuda_visible_devices:
-        cuda_visible_devices = original_cuda_visible_devices.split(",")
-    else:
-        cuda_visible_devices = []
+    cuda_visible_devices = original_cuda_visible_devices.split(",") if original_cuda_visible_devices else []
 
     str_gpu_id = cuda_visible_devices[gpu_id] if cuda_visible_devices else str(gpu_id)
     os.environ["CUDA_VISIBLE_DEVICES"] = str_gpu_id
@@ -3323,9 +3187,7 @@ def temp_set_cuda_visible_devices(gpu_id: int):
         del os.environ["CUDA_VISIBLE_DEVICES"]
 
 
-def get_extend_input_len_swa_limit(
-    sliding_window_size: int, chunked_prefill_size: int, page_size: int
-) -> int:
+def get_extend_input_len_swa_limit(sliding_window_size: int, chunked_prefill_size: int, page_size: int) -> int:
     # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
     #    and between prefills, we run swa_radix_cache.cache_unfinished_req(),
     #    so we unlock the previously locked nodes.
@@ -3339,7 +3201,7 @@ def get_extend_input_len_swa_limit(
 def get_num_new_pages(
     seq_lens: torch.Tensor,
     page_size: int,
-    prefix_lens: Optional[torch.Tensor] = None,
+    prefix_lens: torch.Tensor | None = None,
     decode: bool = False,
 ) -> torch.Tensor:
     """
@@ -3381,9 +3243,9 @@ class CachedKernel:
 
         # Check that no parameters have default values
         for name, param in self.signature.parameters.items():
-            assert (
-                param.default is inspect.Parameter.empty
-            ), f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            assert param.default is inspect.Parameter.empty, (
+                f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
+            )
 
         functools.update_wrapper(self, original_fn)
         self.kernel_cache = {}
@@ -3396,9 +3258,7 @@ class CachedKernel:
         Index with grid to get a launcher function.
         Returns a launcher that will handle caching based on the key function.
         """
-        assert (
-            isinstance(grid, tuple) and len(grid) <= 3
-        ), "Grid must be a tuple with at most 3 dimensions."
+        assert isinstance(grid, tuple) and len(grid) <= 3, "Grid must be a tuple with at most 3 dimensions."
 
         # Normalize grid once
         if len(grid) < 3:
@@ -3489,18 +3349,18 @@ def get_ip() -> str:
     try:
         hostname = socket.gethostname()
         ip = socket.gethostbyname(hostname)
-        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":
+        if ip and ip != "127.0.0.1" and ip != "0.0.0.0":  # noqa: S104
             return ip
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to get IP via hostname resolution: {e}")
 
     # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to get IP via IPv4 UDP connect: {e}")
 
     # try ipv6
     try:
@@ -3509,24 +3369,21 @@ def get_ip() -> str:
         # https://developers.google.com/speed/public-dns/docs/using#addresses
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to get IP via IPv6 UDP connect: {e}")
 
     warnings.warn(
-        "Failed to get the IP address, using 0.0.0.0 by default."
-        "The value can be set by the environment variable"
-        " SGLANG_HOST_IP or HOST_IP.",
+        "Failed to get the IP address, using 0.0.0.0 by default.The value can be set by the environment variable SGLANG_HOST_IP or HOST_IP.",
         stacklevel=2,
     )
-    return "0.0.0.0"
+    return "0.0.0.0"  # noqa: S104
 
 
 LOG_PREFIX = None
-LOG_LEVEL = 'INFO'
+LOG_LEVEL = "INFO"
 
 
 class CustomFormatter(logging.Formatter):
-
     grey = "\x1b[38;20m"
     yellow = "\x1b[33;20m"
     red = "\x1b[31;20m"
@@ -3544,7 +3401,7 @@ class CustomFormatter(logging.Formatter):
                 logging.INFO: self.grey + format + self.reset,
                 logging.WARNING: self.yellow + format + self.reset,
                 logging.ERROR: self.red + format + self.reset,
-                logging.CRITICAL: self.bold_red + format + self.reset
+                logging.CRITICAL: self.bold_red + format + self.reset,
             }
 
         log_fmt = self.FORMATS.get(record.levelno)
@@ -3571,7 +3428,7 @@ def is_cuda_available():
     return torch.cuda.is_available() and torch.version.cuda
 
 
-def _maybe_json_dict(path: Union[str, os.PathLike]) -> dict[str, str]:
+def _maybe_json_dict(path: str | os.PathLike) -> dict[str, str]:
     with open(path) as f:
         try:
             return json.loads(f.read())
@@ -3579,15 +3436,15 @@ def _maybe_json_dict(path: Union[str, os.PathLike]) -> dict[str, str]:
             return dict[str, str]()
 
 
-def _maybe_space_split_dict(path: Union[str, os.PathLike]) -> dict[str, str]:
+def _maybe_space_split_dict(path: str | os.PathLike) -> dict[str, str]:
     parsed_dict = dict[str, str]()
     with open(path) as f:
         for line in f.readlines():
             try:
                 model_name, redirect_name = line.strip().split()
                 parsed_dict[model_name] = redirect_name
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to parse model redirect line {line.strip()!r} in {path}: {e}")
     return parsed_dict
 
 
@@ -3607,9 +3464,8 @@ def maybe_model_redirect(model: str) -> str:
     if not Path(model_redirect_path).exists():
         return model
 
-    redirect_dict = (_maybe_json_dict(model_redirect_path)
-                     or _maybe_space_split_dict(model_redirect_path))
-    if (redirect_model := redirect_dict.get(model)):
+    redirect_dict = _maybe_json_dict(model_redirect_path) or _maybe_space_split_dict(model_redirect_path)
+    if redirect_model := redirect_dict.get(model):
         logger.info("model redirect: [ %s ] -> [ %s ]", model, redirect_model)
         return redirect_model
 
@@ -3639,73 +3495,12 @@ def set_cpu_offload_max_bytes(max_bytes: int) -> None:
 
 def register_usr_signal():
     parent_process = psutil.Process().parent()
+
     def signal_handler(sig, frame):
-        logger.error(f"recv usr signal, kill usr signal to parent")
+        logger.error("recv usr signal, kill usr signal to parent")
         parent_process.send_signal(signal.SIGUSR1)
+
     signal.signal(signal.SIGUSR1, signal_handler)
-
-
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
-    # Remove sigchld handler to avoid spammy logs.
-    if threading.current_thread() is threading.main_thread():
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-
-    if parent_pid is None:
-        parent_pid = os.getpid()
-        include_parent = False
-
-    try:
-        itself = psutil.Process(parent_pid)
-    except psutil.NoSuchProcess:
-        return
-
-    children = itself.children(recursive=True)
-    for child in children:
-        if child.pid == skip_pid:
-            continue
-        try:
-            child.kill()
-        except psutil.NoSuchProcess:
-            pass
-
-    if include_parent:
-        try:
-            itself.kill()
-
-            # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
-            # so we send an additional signal to kill them.
-            itself.send_signal(signal.SIGQUIT)
-        except psutil.NoSuchProcess:
-            pass
-
-
-def monkey_patch_p2p_access_check():
-    """
-    Monkey patch the slow p2p access check.
-    NOTE: We assume the p2p access is always allowed, which can be wrong for some setups.
-    """
-
-    import sglang.srt.distributed.device_communicators.custom_all_reduce_utils as tgt
-
-    setattr(tgt, "gpu_p2p_access_check", lambda *arg, **kwargs: True)
-
-    # Suppress the warnings from this delete function when using sglang.bench_one_batch
-    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-        CustomAllreduce,
-    )
-
-    setattr(CustomAllreduce, "__del__", lambda *args, **kwargs: None)
-
-
-def get_int_env_var(name: str, default: int = 0) -> int:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 def get_str_env_var(name: str, default: str = "") -> str:
@@ -3715,11 +3510,7 @@ def get_str_env_var(name: str, default: str = "") -> str:
     return value
 
 
-def random_uuid() -> str:
-    return str(uuid.uuid4().hex)
-
-
-def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+def convert_json_schema_to_str(json_schema: dict | str | type[BaseModel]) -> str:
     """Convert a JSON schema to a string.
     Parameters
     ----------
@@ -3750,20 +3541,22 @@ def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -
 
 
 def custom_save_tensor(pt: torch.Tensor, name: str):
-    path = os.environ.get('FLLM_SAVE_DIR')
+    path = os.environ.get("FLLM_SAVE_DIR")
     if path:
         torch.save(pt, f"{path}/{name}")
 
+
 def custom_append_tensor(pt: torch.Tensor, folder: str, name: str):
     from pathlib import Path
-    path = os.environ.get('FLLM_SAVE_DIR')
+
+    path = os.environ.get("FLLM_SAVE_DIR")
     assert path is not None
     path = Path(path)
     path = path / folder
     if not path.exists():
         path.mkdir(parents=True, exist_ok=True)
         with (path / "meta.txt").open("w") as f:
-            f.write(f"0")
+            f.write("0")
     with (path / "meta.txt").open("r") as f:
         cnt = int(f.read())
     torch.save(pt, f"{str(path)}/{name}_{cnt:03d}.pt")
@@ -3771,9 +3564,11 @@ def custom_append_tensor(pt: torch.Tensor, folder: str, name: str):
     with (path / "meta.txt").open("w") as f:
         f.write(f"{cnt}")
 
+
 def custom_load_tensor(pt: torch.Tensor, folder: str, name: str):
     from pathlib import Path
-    path = os.environ.get('FLLM_SAVE_DIR')
+
+    path = os.environ.get("FLLM_SAVE_DIR")
     assert path is not None
     path = Path(path)
     path = path / folder
@@ -3784,8 +3579,327 @@ def custom_load_tensor(pt: torch.Tensor, folder: str, name: str):
         ret.append(torch.load(f"{str(path)}/{name}_{i:03d}.pt"))
     return ret
 
-def get_prefix_sum(x: List[int]) -> List[int]:
+
+def get_prefix_sum(x: list[int]) -> list[int]:
     prefix_sum = [0]
     for i in range(len(x)):
         prefix_sum.append(prefix_sum[-1] + x[i])
     return prefix_sum
+
+
+def get_rank_page_nums(page2rank: list) -> dict[int, int]:
+    rank_page_nums: dict[int, int] = {}
+    for rank in page2rank:
+        rank_page_nums[rank] = rank_page_nums.get(rank, 0) + 1
+    return rank_page_nums
+
+
+def get_page_slices_by_layer_and_page_idx(buf) -> list[list[Tensor]]:
+    if isinstance(buf, Tensor):
+        slices = [[] for _ in range(buf.shape[0])]
+        for layer in range(buf.shape[0]):
+            for page in range(buf.shape[1]):
+                slices[layer].append(buf[layer, page])
+    else:
+        slices = [[] for _ in range(len(buf))]
+        for layer in range(len(buf)):
+            for page in range(buf[layer].shape[0]):
+                slices[layer].append(buf[layer][page])
+    return slices
+
+
+def ensure_divisibility(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, f"{numerator} is not divisible by {denominator}"
+
+
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+
+
+def split_tensor_along_last_dim(
+    tensor: torch.Tensor,
+    num_partitions: int,
+    contiguous_split_chunks: bool = False,
+) -> Sequence[torch.Tensor]:
+    """Split a tensor along its last dimension.
+
+    Arguments:
+        tensor: input tensor.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                 in memory.
+
+    Returns:
+        A list of Tensors
+    """
+    # Get the size and dimension.
+    last_dim = tensor.dim() - 1
+    last_dim_size = divide(tensor.size()[last_dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
+    # NOTE: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+
+def get_pp_indices(num_hidden_layers: int, pp_rank: int, pp_size: int) -> tuple[int, int]:
+    """Try to evenly distribute layers across partitions.
+    If the number of layers is not divisible by the number of partitions,
+    the last partition will have the remaining layers.
+    """
+    from sglang.srt.env import global_server_args_dict
+
+    pp_layer_nums = global_server_args_dict["pp_layer_nums"]
+    if pp_layer_nums is not None:
+        pp_layer_nums_prefix_sum = get_prefix_sum(pp_layer_nums)
+        assert pp_layer_nums_prefix_sum[-1] == num_hidden_layers, f"{pp_layer_nums_prefix_sum=} not match {num_hidden_layers=}"
+        start_layer = pp_layer_nums_prefix_sum[pp_rank]
+        end_layer = pp_layer_nums_prefix_sum[pp_rank + 1]
+    else:
+        layers_per_partition = num_hidden_layers // pp_size
+        start_layer = pp_rank * layers_per_partition
+        end_layer = start_layer + layers_per_partition
+
+        if pp_rank == pp_size - 1:
+            end_layer = num_hidden_layers
+
+    return (start_layer, end_layer)
+
+
+def _coalesce_kv_page_copies(device_pages: list[Tensor], host_pages: list[Tensor]):
+    """Merge adjacent page views only within the same allocation on both ends.
+
+    Host KV pools allocate each layer in chunks. Consecutive page IDs alone
+    therefore do not guarantee that a larger view is safe. Keep fragmented,
+    non-contiguous and differently shaped pages as individual copies.
+    """
+    device_copies, host_copies = [], []
+    start = 0
+    while start < len(device_pages):
+        device_page, host_page = device_pages[start], host_pages[start]
+        end = start + 1
+        if device_page.shape == host_page.shape and device_page.is_contiguous() and host_page.is_contiguous():
+            device_storage = device_page.untyped_storage()
+            host_storage = host_page.untyped_storage()
+            page_size = device_page.numel()
+            device_offset = device_page.storage_offset()
+            host_offset = host_page.storage_offset()
+            while end < len(device_pages):
+                next_device, next_host = device_pages[end], host_pages[end]
+                offset = (end - start) * page_size
+                if not (
+                    next_device.untyped_storage() is device_storage
+                    and next_host.untyped_storage() is host_storage
+                    and next_device.dtype == device_page.dtype
+                    and next_host.dtype == host_page.dtype
+                    and next_device.shape == device_page.shape
+                    and next_host.shape == host_page.shape
+                    and next_device.is_contiguous()
+                    and next_host.is_contiguous()
+                    and next_device.storage_offset() == device_offset + offset
+                    and next_host.storage_offset() == host_offset + offset
+                ):
+                    break
+                end += 1
+        if end - start > 1:
+            shape = ((end - start) * device_page.shape[0], *device_page.shape[1:])
+            device_page = device_page.as_strided(shape, device_page.stride())
+            host_page = host_page.as_strided(shape, host_page.stride())
+        device_copies.append(device_page)
+        host_copies.append(host_page)
+        start = end
+    return device_copies, host_copies
+
+
+class KVPageViews(tuple):
+    """Fixed-layout pool page views with storage runs checked at construction.
+
+    Page contents may change; page shape, stride, storage and order must remain
+    fixed for the lifetime of a pool. Unregistered lists keep the checked path.
+    """
+
+    def __new__(cls, pages):
+        result = super().__new__(cls, pages)
+        ends = list(range(1, len(result) + 1))
+        if result and all(page.numel() for page in result):
+            runs, _ = _coalesce_kv_page_copies(result, result)
+            cursor = 0
+            for run in runs:
+                count = run.numel() // result[cursor].numel()
+                ends[cursor : cursor + count] = [cursor + count] * count
+                cursor += count
+            assert cursor == len(result)
+        result.run_ends = tuple(ends)
+        return result
+
+
+def _indexed_kv_page_copies(device_pages, host_pages, device_start, host_start, count):
+    device_copies, host_copies = [], []
+    while count:
+        device_page, host_page = device_pages[device_start], host_pages[host_start]
+        n = min(count, device_pages.run_ends[device_start] - device_start, host_pages.run_ends[host_start] - host_start)
+        if device_page.shape != host_page.shape:
+            n = 1
+        if n > 1:
+            shape = (n * device_page.shape[0], *device_page.shape[1:])
+            device_page = device_page.as_strided(shape, device_page.stride())
+            host_page = host_page.as_strided(shape, host_page.stride())
+        device_copies.append(device_page)
+        host_copies.append(host_page)
+        device_start += n
+        host_start += n
+        count -= n
+    return device_copies, host_copies
+
+
+def transfer_kv_layer_torch_npu(
+    device_k_slices: list,
+    host_k_slices: list,
+    device_v_slices: list | None,
+    host_v_slices: list | None,
+    device_ik_slices: list | None,
+    host_ik_slices: list | None,
+    device_indices: torch.Tensor,
+    host_indices: torch.Tensor,
+    direction: int,
+    indexer_layer_mask=None,
+    *,
+    coalesce: bool | None = None,
+):
+    """
+    Pure-Python replacement for torch.ops.transfer_kv.transfer_kv_layer.
+
+    Uses torch._foreach_copy_ on a dedicated NPU stream to perform batched
+    page-level KV transfers between device and host (pin_memory) tensors.
+
+    Args:
+        device_k: NPU tensor, shape [layer_num, page_num][page_size, head_num, head_dim]
+                  or [page_num] [page_size, head_num, head_dim]
+        host_k:   CPU (pin_memory) tensor, same layout as device_k but may differ in page_num dim.
+        device_v: Optional NPU tensor, same layout convention as device_k.
+        host_v:   Optional CPU tensor, same layout convention as host_k.
+        device_ik: Optional NPU tensor (index_k), same layout convention.
+        host_ik:   Optional CPU tensor (index_k), same layout convention.
+        device_indices: 1-D int64 tensor, page indices into device tensors.
+        host_indices:   1-D int64 tensor, page indices into host tensors.
+        direction: 1 = H2D (host->device), 2 = D2H (device->host).
+    """
+    assert direction in (1, 2), "direction must be 1 (H2D) or 2 (D2H)"
+    assert device_indices.numel() == host_indices.numel(), "device_indices and host_indices must have the same length"
+
+    num_pages = device_indices.numel()
+    if num_pages == 0:
+        return
+
+    dim = 4 if isinstance(device_k_slices[0], Tensor) else 5
+    assert dim in (4, 5), "device_k must be 4D or 5D"
+    is_5d = dim == 5
+    if is_5d:
+        assert len(device_k_slices) == len(host_k_slices), "device_k and host_k must have the same number of layers"
+        assert device_k_slices[0][0].shape[0] == host_k_slices[0][0].shape[0], "device_k and host_k must have the same page_size"
+    else:
+        assert device_k_slices[0].shape[0] == host_k_slices[0].shape[0], "device_k and host_k must have the same page_size"
+
+    # Collect all (device_tensor, host_tensor) buffer pairs
+    buffer_pairs = [(device_k_slices, host_k_slices)]
+
+    def append_optional_buffer_pair(name, device_slices, host_slices):
+        if (device_slices is None) != (host_slices is None):
+            raise ValueError(
+                f"{name} buffer layout mismatch: "
+                f"device_slices={'missing' if device_slices is None else 'present'}, "
+                f"host_slices={'missing' if host_slices is None else 'present'}"
+            )
+        if device_slices is not None:
+            buffer_pairs.append((device_slices, host_slices))
+
+    append_optional_buffer_pair("value", device_v_slices, host_v_slices)
+    append_optional_buffer_pair("index_k", device_ik_slices, host_ik_slices)
+
+    if coalesce is None:
+        from sglang.srt.env import global_server_args_dict
+
+        coalesce = global_server_args_dict.get("disaggregation_mode") == "prefill"
+
+    # Group within each layer so adjacent pages can share a copy descriptor.
+    # No device gather or staging buffer is needed: merged tensors are views.
+    device_pages_list = device_indices.tolist()
+    host_pages_list = host_indices.tolist()
+    # Find candidate runs once for all layers/buffers. Fragmented page IDs take
+    # the original path without paying for per-tensor storage/shape checks.
+    page_runs = []
+    start = 0
+    if coalesce:
+        for i in range(1, num_pages):
+            if device_pages_list[i] != device_pages_list[i - 1] + 1 or host_pages_list[i] != host_pages_list[i - 1] + 1:
+                page_runs.append((start, i))
+                start = i
+    page_runs.append((start, num_pages))
+    has_contiguous_run = coalesce and len(page_runs) < num_pages
+
+    d_tensors = []
+    h_tensors = []
+    num_layers = len(device_k_slices) if is_5d else 1
+    if indexer_layer_mask is not None and len(indexer_layer_mask) != num_layers:
+        raise ValueError("IndexK transfer mask does not match logical layer count")
+
+    for dev_sl, host_sl in buffer_pairs:
+        if not has_contiguous_run:
+            for d_idx, h_idx in zip(device_pages_list, host_pages_list):
+                if is_5d:
+                    for layer in range(num_layers):
+                        if dev_sl is device_ik_slices and indexer_layer_mask is not None and not indexer_layer_mask[layer]:
+                            continue
+                        d_tensors.append(dev_sl[layer][d_idx])
+                        h_tensors.append(host_sl[layer][h_idx])
+                else:
+                    if dev_sl is device_ik_slices and indexer_layer_mask is not None and not indexer_layer_mask[0]:
+                        continue
+                    d_tensors.append(dev_sl[d_idx])
+                    h_tensors.append(host_sl[h_idx])
+            continue
+        for layer in range(num_layers):
+            # The indexer mask must apply on the coalesced path as well; a
+            # masked-off layer has no host-side index_k pages to pair with.
+            if dev_sl is device_ik_slices and indexer_layer_mask is not None and not indexer_layer_mask[layer]:
+                continue
+            device_layer = dev_sl[layer] if is_5d else dev_sl
+            host_layer = host_sl[layer] if is_5d else host_sl
+            for start, end in page_runs:
+                if end - start == 1:
+                    d_tensors.append(device_layer[device_pages_list[start]])
+                    h_tensors.append(host_layer[host_pages_list[start]])
+                elif isinstance(device_layer, KVPageViews) and isinstance(host_layer, KVPageViews):
+                    device_copies, host_copies = _indexed_kv_page_copies(
+                        device_layer,
+                        host_layer,
+                        device_pages_list[start],
+                        host_pages_list[start],
+                        end - start,
+                    )
+                    d_tensors.extend(device_copies)
+                    h_tensors.extend(host_copies)
+                else:
+                    device_copies, host_copies = _coalesce_kv_page_copies(
+                        [device_layer[idx] for idx in device_pages_list[start:end]],
+                        [host_layer[idx] for idx in host_pages_list[start:end]],
+                    )
+                    d_tensors.extend(device_copies)
+                    h_tensors.extend(host_copies)
+
+    if direction == 2:  # D2H
+        src_tensors = d_tensors
+        dst_tensors = h_tensors
+    else:  # H2D
+        src_tensors = h_tensors
+        dst_tensors = d_tensors
+
+    BATCH_SIZE = 16384
+    for i in range(0, len(src_tensors), BATCH_SIZE):
+        torch._foreach_copy_(dst_tensors[i : i + BATCH_SIZE], src_tensors[i : i + BATCH_SIZE], non_blocking=True)

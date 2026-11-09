@@ -35,11 +35,7 @@ def _is_var_access(node: jinja2.nodes.Node, varname: str) -> bool:
 def _is_attr_access(node: jinja2.nodes.Node, varname: str, key: str) -> bool:
     """Check if node is an attribute access like {{ varname['key'] }} or {{ varname.key }}"""
     if isinstance(node, jinja2.nodes.Getitem):
-        return (
-            _is_var_access(node.node, varname)
-            and isinstance(node.arg, jinja2.nodes.Const)
-            and node.arg.value == key
-        )
+        return _is_var_access(node.node, varname) and isinstance(node.arg, jinja2.nodes.Const) and node.arg.value == key
 
     if isinstance(node, jinja2.nodes.Getattr):
         return _is_var_access(node.node, varname) and node.attr == key
@@ -54,15 +50,11 @@ def _is_var_or_elems_access(
 ) -> bool:
     """Check if node accesses varname or varname[key] with filters/tests"""
     if isinstance(node, jinja2.nodes.Filter):
-        return node.node is not None and _is_var_or_elems_access(
-            node.node, varname, key
-        )
+        return node.node is not None and _is_var_or_elems_access(node.node, varname, key)
     if isinstance(node, jinja2.nodes.Test):
         return _is_var_or_elems_access(node.node, varname, key)
 
-    if isinstance(node, jinja2.nodes.Getitem) and isinstance(
-        node.arg, jinja2.nodes.Slice
-    ):
+    if isinstance(node, jinja2.nodes.Getitem) and isinstance(node.arg, jinja2.nodes.Slice):
         return _is_var_or_elems_access(node.node, varname, key)
 
     return _is_attr_access(node, varname, key) if key else _is_var_access(node, varname)
@@ -89,6 +81,12 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
     - If template has loops like {%- for content in message['content'] -%} → 'openai'
     - Otherwise → 'string'
     """
+    # Shortcut for multimodal templates
+    if any(
+        keyword in chat_template for keyword in ["image", "audio", "video", "vision", "visual"]
+    ):
+        return "openai"
+
     jinja_ast = _try_extract_ast(chat_template)
     if jinja_ast is None:
         return "string"
@@ -101,6 +99,12 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
             # Check if iterating over message['content'] or similar
             if _is_var_or_elems_access(loop_iter, "message", "content"):
                 return "openai"  # Found content iteration → openai format
+
+            # Also check for patterns like: {%- for item in msg.content -%} or {%- for item in m.content -%}
+            if _is_var_or_elems_access(
+                loop_iter, "msg", "content"
+            ) or _is_var_or_elems_access(loop_iter, "m", "content"):
+                return "openai"  # Found content iteration → openai format (glm4v)
 
         return "string"  # No content loops found → string format
     except Exception as e:
@@ -150,14 +154,14 @@ def process_content_for_template_format(
                     )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
-                    # Normalize to simple 'image' type for template compatibility
-                    processed_content_parts.append({"type": "image"})
+                    # Preserve full image_url structure for templates that render URLs inline
+                    processed_content_parts.append(chunk)
                 elif chunk_type == "video_url":
                     video_data.append(chunk["video_url"]["url"])
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
-                    # Normalize to simple 'video' type for template compatibility
-                    processed_content_parts.append({"type": "video"})
+                    # Preserve full video_url structure for templates that render URLs inline
+                    processed_content_parts.append(chunk)
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type
@@ -166,9 +170,7 @@ def process_content_for_template_format(
                     # Keep other content as-is (text, etc.)
                     processed_content_parts.append(chunk)
 
-        new_msg = {
-            k: v for k, v in msg_dict.items() if v is not None and k != "content"
-        }
+        new_msg = {k: v for k, v in msg_dict.items() if v is not None and k != "content"}
         new_msg["content"] = processed_content_parts
         return new_msg
 

@@ -7,7 +7,6 @@ import torch
 from torch.nn import functional as F
 
 
-
 def fused_moe_forward_native(
     layer: torch.nn.Module,
     dispatch_output,

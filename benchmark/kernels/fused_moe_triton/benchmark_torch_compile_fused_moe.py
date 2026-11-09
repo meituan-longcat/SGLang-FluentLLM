@@ -2,13 +2,12 @@ import argparse
 
 import torch
 import triton
-from torch.nn import functional as F
-from transformers import AutoConfig
-
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
     fused_moe as fused_moe_triton,
 )
 from sglang.srt.model_executor.cuda_graph_runner import set_torch_compile_config
+from torch.nn import functional as F
+from transformers import AutoConfig
 
 
 def get_model_config(model_name: str, tp_size: int):

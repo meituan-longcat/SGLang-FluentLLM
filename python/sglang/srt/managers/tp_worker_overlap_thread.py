@@ -14,7 +14,7 @@
 """A tensor parallel worker."""
 
 import dataclasses
-from sglang.srt.utils import get_colorful_logger
+import math
 import signal
 import threading
 from queue import Queue
@@ -22,7 +22,7 @@ from typing import Optional
 
 import psutil
 import torch
-import math
+
 from sglang.srt.env import ENV
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
@@ -31,13 +31,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.scheduling.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    get_compiler_backend,
-    is_npu
-)
+from sglang.srt.utils import get_colorful_logger, is_npu
 from sglang.utils import get_exception_traceback
 
 logger = get_colorful_logger(__name__)
@@ -84,9 +81,7 @@ class TpModelWorkerClient:
         self.future_token_ids_limit = future_max_num_tokens
 
         # Upper bound for write and resolve is future_token_ids_limit + max_running_requests, see line 157 and line 215
-        self.future_token_ids_map = torch.empty(
-            (self.future_token_ids_limit + self.max_running_requests,), dtype=torch.int32, device=self.device
-        )
+        self.future_token_ids_map = torch.empty((self.future_token_ids_limit + self.max_running_requests,), dtype=torch.int32, device=self.device)
 
         # Launch threads
         self.input_queue = Queue()
@@ -136,9 +131,6 @@ class TpModelWorkerClient:
     def get_attention_tp_group(self):
         return self.worker.get_attention_tp_group()
 
-    def get_tp_group(self):
-        return self.worker.get_tp_group()
-
     def get_memory_pool(self):
         return (
             self.worker.model_runner.req_to_token_pool,
@@ -149,11 +141,11 @@ class TpModelWorkerClient:
     def register_hicache_layer_transfer_counter(self, counter):
         return self.worker.register_hicache_layer_transfer_counter(counter)
 
-    def set_hicache_consumer(self, consumer_index: int):
-        return self.worker.set_hicache_consumer(consumer_index)
-
     def forward_thread_func(self):
         try:
+            # device 绑定是线程局部的: 新线程不继承主线程的 set_device, 首次触发
+            # LazySetDevice 会落到 device 0 (同节点多 DP rank 时表现为该卡 OOM)。
+            torch.get_device_module(self.device).set_device(self.gpu_id)
             with torch.get_device_module(self.device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:
@@ -161,7 +153,7 @@ class TpModelWorkerClient:
             logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
             self.parent_process.send_signal(signal.SIGUSR1)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward_thread_func_(self):
         batch_pt = 0
         batch_lists = [None] * self.keep_batch_reference_num
@@ -182,58 +174,69 @@ class TpModelWorkerClient:
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
-            resolve_future_token_ids(input_ids,
-                                     self.future_token_ids_map)
+            resolve_future_token_ids(input_ids, self.future_token_ids_map)
+
+            # For multi-step decode, disable async vocab mask wait since the scheduler
+            # doesn't compute it between steps. This makes the forward thread compute
+            # vocab_mask inline (same as non-overlap mode).
+            if self.num_continuous_decode_steps > 1 and model_worker_batch.sampling_info:
+                model_worker_batch.sampling_info.sampling_info_done = None
+
+            # For multi-step decode, disable async vocab mask wait since the scheduler
+            # doesn't compute it between steps. This makes the forward thread compute
+            # vocab_mask inline (same as non-overlap mode).
+            if self.num_continuous_decode_steps > 1 and model_worker_batch.sampling_info:
+                model_worker_batch.sampling_info.sampling_info_done = None
 
             # Run forward
             logits_output, next_token_ids, next_token_multi_ids = self.worker.forward_batch_generation(
                 model_worker_batch, model_worker_batch.launch_done
             )
 
+            # Grammar accept for multi-step decode: accept tokens in forward thread
+            # so that the next step's vocab_mask is based on up-to-date grammar state.
+            grammar_terminated_list = None
+            if (
+                self.num_continuous_decode_steps > 1
+                and model_worker_batch.sampling_info
+                and model_worker_batch.sampling_info.grammars
+                and next_token_ids is not None
+            ):
+                token_ids_cpu = next_token_ids.tolist()
+                for i, grammar in enumerate(model_worker_batch.sampling_info.grammars):
+                    if grammar is not None and not grammar.finished and not grammar.is_terminated():
+                        grammar.accept_token(token_ids_cpu[i])
+                # Record per-token grammar terminated state (list of lists).
+                # Non-spec path: each inner list has exactly 1 element.
+                grammar_terminated_list = [[g.is_terminated() if g is not None else False] for g in model_worker_batch.sampling_info.grammars]
+
             # Update the future token ids map
             bs = len(model_worker_batch.seq_lens)
-            self.future_token_ids_map[
-                future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-            ] = next_token_ids
+            self.future_token_ids_map[future_token_ids_ct + 1 : future_token_ids_ct + bs + 1] = next_token_ids
 
             # Copy results to the CPU
             if model_worker_batch.return_logprob:
-                logits_output.next_token_logprobs = (
-                    logits_output.next_token_logprobs.to("cpu", non_blocking=True)
-                )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.to("cpu", non_blocking=True)
-                    )
+                logits_output.transfer_logprobs_to_cpu()
             if logits_output.hidden_states is not None:
-                logits_output.hidden_states = logits_output.hidden_states.to(
-                    "cpu", non_blocking=True
-                )
+                logits_output.hidden_states = logits_output.hidden_states.to("cpu", non_blocking=True)
             self.worker.model_runner.req_to_token_pool.verified_lens[model_worker_batch.req_pool_indices] += model_worker_batch.new_tokens_to_compute
             next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             if next_token_multi_ids is not None:
                 next_token_multi_ids = next_token_multi_ids.to("cpu", non_blocking=True)
             copy_done.record()
 
-            self.output_queue.put((copy_done, logits_output, next_token_ids, next_token_multi_ids))
+            self.output_queue.put((copy_done, logits_output, next_token_ids, next_token_multi_ids, grammar_terminated_list))
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
-        copy_done, logits_output, next_token_ids, next_token_multi_ids = self.output_queue.get()
+        copy_done, logits_output, next_token_ids, next_token_multi_ids, grammar_terminated_list = self.output_queue.get()
 
         if launch_done is not None:
             launch_done.wait()
         copy_done.synchronize()
 
-        if logits_output.next_token_logprobs is not None:
-            logits_output.next_token_logprobs = (
-                logits_output.next_token_logprobs.tolist()
-            )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
+        logits_output.convert_logprobs_to_python()
         next_token_ids = next_token_ids.tolist()
-        return logits_output, next_token_ids, next_token_multi_ids
+        return logits_output, next_token_ids, next_token_multi_ids, grammar_terminated_list
 
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
@@ -260,9 +263,7 @@ class TpModelWorkerClient:
             dtype=torch.int32,
             device=self.device,
         )
-        self.future_token_ids_ct = (
-            self.future_token_ids_ct + bs
-        ) % self.future_token_ids_limit
+        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
         return None, future_next_token_ids, None
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
@@ -273,9 +274,7 @@ class TpModelWorkerClient:
         success, message = self.worker.init_weights_update_group(recv_req)
         return success, message
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
+    def update_weights_from_distributed(self, recv_req: UpdateWeightsFromDistributedReqInput):
         success, message = self.worker.update_weights_from_distributed(recv_req)
         return success, message
 

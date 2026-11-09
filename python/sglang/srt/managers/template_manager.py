@@ -24,8 +24,6 @@ import re
 from typing import Optional
 
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import ServerArgs, PortArgs
-from sglang.srt.utils import get_colorful_logger
 from sglang.srt.parser.code_completion_parser import (
     CompletionTemplate,
     FimPosition,
@@ -39,6 +37,8 @@ from sglang.srt.parser.conversation import (
     register_conv_template,
 )
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
+from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
@@ -67,14 +67,26 @@ class TemplateManager:
         else:
             # If no pre-defined template was found, fallback to HuggingFace template
             if self._chat_template_name is None:
-                # Default to string content format if no template was found
-                self._jinja_template_content_format = "string"
-                logger.warning("chat template will be detected by hf in function _apply_jinja_template")
+                # Try to detect content format from the HuggingFace tokenizer's built-in chat template.
+                # This is necessary for multimodal models (e.g. Qwen3VL) whose jinja template uses
+                # the 'openai' content format (iterates over message['content'] as a list), so that
+                # image_url chunks are correctly extracted into image_data instead of being silently
+                # dropped by the 'string' fallback path.
+                actual_template = self.tokenizer_manager.query_actual_chat_template()
+                if actual_template:
+                    self._jinja_template_content_format = detect_jinja_template_content_format(
+                        actual_template
+                    )
+                    logger.warning(
+                        f"Detected HuggingFace built-in chat template content format: "
+                        f"{self._jinja_template_content_format}"
+                    )
+                else:
+                    self._jinja_template_content_format = "string"
+                    logger.warning("chat template will be detected by hf in function _apply_jinja_template")
 
         # Detect reasoning pattern from chat template
-        self._force_reasoning = self._detect_reasoning_pattern(
-            self.tokenizer_manager.query_actual_chat_template()
-        )
+        self._force_reasoning = self._detect_reasoning_pattern(self.tokenizer_manager.query_actual_chat_template())
 
         # Load completion template
         if server_args.completion_template:
@@ -127,21 +139,15 @@ class TemplateManager:
 
     def _load_jinja_template(self, template_path: str) -> None:
         """Load a Jinja template file."""
-        with open(template_path, "r") as f:
+        with open(template_path) as f:
             chat_template = "".join(f.readlines()).strip("\n")
         self._override_chat_template = chat_template.replace("\\n", "\n")
         self._chat_template_name = None
         # Detect content format from the loaded template
-        self._jinja_template_content_format = detect_jinja_template_content_format(
-            chat_template
-        )
-        logger.info(
-            f"Detected user specified Jinja chat template with content format: {self._jinja_template_content_format}"
-        )
+        self._jinja_template_content_format = detect_jinja_template_content_format(chat_template)
+        logger.info(f"Detected user specified Jinja chat template with content format: {self._jinja_template_content_format}")
 
-    def _load_explicit_chat_template(
-        self, chat_template_arg: str
-    ) -> None:
+    def _load_explicit_chat_template(self, chat_template_arg: str) -> None:
         """Load explicitly specified chat template."""
         logger.warning(f"Loading chat template from argument: {chat_template_arg}")
 
@@ -150,10 +156,7 @@ class TemplateManager:
             return
 
         if not os.path.exists(chat_template_arg):
-            raise RuntimeError(
-                f"Chat template {chat_template_arg} is not a built-in template name "
-                "or a valid chat template file path."
-            )
+            raise RuntimeError(f"Chat template {chat_template_arg} is not a built-in template name or a valid chat template file path.")
 
         if chat_template_arg.endswith(".jinja"):
             self._load_jinja_template(chat_template_arg)
@@ -172,8 +175,7 @@ class TemplateManager:
         if not completion_template_exists(completion_template_arg):
             if not os.path.exists(completion_template_arg):
                 raise RuntimeError(
-                    f"Completion template {completion_template_arg} is not a built-in template name "
-                    "or a valid completion template file path."
+                    f"Completion template {completion_template_arg} is not a built-in template name or a valid completion template file path."
                 )
 
             self._load_json_completion_template(completion_template_arg)
@@ -182,18 +184,14 @@ class TemplateManager:
 
     def _load_json_chat_template(self, template_path: str) -> None:
         """Load a JSON chat template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of chat template file"
+        assert template_path.endswith(".json"), "unrecognized format of chat template file"
 
-        with open(template_path, "r") as filep:
+        with open(template_path) as filep:
             template = json.load(filep)
             try:
                 sep_style = SeparatorStyle[template["sep_style"]]
             except KeyError:
-                raise ValueError(
-                    f"Unknown separator style: {template['sep_style']}"
-                ) from None
+                raise ValueError(f"Unknown separator style: {template['sep_style']}") from None
 
             register_conv_template(
                 Conversation(
@@ -211,18 +209,14 @@ class TemplateManager:
 
     def _load_json_completion_template(self, template_path: str) -> None:
         """Load a JSON completion template file."""
-        assert template_path.endswith(
-            ".json"
-        ), "unrecognized format of completion template file"
+        assert template_path.endswith(".json"), "unrecognized format of completion template file"
 
-        with open(template_path, "r") as filep:
+        with open(template_path) as filep:
             template = json.load(filep)
             try:
                 fim_position = FimPosition[template["fim_position"]]
             except KeyError:
-                raise ValueError(
-                    f"Unknown fim position: {template['fim_position']}"
-                ) from None
+                raise ValueError(f"Unknown fim position: {template['fim_position']}") from None
 
             register_completion_template(
                 CompletionTemplate(

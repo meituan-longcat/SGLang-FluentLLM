@@ -1,42 +1,41 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
-from sglang.srt.env import global_server_args_dict
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.utils import add_prefix, get_colorful_logger
+
 logger = get_colorful_logger(__name__)
 
 
@@ -76,16 +75,10 @@ class LlamaModel(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.eh_proj = ReplicatedLinear(
-            2 * config.hidden_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("eh_proj", "")
+            2 * config.hidden_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=add_prefix("eh_proj", "")
         )
 
-        self.decoder = LlamaDecoderLayer(
-            config, 0, quant_config=quant_config
-        )
+        self.decoder = LlamaDecoderLayer(config, 0, quant_config=quant_config)
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -96,32 +89,25 @@ class LlamaModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
 
-        hidden_states, _ = self.eh_proj(
-            torch.cat(
-                (
-                    self.enorm(hidden_states),
-                    self.hnorm(forward_batch.spec_info.hidden_states)
-                ), 
-                dim=-1
-            )
-        )
+        hidden_states, _ = self.eh_proj(torch.cat((self.enorm(hidden_states), self.hnorm(forward_batch.spec_info.hidden_states)), dim=-1))
 
         residual = None
         # tp_num_tokens = hidden_states.shape[0]
         hidden_states, residual = self.decoder(
             # positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens
-            positions, hidden_states, forward_batch, residual
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
         )
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.final_layernorm(hidden_states, residual)
             # hidden_states, _ = self.decoder.decoder_comm_manager.post_final_norm_comm(hidden_states, residual, tp_num_tokens)
         return hidden_states
+
 
 class LlamaForCausalLMNextN(LlamaForCausalLM):
     def __init__(
@@ -157,12 +143,10 @@ class LlamaForCausalLMNextN(LlamaForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
-    
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        print(f"load_weights_eagle")
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        print("load_weights_eagle")
 
         if hasattr(self.config, "num_nextn_predict_layers"):
             num_nextn_layers = self.config.num_nextn_predict_layers
@@ -205,7 +189,7 @@ class LlamaForCausalLMNextN(LlamaForCausalLM):
         }
 
         # named_parameters
-        '''
+        """
             'model.embed_tokens.weight'
             'model.enorm.weight'
             'model.hnorm.weight'
@@ -220,10 +204,10 @@ class LlamaForCausalLMNextN(LlamaForCausalLM):
             'model.decoder.post_attention_layernorm.weight'
             'model.final_layernorm.weight'
             'lm_head.weight'
-        '''
+        """
 
         params_dict = dict(self.named_parameters())
-                
+
         for name, loaded_weight in weights:
             if ".mtp." not in name:
                 continue
@@ -246,19 +230,21 @@ class LlamaForCausalLMNextN(LlamaForCausalLM):
                 break
             else:
                 param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
 
 class MeituanQwen3ForCausalLMNextN(LlamaForCausalLMNextN):
     pass
 
+
 class LongcatLiteForCausalLMNextN(LlamaForCausalLMNextN):
     pass
+
 
 EntryClass = [
     LlamaForCausalLMNextN,
     # meituan
-    MeituanQwen3ForCausalLMNextN, LongcatLiteForCausalLMNextN
+    MeituanQwen3ForCausalLMNextN,
+    LongcatLiteForCausalLMNextN,
 ]

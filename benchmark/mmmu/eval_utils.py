@@ -7,7 +7,6 @@ import os
 import pprint
 import random
 import re
-from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -30,7 +29,7 @@ class EvalArgs:
     result_filename: str = ""
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
-    extra_request_body: Optional[str] = None
+    extra_request_body: str | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -99,7 +98,7 @@ def prepare_samples(eval_args: EvalArgs):
     eval_args.config = load_yaml(prompt_format_file)
     for key, value in eval_args.config.items():
         if key != "eval_params" and type(value) == list:
-            assert len(value) == 1, "key {} has more than one value".format(key)
+            assert len(value) == 1, f"key {key} has more than one value"
             eval_args.config[key] = value[0]
 
     # run for each subject
@@ -320,7 +319,6 @@ def parse_open_response(response):
             return [response]
         return key_responses
 
-    # pdb.set_trace()
     key_responses = get_key_subresponses(response)
 
     pred_list = key_responses.copy()  # keep the original string response
@@ -405,7 +403,6 @@ def evaluate(samples):
             judge_dict[sample["id"]] = "Correct"
             pred_correct += 1
         else:
-            # print(f"Wrong! expected {pred_i}, answered with {gold_i}")
             judge_dict[sample["id"]] = "Wrong"
 
     if len(samples) == 0:
@@ -414,7 +411,7 @@ def evaluate(samples):
 
 
 # ----------- Calculate Accuracy -------------
-def calculate_ins_level_acc(results: Dict):
+def calculate_ins_level_acc(results: dict):
     """Calculate the instruction level accuracy for given Subject results"""
     acc = 0
     ins_num = 0
@@ -450,13 +447,11 @@ def eval_result(output_path, answer_dict):
     evaluation_result = {}
 
     for category in CAT_SHORT2LONG.values():
-        # print("Evaluating: {}".format(category))
         # get cat_outputs and cat_answers
         try:
             cat_outputs = output_dict_w_cat[category]
             cat_answers = answer_dict_w_cat[category]
         except KeyError:
-            # print("Skipping {} for not found".format(category))
             continue
 
         exampels_to_eval = []
@@ -484,12 +479,11 @@ def eval_result(output_path, answer_dict):
         evaluation_result[category] = metric_dict
 
     printable_results = {}
-    # pdb.set_trace()
     # add domain Subject
     for domain, in_domain_cats in DOMAIN_CAT2SUB_CAT.items():
         in_domain_cat_results = {}
         for cat_name in in_domain_cats:  # use the order in DOMAIN_CAT2SUB_CAT
-            if cat_name in evaluation_result.keys():
+            if cat_name in evaluation_result:
                 in_domain_cat_results[cat_name] = evaluation_result[cat_name]
             else:
                 pass

@@ -12,18 +12,17 @@ try:
 except ImportError as e:
     mcp = e
 
-from openai_harmony import Author, Message, Role, StreamState, TextContent
+from openai_harmony import Author, Message, Role, StreamState, TextContent  # noqa: E402
 
-from sglang.srt.entrypoints.harmony_utils import (
+from sglang.srt.entrypoints.harmony_utils import (  # noqa: E402
     get_encoding,
     get_streamable_parser_for_assistant,
     render_for_completion,
 )
-from sglang.srt.entrypoints.tool import Tool
+from sglang.srt.entrypoints.tool import Tool  # noqa: E402
 
 
 class ConversationContext(ABC):
-
     @abstractmethod
     def append_output(self, output) -> None:
         pass
@@ -42,7 +41,6 @@ class ConversationContext(ABC):
 
 
 class SimpleContext(ConversationContext):
-
     def __init__(self):
         self.last_output = None
 
@@ -60,7 +58,6 @@ class SimpleContext(ConversationContext):
 
 
 class HarmonyContext(ConversationContext):
-
     def __init__(
         self,
         messages: list,
@@ -96,6 +93,8 @@ class HarmonyContext(ConversationContext):
                     self.num_cached_tokens = meta_info["cached_tokens"]
                 if "completion_tokens" in meta_info:
                     self.num_output_tokens += meta_info["completion_tokens"]
+                if "reasoning_tokens" in meta_info:
+                    self.num_reasoning_tokens = meta_info["reasoning_tokens"]
 
         else:
             output_msgs = output
@@ -109,9 +108,7 @@ class HarmonyContext(ConversationContext):
     def need_builtin_tool_call(self) -> bool:
         last_msg = self.messages[-1]
         recipient = last_msg.recipient
-        return recipient is not None and (
-            recipient.startswith("browser.") or recipient.startswith("python")
-        )
+        return recipient is not None and (recipient.startswith("browser.") or recipient.startswith("python"))
 
     async def call_tool(self) -> list[Message]:
         if not self.messages:
@@ -120,21 +117,15 @@ class HarmonyContext(ConversationContext):
         recipient = last_msg.recipient
         if recipient is not None:
             if recipient.startswith("browser."):
-                return await self.call_search_tool(
-                    self.tool_sessions["browser"], last_msg
-                )
+                return await self.call_search_tool(self.tool_sessions["browser"], last_msg)
             elif recipient.startswith("python"):
-                return await self.call_python_tool(
-                    self.tool_sessions["python"], last_msg
-                )
+                return await self.call_python_tool(self.tool_sessions["python"], last_msg)
         raise ValueError("No tool call found")
 
     def render_for_completion(self) -> list[int]:
         return render_for_completion(self.messages)
 
-    async def call_search_tool(
-        self, tool_session: Union["ClientSession", Tool], last_msg: Message
-    ) -> list[Message]:
+    async def call_search_tool(self, tool_session: Union["ClientSession", Tool], last_msg: Message) -> list[Message]:
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
         tool_name = last_msg.recipient.split(".")[1]
@@ -145,9 +136,7 @@ class HarmonyContext(ConversationContext):
         author = Author(role=Role.TOOL, name=last_msg.recipient)
         return [Message(author=author, content=[content], recipient=Role.ASSISTANT)]
 
-    async def call_python_tool(
-        self, tool_session: Union["ClientSession", Tool], last_msg: Message
-    ) -> list[Message]:
+    async def call_python_tool(self, tool_session: Union["ClientSession", Tool], last_msg: Message) -> list[Message]:
         if isinstance(tool_session, Tool):
             return await tool_session.get_result(self)
         param = {
@@ -170,7 +159,6 @@ class HarmonyContext(ConversationContext):
 
 
 class StreamingHarmonyContext(HarmonyContext):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.last_output = None

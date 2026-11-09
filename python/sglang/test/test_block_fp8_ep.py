@@ -12,7 +12,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     run_moe_ep_preproess,
     silu_and_mul_triton_kernel,
 )
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.ops.topk import select_experts
 
 
 # For test

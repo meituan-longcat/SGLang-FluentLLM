@@ -1,11 +1,12 @@
 import logging
-from typing import List, Optional
+from typing import Optional
+
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
 
 class MooncakeTransferEngine:
-
     def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
         try:
             from mooncake.engine import TransferEngine
@@ -27,9 +28,15 @@ class MooncakeTransferEngine:
         )
         self.session_id = f"{self.hostname}:{self.engine.get_rpc_port()}"
 
-    def register(self, ptr, length):
+    def register(self, ptr, length, is_cpu=False):
         try:
-            ret_value = self.engine.register_memory(ptr, length)
+            if is_cpu:
+                # CPU-backed swapped tensors expose NPU-visible addresses.
+                # Ascend Direct requires the "npu" registration location for
+                # those addresses even though their storage resides on host.
+                ret_value = self.engine.register_memory(ptr, length, "npu")
+            else:
+                ret_value = self.engine.register_memory(ptr, length)
         except Exception:
             # Mark register as failed
             ret_value = -1
@@ -53,26 +60,23 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
+        npu = is_npu()
         ret_value = self.engine.initialize(
             hostname,
             "P2PHANDSHAKE",
-            "rdma",
+            "ascend_direct" if npu else "rdma",
             device_name if device_name is not None else "",
         )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
-    def transfer_sync(
-        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
-    ) -> int:
+    def transfer_sync(self, session_id: str, buffer: int, peer_buffer_address: int, length: int) -> int:
         """Synchronously transfer data to the specified address."""
         try:
             # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
             # later: based on the cached queue pair to send data
-            ret = self.engine.transfer_sync_write(
-                session_id, buffer, peer_buffer_address, length
-            )
+            ret = self.engine.transfer_sync_write(session_id, buffer, peer_buffer_address, length)
         except Exception:
             # Mark transfer request as failed
             ret = -1
@@ -91,23 +95,21 @@ class MooncakeTransferEngine:
     def batch_transfer_sync(
         self,
         session_id: str,
-        buffers: List[int],
-        peer_buffer_addresses: List[int],
-        lengths: List[int],
+        buffers: list[int],
+        peer_buffer_addresses: list[int],
+        lengths: list[int],
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:
-            ret = self.engine.batch_transfer_sync_write(
-                session_id, buffers, peer_buffer_addresses, lengths
-            )
-        except Exception:
+            ret = self.engine.batch_transfer_sync_write(session_id, buffers, peer_buffer_addresses, lengths)
+        except Exception as e:
             ret = -1
             # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
             if not hasattr(self.engine, "batch_transfer_sync_write"):
                 raise RuntimeError(
                     "Mooncake's batch transfer requires mooncake-transfer-engine >= 0.3.4.post2. "
                     "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
-                )
+                ) from e
 
         if ret < 0:
             logger.debug(
@@ -118,14 +120,10 @@ class MooncakeTransferEngine:
             )
         return ret
 
-    def transfer_submit_write(
-        self, session_id: str, buffer: int, peer_buffer_address: int, length: int
-    ) -> int:
+    def transfer_submit_write(self, session_id: str, buffer: int, peer_buffer_address: int, length: int) -> int:
         """ASynchronously transfer data to the specified address."""
 
-        batch_id = self.engine.transfer_submit_write(
-            session_id, buffer, peer_buffer_address, length
-        )
+        batch_id = self.engine.transfer_submit_write(session_id, buffer, peer_buffer_address, length)
         return batch_id
 
     def transfer_check_status(self, batch_id: int) -> int:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import bisect
-from contextlib import contextmanager
 import gc
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,16 +10,14 @@ import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.oe_utils import OverEmbeddingInfo
 from sglang.srt.utils import get_available_gpu_memory
-
-
+from sglang.srt.utils.oe_utils import OverEmbeddingInfo
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -43,12 +41,14 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.unfreeze()
             gc.collect()
 
+
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     server_args = model_runner.server_args
     max_capture_bs = server_args.prefill_graph_max_bs
     assert max_capture_bs is not None
     capture_bs = list(range(1, min(max_capture_bs + 1, model_runner.req_to_token_pool.size)))
     return capture_bs
+
 
 # Reuse this memory pool across all cuda graph runners.
 global_graph_memory_pool = None
@@ -93,14 +93,10 @@ class PrefillCudaGraphRunner:
         num_tiles = (self.max_num_token + 16 - 1) // 16
         self.capture_num_tokens_range = [16 * (i + 1) for i in range(num_tiles)]
         self.model_runner.attn_backend.init_cuda_graph_state_prefill(self.max_num_token)
-        self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
-        )
-        self.seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
+        self.seq_len_fill_value = self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+        self.seq_lens_cpu = torch.full((self.max_bs,), self.seq_len_fill_value, dtype=torch.int32)
         hf_config = self.model_runner.model_config.hf_config
-        self.use_over_embedding = getattr(hf_config, 'use_over_embedding', False)
+        self.use_over_embedding = getattr(hf_config, "use_over_embedding", False)
         if self.use_over_embedding:
             self.over_embedding_n = hf_config.oe_neighbor_num
             self.over_embedding_k = hf_config.oe_split_num
@@ -111,30 +107,21 @@ class PrefillCudaGraphRunner:
             # nan in verify calculation process, conflicts with existing operators
             self.input_ids = torch.ones((self.max_num_token,), dtype=torch.int64)
             if self.use_over_embedding:
-                assert False, "TODO: use_over_embedding is not yet compatible with prefill cuda graph"
-                over_embedding_input_ids = torch.ones((self.max_bs*self.over_embedding_n), dtype=torch.int32)
-                oe_n_gram_ids = torch.zeros([self.max_bs,
-                                                  self.over_embedding_n - 1,
-                                                  self.over_embedding_k],
-                                      dtype = torch.int32)
-                oe_exclusive_req_len_sums = torch.zeros([self.max_bs+1], dtype=torch.int32)
-                oe_exclusive_oe_info_len_sums = torch.zeros([self.max_bs+1], dtype=torch.int32)
+                raise AssertionError("TODO: use_over_embedding is not yet compatible with prefill cuda graph")
+                over_embedding_input_ids = torch.ones((self.max_bs * self.over_embedding_n), dtype=torch.int32)
+                oe_n_gram_ids = torch.zeros([self.max_bs, self.over_embedding_n - 1, self.over_embedding_k], dtype=torch.int32)
+                oe_exclusive_req_len_sums = torch.zeros([self.max_bs + 1], dtype=torch.int32)
+                oe_exclusive_oe_info_len_sums = torch.zeros([self.max_bs + 1], dtype=torch.int32)
                 self.oe_info = OverEmbeddingInfo(
                     over_embedding_input_ids=over_embedding_input_ids,
                     oe_exclusive_req_len_sums=oe_exclusive_req_len_sums,
                     oe_exclusive_oe_info_len_sums=oe_exclusive_oe_info_len_sums,
-                    oe_n_gram_ids=oe_n_gram_ids
+                    oe_n_gram_ids=oe_n_gram_ids,
                 )
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-            )
-            self.extend_seq_lens = torch.ones(
-                (self.max_bs,), dtype=torch.int32
-            )
-            self.extend_prefix_lens = torch.zeros(
-                (self.max_bs,), dtype=torch.int32
-            )
+            self.seq_lens = torch.full((self.max_bs,), self.seq_len_fill_value, dtype=torch.int32)
+            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            self.extend_prefix_lens = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.arange(0, self.max_num_token, dtype=torch.int64)
             self.out_cache_loc.clamp_(min=0, max=63)
             self.positions = torch.arange(0, self.max_num_token, dtype=torch.int64)
@@ -152,7 +139,7 @@ class PrefillCudaGraphRunner:
                 "3. disable torch compile by not using --enable-torch-compile\n"
                 "4. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
-            )
+            ) from e
 
     @contextmanager
     def model_capture_mode(self):
@@ -165,11 +152,7 @@ class PrefillCudaGraphRunner:
             self.model_runner.model.capture_mode = False
 
     def can_run(self, forward_batch: ForwardBatch):
-        is_bs_supported = (
-            forward_batch.batch_size in self.graphs
-            if self.disable_padding
-            else forward_batch.batch_size <= self.max_bs
-        )
+        is_bs_supported = forward_batch.batch_size in self.graphs if self.disable_padding else forward_batch.batch_size <= self.max_bs
         is_num_tokens_supported = forward_batch.extend_num_tokens <= self.max_num_token
         return is_bs_supported and is_num_tokens_supported and forward_batch.forward_mode == ForwardMode.EXTEND
 
@@ -177,16 +160,10 @@ class PrefillCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), graph_capture() as graph_capture_context:
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc), graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
             capture_bs = sorted(self.capture_bs, reverse=True)
-            capture_bs_range = (
-                tqdm.tqdm(capture_bs)
-                if get_tensor_model_parallel_rank() == 0
-                else capture_bs
-            )
+            capture_bs_range = tqdm.tqdm(capture_bs) if get_tensor_model_parallel_rank() == 0 else capture_bs
             capture_num_tokens_range = sorted(self.capture_num_tokens_range, reverse=True)
             for bs in capture_bs_range:
                 if get_tensor_model_parallel_rank() == 0:
@@ -195,11 +172,8 @@ class PrefillCudaGraphRunner:
                         self.model_runner.gpu_id,
                         empty_cache=False,
                     )
-                    capture_bs_range.set_description(
-                        f"Capturing batches ({avail_mem=:.2f} GB)"
-                    )
+                    capture_bs_range.set_description(f"Capturing batches ({avail_mem=:.2f} GB)")
                 for num_tokens in capture_num_tokens_range:
-                    #print(f"Capturing bs: {bs} num_tokens: {num_tokens}")
                     (
                         graph,
                         output_buffers,
@@ -212,13 +186,6 @@ class PrefillCudaGraphRunner:
         stream = self.stream
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
-        if self.use_over_embedding:
-            oe_info = OverEmbeddingInfo(
-                over_embedding_input_ids=self.oe_info.over_embedding_input_ids[:bs*self.over_embedding_n],
-                oe_exclusive_req_len_sums=self.oe_info.oe_exclusive_req_len_sums[:bs+1],
-                oe_exclusive_oe_info_len_sums=self.oe_info.oe_exclusive_oe_info_len_sums[:bs+1],
-                oe_n_gram_ids=self.oe_info.oe_n_gram_ids[:bs]
-            )
         req_pool_indices = self.req_pool_indices[:bs]
         seq_lens = self.seq_lens[:bs]
         seq_lens[-1] = num_tokens - (bs - 1) * self.seq_len_fill_value
@@ -226,7 +193,7 @@ class PrefillCudaGraphRunner:
         extend_seq_lens[-1] = num_tokens - (bs - 1) * self.seq_len_fill_value
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
-        extend_prefix_lens=self.extend_prefix_lens[:bs]
+        extend_prefix_lens = self.extend_prefix_lens[:bs]
 
         global_num_tokens = None
         gathered_buffer = None
@@ -253,8 +220,9 @@ class PrefillCudaGraphRunner:
             all_decode_or_idle=False,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
-            captureing_prefill_graph=True
+            captureing_prefill_graph=True,
         )
+        forward_batch.extend_seq_lens_cpu = extend_seq_lens.tolist()
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_prefill_capture_cuda_graph(
@@ -300,9 +268,6 @@ class PrefillCudaGraphRunner:
         num_token_index = bisect.bisect_left(self.capture_num_tokens_range, raw_num_token)
         num_tokens = self.capture_num_tokens_range[num_token_index]
 
-        #print(f"{num_tokens=} {bs=}")
-        #print(f"{raw_num_token=} {raw_bs=}")
-        #print(f"{forward_batch=}")
 
         if bs != raw_bs or num_tokens != raw_num_token:
             self.seq_lens.fill_(1)
@@ -314,9 +279,9 @@ class PrefillCudaGraphRunner:
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         if self.use_over_embedding:
-            self.oe_info.over_embedding_input_ids[:raw_bs*self.over_embedding_n].copy_(forward_batch.oe_info.over_embedding_input_ids)
-            self.oe_info.oe_exclusive_req_len_sums[:raw_bs+1].copy_(forward_batch.oe_info.oe_exclusive_req_len_sums)
-            self.oe_info.oe_exclusive_oe_info_len_sums[:raw_bs+1].copy_(forward_batch.oe_info.oe_exclusive_oe_info_len_sums)
+            self.oe_info.over_embedding_input_ids[: raw_bs * self.over_embedding_n].copy_(forward_batch.oe_info.over_embedding_input_ids)
+            self.oe_info.oe_exclusive_req_len_sums[: raw_bs + 1].copy_(forward_batch.oe_info.oe_exclusive_req_len_sums)
+            self.oe_info.oe_exclusive_oe_info_len_sums[: raw_bs + 1].copy_(forward_batch.oe_info.oe_exclusive_oe_info_len_sums)
             self.oe_info.oe_n_gram_ids[:raw_bs].copy_(forward_batch.oe_info.oe_n_gram_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
@@ -331,12 +296,7 @@ class PrefillCudaGraphRunner:
 
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata_replay_prefill_cuda_graph(
-            forward_batch,
-            bs,
-            num_tokens,
-            self.seq_lens[:bs],
-            self.req_pool_indices[:bs],
-            self.extend_prefix_lens[:bs]
+            forward_batch, bs, num_tokens, self.seq_lens[:bs], self.req_pool_indices[:bs], self.extend_prefix_lens[:bs]
         )
 
         self.graphs[bs][num_tokens].replay()
@@ -345,8 +305,6 @@ class PrefillCudaGraphRunner:
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=next_token_logits[:raw_num_token],
-            hidden_states=(
-                hidden_states[:raw_num_token] if hidden_states is not None else None
-            ),
+            hidden_states=(hidden_states[:raw_num_token] if hidden_states is not None else None),
         )
         return logits_output

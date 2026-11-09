@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.request
@@ -17,7 +18,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from json import dumps
-from typing import Any, Callable, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Optional, Union
 
 import numpy as np
 import requests
@@ -81,16 +82,13 @@ def http_request(
         headers["Authorization"] = f"Bearer {api_key}"
 
     if stream:
-        return requests.post(url, json=json, stream=True, headers=headers)
+        return requests.post(url, json=json, stream=True, headers=headers, timeout=3600)
     else:
-        req = urllib.request.Request(url, headers=headers, method=method)
-        if json is None:
-            data = None
-        else:
-            data = bytes(dumps(json), encoding="utf-8")
+        req = urllib.request.Request(url, headers=headers, method=method)  # noqa: S310
+        data = None if json is None else bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            resp = urllib.request.urlopen(req, data=data, cafile=verify)  # noqa: S310
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
@@ -140,7 +138,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise IOError(f"Could not open video file:{video_path}")
+        raise OSError(f"Could not open video file:{video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"target_frames: {num_frames}")
@@ -154,7 +152,6 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
             frames.append(frame)
         else:
             # Handle the case where the frame could not be read
-            # print(f"Warning: Could not read frame at index {i}.")
             pass
 
     cap.release()
@@ -191,7 +188,7 @@ def _is_chinese_char(cp: int):
     # as is Japanese Hiragana and Katakana. Those alphabets are used to write
     # space-separated words, so they are not treated specially and handled
     # like the all of the other languages.
-    if (
+    return (
         (cp >= 0x4E00 and cp <= 0x9FFF)
         or (cp >= 0x3400 and cp <= 0x4DBF)  #
         or (cp >= 0x20000 and cp <= 0x2A6DF)  #
@@ -200,10 +197,7 @@ def _is_chinese_char(cp: int):
         or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
         or (cp >= 0xF900 and cp <= 0xFAFF)
         or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
-    ):  #
-        return True
-
-    return False
+    )
 
 
 def find_printable_text(text: str):
@@ -211,10 +205,7 @@ def find_printable_text(text: str):
     # Borrowed from https://github.com/huggingface/transformers/blob/061580c82c2db1de9139528243e105953793f7a2/src/transformers/generation/streamers.py#L99
 
     # After the symbol for a new line, we flush the cache.
-    if text.endswith("\n"):
-        return text
-    # If the last token is a CJK character, we print the characters.
-    elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
+    if text.endswith("\n") or len(text) > 0 and _is_chinese_char(ord(text[-1])):
         return text
     # Otherwise if the penultimate token is a CJK character, we print the characters except for the last one.
     elif len(text) > 1 and _is_chinese_char(ord(text[-2])):
@@ -227,9 +218,7 @@ def find_printable_text(text: str):
 
 def graceful_registry(sub_module_name: str):
     def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
+        logger.info(f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown...")
         if signum == signal.SIGTERM:
             logger.info(f"{sub_module_name} recive sigterm")
 
@@ -262,7 +251,7 @@ class LazyImport:
 def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
     if filename is None:
-        filename = os.path.join("/tmp", url.split("/")[-1])
+        filename = os.path.join(tempfile.gettempdir(), url.split("/")[-1])
 
     # Check if the cache file already exists
     if os.path.exists(filename):
@@ -271,7 +260,7 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     print(f"Downloading from {url} to {filename}")
 
     # Stream the response to show the progress bar
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=3600)
     response.raise_for_status()  # Check for request errors
 
     # Total size of the file in bytes
@@ -279,13 +268,16 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     chunk_size = 1024  # Download in chunks of 1KB
 
     # Use tqdm to display the progress bar
-    with open(filename, "wb") as f, tqdm(
-        desc=filename,
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-    ) as bar:
+    with (
+        open(filename, "wb") as f,
+        tqdm(
+            desc=filename,
+            total=total_size,
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as bar,
+    ):
         for chunk in response.iter_content(chunk_size=chunk_size):
             f.write(chunk)
             bar.update(len(chunk))
@@ -325,7 +317,7 @@ def reserve_port(host, start=30000, end=40000):
             # Attempt to bind to the port on localhost
             sock.bind((host, port))
             return port, sock
-        except socket.error:
+        except OSError:
             sock.close()  # Failed to bind, try next port
             continue
     raise RuntimeError("No free port available.")
@@ -347,10 +339,10 @@ def execute_shell_command(command: str) -> subprocess.Popen:
     """
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)  # noqa: S603
 
 
-def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
+def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):  # noqa: S104
     """
     Launch the server using the given command.
     If no port is specified, a free port is reserved.
@@ -393,6 +385,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
             response = requests.get(
                 f"{base_url}/v1/models",
                 headers={"Authorization": "Bearer None"},
+                timeout=30,
             )
             if response.status_code == 200:
                 time.sleep(5)
@@ -413,7 +406,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 
 class TypeBasedDispatcher:
-    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+    def __init__(self, mapping: list[tuple[type, Callable]]):
         self._mapping = mapping
         self._fallback_fn = None
 
@@ -484,17 +477,20 @@ def get_cat_reporter(model_name: str, app_key: str):
     if not model_name:
         return EmptyCat()
 
-    DEFAULT_CAT_TYPE="Metrics." + model_name
+    DEFAULT_CAT_TYPE = "Metrics." + model_name
     try:
-        from pycat import Cat
         from functools import partial
+
+        from pycat import Cat, CatStatusEnum
+
         if app_key is None:
-            app_key = "com.sankuai.friday.inference.fluent"
+            app_key = "inference.fluent"
         Cat.init_cat(app_key, disable_falcon=True)
     except Exception as e:
         logger.error(f"Error init Cat: {e}")
         return EmptyCat()
     else:
+
         def log_transaction(t_type: str, t_name: str, duration: int, suceess: bool = True):
             t = Cat.new_transaction(t_type, t_name)
             if suceess:
@@ -509,8 +505,21 @@ def get_cat_reporter(model_name: str, app_key: str):
         def log_count(t_name: str, count: float):
             log_transaction(DEFAULT_CAT_TYPE, t_name, duration=int(count * 1000))
 
+        def log_result(t_name: str, success: bool):
+            log_transaction(DEFAULT_CAT_TYPE, t_name, duration=0, suceess=success)
+
+        def log_success_rate(t_name: str, success: bool):
+            log_transaction(
+                DEFAULT_CAT_TYPE,
+                t_name,
+                duration=0,
+                suceess=success,
+            )
+
         Cat.log_count = staticmethod(log_count)
         Cat.log_duration = staticmethod(log_duration)
+        Cat.log_result = staticmethod(log_result)
+        Cat.log_success_rate = staticmethod(log_success_rate)
         Cat.log_transaction = staticmethod(log_transaction)
         Cat.log_batch_event = staticmethod(partial(Cat.log_batch_event, e_type=DEFAULT_CAT_TYPE))
         return Cat

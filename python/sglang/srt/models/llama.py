@@ -16,56 +16,55 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
-from sglang.srt.utils import get_colorful_logger, device_synchronize
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from collections.abc import Iterable
+from typing import Any, Optional, Union
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
 from sglang.srt.distributed import (
+    GroupCoordinator,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    GroupCoordinator,
 )
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-    ReplicatedLinear,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.dp_attention import (
+from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
+from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import (
     get_attention_tp_group,
-    get_attention_tp_size,
     get_attention_tp_rank,
+    get_attention_tp_size,
     get_dense_tp_group,
-    get_dense_tp_size,
-    get_dense_tp_rank,
 )
-from sglang.srt.layers.vocab_parallel_embedding import (
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import make_layers, add_prefix
+from sglang.srt.ops.activation import SiluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.utils import add_prefix, device_synchronize, get_colorful_logger, make_layers
 from sglang.utils import get_exception_traceback
-from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
 
 logger = get_colorful_logger(__name__)
 _with_qk_norm = False
+
 
 class LlamaMLP(nn.Module):
     def __init__(
@@ -112,10 +111,7 @@ class LlamaMLP(nn.Module):
                 prefix=add_prefix("down_proj", prefix),
             )
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -136,7 +132,7 @@ class LlamaAttention(nn.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
@@ -170,9 +166,7 @@ class LlamaAttention(nn.Module):
             assert self.attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.total_num_heads
-        )
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.total_num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -218,9 +212,7 @@ class LlamaAttention(nn.Module):
             layer_id=layer_id,
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         q_by_head = q.reshape(-1, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
@@ -259,19 +251,13 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
+        if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
+            rope_scaling["original_max_position_embeddings"] = config.original_max_position_embeddings
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         # Support llamafy/Qwen-Qwen2.5-7B-Instruct-llamafied with attention_bias
         # Support internlm/internlm-7b with bias
-        attention_bias = getattr(config, "attention_bias", False) or getattr(
-            config, "bias", False
-        )
+        attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -312,7 +298,7 @@ class LlamaDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tp_num_tokens: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -330,13 +316,9 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(
-            hidden_states, forward_batch, tp_num_tokens
-        )
+        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(hidden_states, forward_batch, tp_num_tokens)
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(
-            hidden_states, residual, tp_num_tokens, forward_batch
-        )
+        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(hidden_states, residual, tp_num_tokens, forward_batch)
         return hidden_states, residual
 
 
@@ -358,9 +340,7 @@ class LlamaModel(nn.Module):
         )
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: LlamaDecoderLayer(
-                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
-            ),
+            lambda idx, prefix: LlamaDecoderLayer(config=config, quant_config=quant_config, layer_id=idx, prefix=prefix),
             prefix="model.layers",
         )
 
@@ -373,11 +353,8 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds.type_as(self.embed_tokens.weight)
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, list[torch.Tensor]]]:
+        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds.type_as(self.embed_tokens.weight)
         tp_num_tokens = hidden_states.shape[0]
         residual = None
         aux_hidden_states = []
@@ -426,13 +403,10 @@ class LlamaModel(nn.Module):
                 layer_self_attn.attn.k_scale = scaling_factor
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
-                raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
-                )
+                raise RuntimeError("Self attention has no KV cache scaling factor attribute!")
 
 
 class LlamaForCausalLM(nn.Module):
-
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -505,25 +479,17 @@ class LlamaForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds
-            )
+            hidden_states, aux_hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         else:
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, input_embeds
-            )
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-        )
+            hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states)
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
         if module_name in ["q_proj", "o_proj", "qkv_proj"]:
             return self.config.hidden_size, self.config.hidden_size
         elif module_name in ["kv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size // (
-                self.config.num_attention_heads // self.config.num_key_value_heads
-            )
+            return self.config.hidden_size, self.config.hidden_size // (self.config.num_attention_heads // self.config.num_key_value_heads)
         elif module_name == "gate_up_proj":
             return self.config.hidden_size, self.config.intermediate_size
         elif module_name == "down_proj":
@@ -542,7 +508,7 @@ class LlamaForCausalLM(nn.Module):
         return params_mapping.get(name, name)
 
     def get_module_name_from_weight_name(self, name):
-        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
+        for param_name, weight_name, _shard_id, num_shard in self.stacked_params_mapping:
             if weight_name in name:
                 return (
                     name.replace(weight_name, param_name)[: -len(".weight")],
@@ -554,7 +520,7 @@ class LlamaForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         return len(params_dict)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -606,18 +572,14 @@ class LlamaForCausalLM(nn.Module):
                 # Skip loading kv_scale from ckpts towards new design.
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
-                if name in params_dict.keys():
+                if name in params_dict:
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")
 
-    def get_weights_by_name(
-        self, name: str, truncate_size: int = 100, tp_size: int = 1
-    ) -> Optional[torch.Tensor]:
+    def get_weights_by_name(self, name: str, truncate_size: int = 100, tp_size: int = 1) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
 
         Only used for unit test with an unoptimized performance.
@@ -625,15 +587,8 @@ class LlamaForCausalLM(nn.Module):
         """
         try:
             if name == "lm_head.weight" and self.config.tie_word_embeddings:
-                logger.info(
-                    "word embedding is tied for this model, return embed_tokens.weight as lm_head.weight."
-                )
-                return (
-                    self.model.embed_tokens.weight.cpu()
-                    .to(torch.float32)
-                    .numpy()
-                    .tolist()[:truncate_size]
-                )
+                logger.info("word embedding is tied for this model, return embed_tokens.weight as lm_head.weight.")
+                return self.model.embed_tokens.weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
 
             mapped_name = name
             mapped_shard_id = None
@@ -648,9 +603,7 @@ class LlamaForCausalLM(nn.Module):
                 if mapped_shard_id in ["q", "k", "v"]:
                     num_heads = self.config.num_attention_heads // tp_size
                     num_kv_heads = self.config.num_key_value_heads // tp_size
-                    head_dim = (
-                        self.config.hidden_size // self.config.num_attention_heads
-                    )
+                    head_dim = self.config.hidden_size // self.config.num_attention_heads
                     if mapped_shard_id == "q":
                         offset = 0
                         size = num_heads * head_dim
@@ -683,9 +636,7 @@ class LlamaForCausalLM(nn.Module):
             return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
 
         except Exception:
-            logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
-            )
+            logger.error(f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}")
             return None
 
     def get_embed_and_head(self):
@@ -724,14 +675,20 @@ class Phi3ForCausalLM(LlamaForCausalLM):
 class InternLM3ForCausalLM(LlamaForCausalLM):
     pass
 
+
 class MeituanQwen3ForCausalLM(LlamaForCausalLM):
     pass
+
 
 class LongcatLiteForCausalLM(LlamaForCausalLM):
     pass
 
+
 EntryClass = [
-    LlamaForCausalLM, Phi3ForCausalLM, InternLM3ForCausalLM,
+    LlamaForCausalLM,
+    Phi3ForCausalLM,
+    InternLM3ForCausalLM,
     # meituan
-    MeituanQwen3ForCausalLM, LongcatLiteForCausalLM
+    MeituanQwen3ForCausalLM,
+    LongcatLiteForCausalLM,
 ]

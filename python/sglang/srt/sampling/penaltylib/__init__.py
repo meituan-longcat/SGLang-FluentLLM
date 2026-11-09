@@ -9,5 +9,5 @@ __all__ = [
     "BatchedMinNewTokensPenalizer",
     "BatchedPresencePenalizer",
     "BatchedPenalizerOrchestrator",
-    "BatchedRepetitionPenalizer"
+    "BatchedRepetitionPenalizer",
 ]

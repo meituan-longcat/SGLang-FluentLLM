@@ -10,9 +10,11 @@ from sglang.srt.layers.quantization.utils import should_ignore_quant_layer
 def get_layout(config, prefix):
     if isinstance(config, Fp8Config):
         from sglang.srt.layers.dense.layouts.fp8 import Fp8LinearMethod
+
         return Fp8LinearMethod(config)
     if isinstance(config, W8A8Fp8Config):
         from sglang.srt.layers.dense.layouts.w8a8_fp8 import W8A8Fp8LinearMethod
+
         return W8A8Fp8LinearMethod(config)
     if isinstance(config, W8A8Int8Config):
         return W8A8Int8LinearMethod(config)
@@ -53,10 +55,7 @@ class LinearBase(torch.nn.Module):
         self.prefix = prefix
 
         self.quant_config = quant_config
-        if quant_config is None or should_ignore_quant_layer(
-            prefix=prefix,
-            ignored_layers=getattr(quant_config, "ignored_layers", [])
-        ):
+        if quant_config is None or should_ignore_quant_layer(prefix=prefix, ignored_layers=getattr(quant_config, "ignored_layers", [])):
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)

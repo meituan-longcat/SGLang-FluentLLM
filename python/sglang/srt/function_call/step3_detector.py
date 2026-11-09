@@ -1,8 +1,9 @@
+# ruff: noqa: S105
 import ast
 import json
 import logging
 import re
-from typing import Any, Dict, List, Union, Literal
+from typing import Any, Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -15,7 +16,7 @@ from sglang.srt.function_call.core_types import (
 logger = logging.getLogger(__name__)
 
 
-def get_argument_type(func_name: str, arg_key: str, defined_tools: List[Tool]) -> str:
+def get_argument_type(func_name: str, arg_key: str, defined_tools: list[Tool]) -> str:
     """Get the expected type for a function argument from tool schema."""
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
@@ -33,10 +34,10 @@ def parse_arguments(value: str) -> tuple[Any, bool]:
     try:
         try:
             parsed_value = json.loads(value)
-        except:
+        except Exception:
             parsed_value = ast.literal_eval(value)
         return parsed_value, True
-    except:
+    except Exception:
         return value, False
 
 
@@ -67,18 +68,14 @@ class Step3Detector(BaseFormatDetector):
         self.tool_sep = "<｜tool_sep｜>"
 
         # Regex for parsing steptml invocations
-        self.invoke_regex = re.compile(
-            r'<steptml:invoke name="([^"]+)">(.+?)</steptml:invoke>', re.DOTALL
-        )
-        self.param_regex = re.compile(
-            r'<steptml:parameter name="([^"]+)">([^<]*)</steptml:parameter>', re.DOTALL
-        )
+        self.invoke_regex = re.compile(r'<steptml:invoke name="([^"]+)">(.+?)</steptml:invoke>', re.DOTALL)
+        self.param_regex = re.compile(r'<steptml:parameter name="([^"]+)">([^<]*)</steptml:parameter>', re.DOTALL)
 
         # Streaming state variables
         self._in_tool_block: bool = False
         self._tool_block_finished: bool = False
         self._current_function_name: str = ""
-        self._current_parameters: Dict[str, Any] = {}
+        self._current_parameters: dict[str, Any] = {}
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
@@ -86,9 +83,7 @@ class Step3Detector(BaseFormatDetector):
         """Check if the text contains a Step3 format tool call."""
         return self.bot_token in text
 
-    def _parse_steptml_invoke(
-        self, text: str, tools: List[Tool] = None
-    ) -> tuple[str, dict]:
+    def _parse_steptml_invoke(self, text: str, tools: list[Tool] = None) -> tuple[str, dict]:
         """Parse steptml invoke format to extract function name and parameters."""
         invoke_match = self.invoke_regex.search(text)
         if not invoke_match:
@@ -118,10 +113,7 @@ class Step3Detector(BaseFormatDetector):
         return func_name, params
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -140,9 +132,7 @@ class Step3Detector(BaseFormatDetector):
 
             # Find all individual tool calls using regex
             calls = []
-            tool_call_pattern = (
-                f"{re.escape(self.tool_call_begin)}(.*?){re.escape(self.tool_call_end)}"
-            )
+            tool_call_pattern = f"{re.escape(self.tool_call_begin)}(.*?){re.escape(self.tool_call_end)}"
 
             for match in re.finditer(tool_call_pattern, tool_section, re.DOTALL):
                 call_content = match.group(1)
@@ -172,10 +162,7 @@ class Step3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing for Step3 format.
@@ -202,9 +189,7 @@ class Step3Detector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=normal_text)
             else:
                 # Check if we might have a partial bot_token
-                partial_len = self._ends_with_partial_token(
-                    self._buffer, self.bot_token
-                )
+                partial_len = self._ends_with_partial_token(self._buffer, self.bot_token)
                 if partial_len:
                     return StreamingParseResult()  # Wait for more text
                 else:
@@ -213,7 +198,7 @@ class Step3Detector(BaseFormatDetector):
                     return StreamingParseResult(normal_text=normal_text)
 
         # We're inside the tool block
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
 
         # Check if tool block is ending
         if self.eot_token in self._buffer:
@@ -261,7 +246,7 @@ class Step3Detector(BaseFormatDetector):
 
         return StreamingParseResult()
 
-    def _parse_partial_tool_call(self, tools: List[Tool]) -> StreamingParseResult:
+    def _parse_partial_tool_call(self, tools: list[Tool]) -> StreamingParseResult:
         """Parse partial tool call for streaming scenarios."""
         calls = []
 
@@ -328,9 +313,7 @@ class Step3Detector(BaseFormatDetector):
                 param_value = param_match.group(2).strip()
 
                 # Use schema-aware parsing
-                arg_type = get_argument_type(
-                    self._current_function_name, param_name, tools
-                )
+                arg_type = get_argument_type(self._current_function_name, param_name, tools)
                 if arg_type and arg_type != "string":
                     parsed_value, _ = parse_arguments(param_value)
                     new_params[param_name] = parsed_value

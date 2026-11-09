@@ -1,15 +1,11 @@
-from typing import Tuple
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
 
-def get_compressed_seqlens(
-    seqlens: torch.Tensor,
-    kernel_size: int,
-    kernel_stride: int
-):
+
+def get_compressed_seqlens(seqlens: torch.Tensor, kernel_size: int, kernel_stride: int):
     """
     Compute seqlens after compression.
 
@@ -23,13 +19,14 @@ def get_compressed_seqlens(
     seqblocks = torch.clamp_min((seqlens - kernel_size) // kernel_stride + 1, 0)
     return seqblocks
 
+
 def get_compressed_buffer_loc(
-        seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        req_to_token: torch.Tensor,
-        kernel_size: int,
-        kernel_stride: int,
-    ):
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    kernel_size: int,
+    kernel_stride: int,
+):
     """
     Get the compressed key and value location in the kv cache.
 
@@ -46,33 +43,28 @@ def get_compressed_buffer_loc(
 
     max_blocks = seq_lens_block.max()
     num_seqs = len(seq_lens_block)
-    
-    all_block_indices = torch.arange(
-        max_blocks, 
-        device=seq_lens_block.device
-    ).unsqueeze(0).expand(num_seqs, -1) # [num_seqs, max_blocks]
+
+    all_block_indices = torch.arange(max_blocks, device=seq_lens_block.device).unsqueeze(0).expand(num_seqs, -1)  # [num_seqs, max_blocks]
 
     token_indices = all_block_indices * kernel_stride
 
     valid_mask = all_block_indices < seq_lens_block.unsqueeze(1)
     seq_ids, block_ids = valid_mask.nonzero(as_tuple=True)
-    
-    compressed_kv_buffer_loc = req_to_token[
-        req_pool_indices[seq_ids],
-        token_indices[seq_ids, block_ids]
-    ] // kernel_stride
+
+    compressed_kv_buffer_loc = req_to_token[req_pool_indices[seq_ids], token_indices[seq_ids, block_ids]] // kernel_stride
 
     return compressed_kv_buffer_loc
 
+
 @triton.jit
 def _get_attention_score_kernel(
-    q_ptr, # [batch_size, num_q_heads, head_dim]
-    k_buffer, # [buffer_size, num_kv_heads, head_dim]
-    lse_ptr, # [batch_size, num_q_heads]
-    score_ptr, # [total_k_len, num_q_heads, num_kv_heads]
+    q_ptr,  # [batch_size, num_q_heads, head_dim]
+    k_buffer,  # [buffer_size, num_kv_heads, head_dim]
+    lse_ptr,  # [batch_size, num_q_heads]
+    score_ptr,  # [total_k_len, num_q_heads, num_kv_heads]
     # seqlens
-    k_indptr, # [batch_size+1]
-    k_indices, # [total_k_len]
+    k_indptr,  # [batch_size+1]
+    k_indices,  # [total_k_len]
     # shape
     NUM_SHARE_Q_HEADS,
     HEAD_DIM,
@@ -117,10 +109,10 @@ def _get_attention_score_kernel(
         kv_loc = tl.load(k_indices + offs_k, mask=mask_k, other=0)
         # init k ptr and mask and load k
         mask_buf_k = mask_k[:, None] & mask_d[None, :]
-        offs_buf_k = kv_loc[:, None] * stride_kn + pid_kh * stride_kh + offs_d[None, :]               
+        offs_buf_k = kv_loc[:, None] * stride_kn + pid_kh * stride_kh + offs_d[None, :]
         k = tl.load(k_buffer + offs_buf_k, mask=mask_buf_k, other=0.0)
-        # compute qk 
-        qk = tl.sum(q[None, :] * k, -1) * sm_scale 
+        # compute qk
+        qk = tl.sum(q[None, :] * k, -1) * sm_scale
         # compute score
         score = tl.exp(qk - lse)
         # save output
@@ -132,9 +124,9 @@ def get_attention_score(
     q: torch.Tensor,  # [total_query_len, num_q_heads, head_dim]
     k_buffer: torch.Tensor,  # [kv_buffer_size, num_kv_heads, head_dim]
     lse: torch.Tensor,  # [total_query_len, num_q_heads]
-    score: torch.Tensor, # [total_key_len, num_q_heads]
-    k_indptr: torch.Tensor, # [batch_size + 1]
-    k_indices: torch.Tensor, # [total_key_len]
+    score: torch.Tensor,  # [total_key_len, num_q_heads]
+    k_indptr: torch.Tensor,  # [batch_size + 1]
+    k_indices: torch.Tensor,  # [total_key_len]
     sm_scale: float,
 ) -> torch.Tensor:
     # shape
@@ -170,6 +162,7 @@ def get_attention_score(
         # num_stages=3,
     )
 
+
 def compress_attention_decode(
     q,
     k_buffer,
@@ -179,7 +172,7 @@ def compress_attention_decode(
     kv_indptr,
     kv_indices,
     sm_scale,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Flash attention for decode.
 
@@ -203,8 +196,10 @@ def compress_attention_decode(
         dtype=torch.float32,
         device=q.device,
     )
-    attn_logits[:,:,:,:v_head_dim] = 0
-    attn_logits[:,:,:,v_head_dim] = -torch.inf # When k_len < num_kv_splits, ignore positions where computation did not occur when calculating logsumexp
+    attn_logits[:, :, :, :v_head_dim] = 0
+    attn_logits[
+        :, :, :, v_head_dim
+    ] = -torch.inf  # When k_len < num_kv_splits, ignore positions where computation did not occur when calculating logsumexp
     decode_attention_fwd(
         q=q,
         k_buffer=k_buffer,
@@ -216,11 +211,9 @@ def compress_attention_decode(
         num_kv_splits=num_kv_splits,
         sm_scale=sm_scale,
     )
-    lse_splits = attn_logits[:,:,:,v_head_dim] # [batch_size, num_q_heads, num_kv_splits]
-    lse = lse_splits.logsumexp(-1) # [batch_size, num_q_heads]
+    lse_splits = attn_logits[:, :, :, v_head_dim]  # [batch_size, num_q_heads, num_kv_splits]
+    lse = lse_splits.logsumexp(-1)  # [batch_size, num_q_heads]
 
-    cu_seqlens_q = kv_indptr.new_zeros(batch_size + 1)
-    total_kv_len=kv_indptr[-1]
     # k = k_buffer.new_empty((total_kv_len, num_kv_heads, qk_head_dim))
     # for i in range(batch_size):
     #     kv_start = kv_indptr[i]
@@ -238,30 +231,10 @@ def compress_attention_decode(
         k_indices=kv_indices,
         sm_scale=sm_scale,
     )
-    
+
     # for i in range(batch_size):
     #     kv_slice = slice(kv_indptr[i], kv_indptr[i+1])
     #     seq_k = k_buffer[kv_indices[kv_slice]].transpose(0, 1)
     #     seq_k = seq_k.repeat_interleave(num_q_heads // num_kv_heads, dim=0)
     #     seq_probs = ((q[i][:,None,:] @ seq_k.transpose(-1, -2)).squeeze(1) * sm_scale - lse.to(torch.bfloat16)[i][:, None]).exp().T
     #     assert torch.allclose(score[kv_slice], seq_probs, rtol=0.05, atol=0.05)
-
-# if __name__ == "__main__":
-#     q = torch.load("debug/q.pt").to(torch.float32)[-1:]
-#     k_buffer = torch.load("debug/k_buffer.pt").to(torch.float32)
-#     v_buffer = torch.load("debug/v_buffer.pt").to(torch.float32)
-#     o = torch.ones_like(torch.load("debug/o_buffer.pt").to(torch.float32)[-1:])
-#     score = torch.load("debug/score_buffer.pt").to(torch.float32)[0:0]
-#     kv_indices = torch.load("debug/kv_indices.pt")[0:0]
-#     kv_indptr = torch.tensor([0, 0]).to(kv_indices.device)
-#     sm_scale = torch.load("debug/sm_scale.pt")
-#     compress_attention_decode(
-#         q=q,
-#         k_buffer=k_buffer,
-#         v_buffer=v_buffer,
-#         o=o,
-#         score=score,
-#         kv_indptr=kv_indptr,
-#         kv_indices=kv_indices,
-#         sm_scale=sm_scale,
-#     )

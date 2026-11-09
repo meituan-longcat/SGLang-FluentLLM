@@ -27,9 +27,8 @@ fi
 echo "task time flag: ${time}"
 
 #按照实际修改
-iplist="
-10.150.2.2
-10.150.34.26"
+iplist=""
+: "${iplist:?Fill in iplist before running this script.}"
 
 currpath=`pwd`
 echo "当前目录: ${currpath}"
@@ -56,10 +55,19 @@ echo "code目录: ${codepath}"
 
 startshell=pdmode_run.sh
 #提前创建好
-logdir=/workdir/npu_dev_test/chenhongluo/logs
+logdir="${LOG_DIR:?Set LOG_DIR to the local log directory.}"
 #目标执行机器上测试代码存放路径
-testpath=/workdir/npu_dev_test/chenhongluo
+testpath="${TEST_PATH:?Set TEST_PATH to the remote work directory.}"
+COREDUMP_DIR="${COREDUMP_DIR:-${testpath}/coredump}"
 #目标执行机上最终会生成${testpath}/fluentllm
+
+# MODEL_PATH is supplied locally and quoted for the remote shell.
+case "${command}" in
+    start|startp|startd)
+        : "${MODEL_PATH:?Set MODEL_PATH to the checkpoint directory.}"
+        printf -v MODEL_PATH_ARG '%q' "${MODEL_PATH}"
+        ;;
+esac
 
 savepath=${logdir}/logs_${time}
 mkdir -p $savepath
@@ -75,12 +83,12 @@ do
     lastip=${i}
     if [ "${command}" == "code" ]; then
         time=$(date +"%Y%m%d_%H%M%S")
-        sshpass -f ${pwfile} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${port} root@${i} "cd /workdir;mkdir -p ${testpath};cd ${testpath};rm -rf fluentllm;"
+        sshpass -f ${pwfile} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${port} root@${i} "mkdir -p ${testpath};cd ${testpath};rm -rf fluentllm;"
         sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} ${codepath}/fluentllm root@${i}:${testpath}
     fi
 
     if [ "${command}" == "fakeweight" ]; then
-        sshpass -f ${pwfile} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${port} root@${i} "cd /workdir;mkdir -p ${fa
+        sshpass -f ${pwfile} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${port} root@${i} "mkdir -p ${fa
 keweightdist};"
         sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} ${fakeweightsource} root@${i}:${fakeweightdist}
     fi
@@ -91,12 +99,11 @@ keweightdist};"
 
     if [ "${command}" == "start" ]; then
         sshpass -f ${pwfile} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${port} root@${i} "export cluster_ip_list=${ips};export Node_idx=${a};env|grep cluster_ip_list;
-        export MODEL_PATH=/mnt/hdfs/zw04mlnn01/checkpoint/IA/longcat/LongCat-Flash-Lite-Release-bf16;
+        export MODEL_PATH=${MODEL_PATH_ARG};
         export NPU_LMHEAD_TP_SIZE=16;
         export prefill_args=\"--attn-tp-size 16 --data-parallel-size 1 --dense-tp-size 16 --expert-parallel-size 16 --chunked-prefill-size 16384  --max-prefill-tokens 16384 --mem-fraction-static 0.81 --skip-server-warmup \"
-        export MODEL_PATH=/mnt/hdfs/zw04mlnn01/checkpoint/IA/flash_3B_mtp_wooepad_int8-no_attn;
+        export MODEL_PATH=${MODEL_PATH_ARG};
         export HCCL_DETERMINISTIC=False;
-         #gsm8k 0.846
 		env|grep Node_idx;export ASCEND_PROCESS_LOG_PATH=${testpath}/log_${time};
 		    #export engine_subfix_cmd=\"--draft-model-path-use-base --speculative-algorithm NEXTN --speculative-num-draft-tokens 2 --speculative-num-steps 1 --speculative-eagle-topk 1\";
         #export engine_subfix_cmd=\"--is-multi-head-eagle --draft-model-path-use-base --speculative-algorithm NEXTN --speculative-num-draft-tokens 4 --speculative-num-steps 3 --speculative-eagle-topk 1\";
@@ -115,8 +122,8 @@ keweightdist};"
         sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} root@${i}:${testpath}/testlog_${time}.log ${savepath}/testlog_${time}.log_${i}_${a}
         sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} root@${i}:${testpath}/fluentllm ${savepath}/fluentllm_${i}_${a}
         sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} root@${i}:${testpath}/result_${time}.log ${savepath}/result_${time}.log_${i}_${a}
-        sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} root@${i}:/workdir/coredump ${savepath}/coredump_${i}_${a}
-        sshpass -f ${pwfile} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 8022 root@${i} "mv /workdir/coredump/* ${testpath}"
+        sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} root@${i}:${COREDUMP_DIR} ${savepath}/coredump_${i}_${a}
+        sshpass -f ${pwfile} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 8022 root@${i} "mv ${COREDUMP_DIR}/* ${testpath}"
     fi
 
     if [ "${command}" == "log_plog" ]; then
@@ -156,8 +163,8 @@ wait
 if [ "${command}" == "press" ]; then
 #提前准备测试脚本包括压测脚本和拉起的batchrun.sh，存放在${codepath}/client_use/目录下
 #测试命令写到batchrun.sh中,测试参考,命令可以改，重定向方式不要变
-#样例10.255.149.50
-#/workdir/npu_dev_test/data/batchrun_example.sh
+# 示例节点由 iplist 指定
+# ${BATCH_RUN_SCRIPT}
 
 #执行逻辑，拷贝client_use下所有文件到最后一台机器的${testpath}下,拉起batchrun.sh
     sshpass -f ${pwfile} scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -r -p -P ${port} ${codepath}/client_use/* root@${lastip}:${testpath}
@@ -174,4 +181,3 @@ fi
 
 #export HCCL_EXEC_TIMEOUT=600;export HCCL_CONNECT_TIMEOUT=600;
 #export ASCEND_SLOG_PRINT_TO_STDOUT=1
-

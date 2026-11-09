@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Literal, Optional
 
 
 class EBNFComposer:
@@ -89,9 +89,7 @@ class EBNFComposer:
     }
 
     @staticmethod
-    def get_value_rule(
-        prop: dict, function_format: Literal["pythonic", "json", "xml"] = "json"
-    ) -> str:
+    def get_value_rule(prop: dict, function_format: Literal["pythonic", "json", "xml"] = "json") -> str:
         if "enum" in prop:
             return EBNFComposer._handle_enum(prop, function_format)
 
@@ -129,7 +127,7 @@ class EBNFComposer:
         return f"({enum_rule})" if len(formatted_values) > 1 else enum_rule
 
     @staticmethod
-    def get_type_mapping(function_format: str) -> Dict[str, str]:
+    def get_type_mapping(function_format: str) -> dict[str, str]:
         """Get the complete type mapping for a given format."""
         mapping = EBNFComposer.BASE_TYPE_MAPPING.copy()
         overrides = EBNFComposer.FORMAT_TYPE_OVERRIDES.get(function_format, {})
@@ -143,10 +141,7 @@ class EBNFComposer:
         type_mapping = EBNFComposer.get_type_mapping(function_format)
 
         if isinstance(prop_type, list):
-            type_rules = [
-                type_mapping.get(single_type, function_format)
-                for single_type in prop_type
-            ]
+            type_rules = [type_mapping.get(single_type, function_format) for single_type in prop_type]
             return " | ".join(type_rules) if type_rules else function_format
 
         return type_mapping.get(prop_type, function_format)
@@ -205,36 +200,22 @@ class EBNFComposer:
             base_pattern = function_call_unit
 
         # Apply sequence-level wrapping if needed
-        if sequence_start_token and sequence_end_token:
-            root_rule = (
-                f'"{sequence_start_token}" {base_pattern} "{sequence_end_token}"'
-            )
-        else:
-            root_rule = base_pattern
+        root_rule = f'"{sequence_start_token}" {base_pattern} "{sequence_end_token}"' if sequence_start_token and sequence_end_token else base_pattern
 
         # =================================================================
         # Step 2: Build the header rules
         # =================================================================
         ebnf_lines = [
             f"root ::= {root_rule}",
-            "function_call ::= "
-            + " | ".join([f"call_{tool.function.name}" for tool in tools]),
+            "function_call ::= " + " | ".join([f"call_{tool.function.name}" for tool in tools]),
         ]
 
         # =================================================================
         # Step 3: Set up formatting templates
         # =================================================================
-        call_template = (
-            f"call_{{name}} ::= {call_rule_fmt}"
-            if call_rule_fmt
-            else EBNFComposer.CALL_RULE_MAP[function_format]
-        )
+        call_template = f"call_{{name}} ::= {call_rule_fmt}" if call_rule_fmt else EBNFComposer.CALL_RULE_MAP[function_format]
         args_template = EBNFComposer.ARGUMENTS_RULE_MAP[function_format]
-        key_value_template = (
-            key_value_rule_fmt
-            if key_value_rule_fmt
-            else EBNFComposer.KEY_VALUE_RULE_MAP[function_format]
-        )
+        key_value_template = key_value_rule_fmt if key_value_rule_fmt else EBNFComposer.KEY_VALUE_RULE_MAP[function_format]
 
         # =================================================================
         # Step 4: Build rules for each tool
@@ -284,9 +265,7 @@ class EBNFComposer:
 
             # Add required properties joined by commas
             if required:
-                rule_parts.append(
-                    f" {key_value_separator} ".join(prop_kv_pairs[k] for k in required)
-                )
+                rule_parts.append(f" {key_value_separator} ".join(prop_kv_pairs[k] for k in required))
 
             # Add optional properties with flexible ordering
             if optional:
@@ -299,9 +278,7 @@ class EBNFComposer:
                         if j == i:
                             opt_parts.append(prop_kv_pairs[optional[j]])
                         else:
-                            opt_parts.append(
-                                f" ( {key_value_separator} {prop_kv_pairs[optional[j]]} )?"
-                            )
+                            opt_parts.append(f" ( {key_value_separator} {prop_kv_pairs[optional[j]]} )?")
                     opt_alternatives.append("".join(opt_parts))
 
                 # Wrap with appropriate comma handling based on whether we have required properties
@@ -321,11 +298,7 @@ class EBNFComposer:
             arguments_rule = arguments_rule or '""'
 
             # Add the function call rule and its arguments rule
-            ebnf_lines.append(
-                call_template.format(
-                    name=tool_name, arguments_rule=f"arguments_{tool_name}"
-                )
-            )
+            ebnf_lines.append(call_template.format(name=tool_name, arguments_rule=f"arguments_{tool_name}"))
             ebnf_lines.append(f"arguments_{tool_name} ::= {arguments_rule}")
 
         # =================================================================
@@ -336,9 +309,7 @@ class EBNFComposer:
             "json": EBNFComposer.json_grammar_ebnf_str,
             "xml": EBNFComposer.xml_grammar_ebnf_str,
         }
-        base_grammar = grammar_dict.get(
-            function_format, EBNFComposer.json_grammar_ebnf_str
-        )
+        base_grammar = grammar_dict.get(function_format, EBNFComposer.json_grammar_ebnf_str)
         ebnf_lines.append(base_grammar)
 
         return "\n".join(ebnf_lines)

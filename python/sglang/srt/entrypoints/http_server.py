@@ -24,32 +24,33 @@ import multiprocessing as multiprocessing
 import os
 import threading
 import time
+from collections.abc import AsyncIterator
 from http import HTTPStatus
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
 # Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+threading._register_atexit = lambda *args, **kwargs: None
 
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
 
-import numpy as np
-import orjson
-import requests
-import uvicorn
-import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+import numpy as np  # noqa: E402
+import orjson  # noqa: E402
+import requests  # noqa: E402
+import uvicorn  # noqa: E402
+import uvloop  # noqa: E402
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse  # noqa: E402
 
-from sglang.srt.disaggregation.utils import (
+from sglang.srt.disaggregation.utils import (  # noqa: E402
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
     register_disaggregation_server,
 )
-from sglang.srt.entrypoints.engine import _launch_subprocesses
-from sglang.srt.entrypoints.openai.protocol import (
+from sglang.srt.entrypoints.engine import _launch_subprocesses  # noqa: E402
+from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     CompletionRequest,
     EmbeddingRequest,
@@ -60,14 +61,19 @@ from sglang.srt.entrypoints.openai.protocol import (
     ScoringRequest,
     V1RerankReqInput,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
-from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
-from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.managers.io_struct import (
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat  # noqa: E402
+from sglang.srt.entrypoints.openai.serving_completions import (  # noqa: E402
+    OpenAIServingCompletion,
+)
+from sglang.srt.entrypoints.openai.serving_embedding import (  # noqa: E402
+    OpenAIServingEmbedding,
+)
+from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank  # noqa: E402
+from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore  # noqa: E402
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor  # noqa: E402
+from sglang.srt.entrypoints.warmup import execute_warmups  # noqa: E402
+from sglang.srt.function_call.function_call_parser import FunctionCallParser  # noqa: E402
+from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -88,28 +94,28 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
 )
-from sglang.srt.managers.req import ABORT_CODE
-from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
-from sglang.srt.metrics.func_timer import enable_func_timer
-from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
+from sglang.srt.managers.req import AbortCode  # noqa: E402
+from sglang.srt.managers.template_manager import TemplateManager  # noqa: E402
+from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager  # noqa: E402
+from sglang.srt.observability.metrics.func_timer import enable_func_timer  # noqa: E402
+from sglang.srt.parser.reasoning_parser import ReasoningParser  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
+from sglang.srt.utils import (  # noqa: E402
     add_api_key_middleware,
     add_prometheus_middleware,
     delete_directory,
     get_bool_env_var,
+    get_colorful_logger,
     kill_process_tree,
     set_uvicorn_logging_configs,
-    get_colorful_logger,
 )
-from sglang.srt.warmup import execute_warmups
-from sglang.utils import get_exception_traceback
-from sglang.version import __version__
+from sglang.srt.utils.http_request import ORJSONRoute  # noqa: E402
+from sglang.utils import get_exception_traceback  # noqa: E402
+from sglang.version import __version__  # noqa: E402
 
 # Optional tracing import for Dynamo compatibility
 try:
-    from sglang.srt.tracing.trace import process_tracing_init
+    from sglang.srt.observability.tracing.trace import process_tracing_init
 except ImportError:
     process_tracing_init = None
 
@@ -124,7 +130,7 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 class _GlobalState:
     tokenizer_manager: TokenizerManager
     template_manager: TemplateManager
-    scheduler_info: Dict
+    scheduler_info: dict
 
 
 _global_state: Optional[_GlobalState] = None
@@ -138,21 +144,11 @@ def set_global_state(global_state: _GlobalState):
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     # Initialize OpenAI serving handlers
-    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
-        _global_state.tokenizer_manager, _global_state.template_manager
-    )
-    fast_api_app.state.openai_serving_score = OpenAIServingScore(
-        _global_state.tokenizer_manager
-    )
-    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(
-        _global_state.tokenizer_manager
-    )
+    fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(_global_state.tokenizer_manager, _global_state.template_manager)
+    fast_api_app.state.openai_serving_chat = OpenAIServingChat(_global_state.tokenizer_manager, _global_state.template_manager)
+    fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(_global_state.tokenizer_manager, _global_state.template_manager)
+    fast_api_app.state.openai_serving_score = OpenAIServingScore(_global_state.tokenizer_manager)
+    fast_api_app.state.openai_serving_rerank = OpenAIServingRerank(_global_state.tokenizer_manager)
 
     server_args: ServerArgs = fast_api_app.server_args
 
@@ -204,6 +200,7 @@ app = FastAPI(
     lifespan=lifespan,
     openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
 )
+app.router.route_class = ORJSONRoute
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -214,7 +211,7 @@ app.add_middleware(
 
 
 @app.exception_handler(HTTPException)
-async def validation_exception_handler(request: Request, exc: HTTPException):
+async def http_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details"""
     error = ErrorResponse(
         object="error",
@@ -232,10 +229,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     exc_str = str(exc)
     errors_str = str(exc.errors())
 
-    if errors_str and errors_str != exc_str:
-        message = f"{exc_str} {errors_str}"
-    else:
-        message = exc_str
+    message = f"{exc_str} {errors_str}" if errors_str and errors_str != exc_str else exc_str
 
     err = ErrorResponse(
         message=message,
@@ -298,16 +292,11 @@ async def health_generate(request: Request) -> Response:
             sampling_params=sampling_params,
             log_metrics=False,
         )
-        if (
-            _global_state.tokenizer_manager.server_args.disaggregation_mode
-            != DisaggregationMode.NULL
-        ):
+        if _global_state.tokenizer_manager.server_args.disaggregation_mode != DisaggregationMode.NULL.value:
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
     else:
-        gri = EmbeddingReqInput(
-            rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
-        )
+        gri = EmbeddingReqInput(rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False)
 
     async def gen():
         async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
@@ -327,9 +316,7 @@ async def health_generate(request: Request) -> Response:
 
     task.cancel()
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
-    last_receive_time = time.strftime(
-        "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
-    )
+    last_receive_time = time.strftime("%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp))
     logger.error(
         f"Health check failed. Server couldn't get a response from detokenizer for last "
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
@@ -355,9 +342,7 @@ async def get_model_info():
 @app.get("/get_server_info")
 async def get_server_info():
     # Returns interna states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: list[dict[Any, Any]] = await _global_state.tokenizer_manager.get_internal_state()
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -388,36 +373,33 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         async def stream_results() -> AsyncIterator[bytes]:
             try:
                 enable_cache_report = _global_state.tokenizer_manager.server_args.enable_cache_report
-                
+
                 # State tracking for streaming
                 prompt_tokens = {}
+                reasoning_tokens = {}
                 completion_tokens = {}
                 cached_tokens = {}
                 spec_verify_tokens = {}
-                
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+
+                async for out in _global_state.tokenizer_manager.generate_request(obj, request):
                     index = out.get("index", 0)
                     meta_info = out.get("meta_info", {})
-                    
+
                     # Track token counts
                     prompt_tokens[index] = meta_info.get("prompt_tokens", 0)
+                    reasoning_tokens[index] = meta_info.get("reasoning_tokens", 0)
                     completion_tokens[index] = meta_info.get("completion_tokens", 0)
                     cached_tokens[index] = meta_info.get("cached_tokens", 0)
                     spec_verify_tokens[index] = meta_info.get("spec_verify_ct", 0)
-                    
+
                     finish_reason = meta_info.get("finish_reason")
                     # For streaming, check if is an abort request
                     finish_reason_type = finish_reason["type"] if finish_reason else None
                     if finish_reason_type:
-                        if finish_reason_type == "abort" and \
-                                finish_reason["err_type"] in [ABORT_CODE.TransferFailed]:
+                        if finish_reason_type == "abort" and finish_reason["err_type"] in [AbortCode.TransferFailed]:
                             out = {"error": {"message": str(finish_reason["message"])}}
                             logger.warning(f"[http_server] Abort request for reason: {str(finish_reason['message'])}")
-                            yield b"data: " + orjson.dumps(
-                                out, option=orjson.OPT_NON_STR_KEYS
-                            ) + b"\n\n"
+                            yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
                             break
 
                     # For streaming, check if this is the last chunk (has finish_reason)
@@ -425,6 +407,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                         # This is the final chunk, add usage information
                         usage = UsageProcessor.calculate_streaming_usage(
                             prompt_tokens=prompt_tokens,
+                            reasoning_tokens=reasoning_tokens,
                             completion_tokens=completion_tokens,
                             cached_tokens=cached_tokens,
                             spec_verify_tokens=spec_verify_tokens,
@@ -432,16 +415,12 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                             enable_cache_report=enable_cache_report,
                         )
                         out["usage"] = usage.model_dump(exclude={"prompt_tokens_details"} if not enable_cache_report else None)
-                    
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
+
+                    yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
+                yield b"data: " + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -451,13 +430,11 @@ async def generate_request(obj: GenerateReqInput, request: Request):
         )
     else:
         try:
-            ret = await _global_state.tokenizer_manager.generate_request(
-                obj, request
-            ).__anext__()
-            
+            ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
+
             # Add usage information for non-streaming request
             enable_cache_report = _global_state.tokenizer_manager.server_args.enable_cache_report
-            
+
             # Always add usage information (prompt_tokens, completion_tokens, total_tokens)
             responses = [ret] if not isinstance(ret, list) else ret
             usage = UsageProcessor.calculate_response_usage(
@@ -465,7 +442,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 n_choices=1,
                 enable_cache_report=enable_cache_report,
             )
-            
+
             # Add usage to response(s)
             if isinstance(ret, list):
                 # For batch responses, add usage to each response
@@ -474,7 +451,7 @@ async def generate_request(obj: GenerateReqInput, request: Request):
             else:
                 # For single response
                 ret["usage"] = usage.model_dump(exclude={"prompt_tokens_details"} if not enable_cache_report else None)
-            
+
             return ret
         except ValueError as e:
             logger.error(f"[http_server] Error: {e}")
@@ -496,9 +473,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
     )
 
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
         logger.error(f"Error: {e}")
@@ -509,9 +484,7 @@ async def generate_from_file_request(file: UploadFile, request: Request):
 async def encode_request(obj: EmbeddingReqInput, request: Request):
     """Handle an embedding request."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
@@ -521,9 +494,7 @@ async def encode_request(obj: EmbeddingReqInput, request: Request):
 async def classify_request(obj: EmbeddingReqInput, request: Request):
     """Handle a reward model request. Now the arguments and return values are the same as embedding models."""
     try:
-        ret = await _global_state.tokenizer_manager.generate_request(
-            obj, request
-        ).__anext__()
+        ret = await _global_state.tokenizer_manager.generate_request(obj, request).__anext__()
         return ret
     except ValueError as e:
         return _create_error_response(e)
@@ -537,6 +508,30 @@ async def flush_cache():
         content="Cache flushed.\nPlease check backend logs for more details. "
         "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/debug/heap_dump", methods=["GET", "POST"])
+async def heap_dump():
+    """Trigger a jemalloc heap profile dump for all scheduler processes.
+
+    Requires jemalloc to be preloaded with profiling support (LD_PRELOAD + MALLOC_CONF=prof:true).
+    The heap profile files will be written to the path specified by prof_prefix in MALLOC_CONF.
+
+    Usage: curl http://<host>:<port>/debug/heap_dump
+    """
+    results = []
+
+    # Dump scheduler processes via IPC
+    try:
+        scheduler_results = await _global_state.tokenizer_manager.heap_dump()
+        results.extend(scheduler_results)
+    except Exception as e:
+        results.append(f"scheduler heap_dump failed: {e}")
+
+    return Response(
+        content="\n".join(results) + "\n",
+        status_code=200,
     )
 
 
@@ -604,9 +599,7 @@ async def dump_expert_distribution_record_async():
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
-    success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
-    )
+    success, message, num_paused_requests = await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     content = {
         "success": success,
         "message": message,
@@ -625,13 +618,9 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
 
 
 @app.post("/init_weights_update_group")
-async def init_weights_update_group(
-    obj: InitWeightsUpdateGroupReqInput, request: Request
-):
+async def init_weights_update_group(obj: InitWeightsUpdateGroupReqInput, request: Request):
     """Initialize the parameter update group."""
-    success, message = await _global_state.tokenizer_manager.init_weights_update_group(
-        obj, request
-    )
+    success, message = await _global_state.tokenizer_manager.init_weights_update_group(obj, request)
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -640,35 +629,25 @@ async def init_weights_update_group(
 
 
 @app.post("/update_weights_from_tensor")
-async def update_weights_from_tensor(
-    obj: UpdateWeightsFromTensorReqInput, request: Request
-):
+async def update_weights_from_tensor(obj: UpdateWeightsFromTensorReqInput, request: Request):
     """Update the weights from tensor inplace without re-launching the server.
     Notes:
-    1. Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
-    2. HTTP will transmit only the metadata of the tensor, while the tensor itself will be directly copied to the model.
+    1. Ensure that the model is on the correct device (e.g., GPU) before calling this endpoint. If the model
+       is moved to the CPU unexpectedly, it may cause performance issues or runtime errors.
+    2. HTTP will transmit only the metadata of the tensor, while the tensor itself will be directly
+       copied to the model.
     3. Any binary data in the named tensors should be base64 encoded.
     """
 
-    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(
-        obj, request
-    )
+    success, message = await _global_state.tokenizer_manager.update_weights_from_tensor(obj, request)
     content = {"success": success, "message": message}
-    return ORJSONResponse(
-        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
-    )
+    return ORJSONResponse(content, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/update_weights_from_distributed")
-async def update_weights_from_distributed(
-    obj: UpdateWeightsFromDistributedReqInput, request: Request
-):
+async def update_weights_from_distributed(obj: UpdateWeightsFromDistributedReqInput, request: Request):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
-    )
+    success, message = await _global_state.tokenizer_manager.update_weights_from_distributed(obj, request)
     content = {"success": success, "message": message}
     if success:
         return ORJSONResponse(content, status_code=200)
@@ -690,9 +669,7 @@ async def get_weights_by_name(obj: GetWeightsByNameReqInput, request: Request):
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])
-async def release_memory_occupation(
-    obj: ReleaseMemoryOccupationReqInput, request: Request
-):
+async def release_memory_occupation(obj: ReleaseMemoryOccupationReqInput, request: Request):
     """Release GPU memory occupation temporarily."""
     try:
         await _global_state.tokenizer_manager.release_memory_occupation(obj, request)
@@ -701,9 +678,7 @@ async def release_memory_occupation(
 
 
 @app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
-async def resume_memory_occupation(
-    obj: ResumeMemoryOccupationReqInput, request: Request
-):
+async def resume_memory_occupation(obj: ResumeMemoryOccupationReqInput, request: Request):
     """Resume GPU memory occupation."""
     try:
         await _global_state.tokenizer_manager.resume_memory_occupation(obj, request)
@@ -730,9 +705,7 @@ async def open_session(obj: OpenSessionReqInput, request: Request):
     try:
         session_id = await _global_state.tokenizer_manager.open_session(obj, request)
         if session_id is None:
-            raise Exception(
-                "Failed to open the session. Check if a session with the same id is still open."
-            )
+            raise Exception("Failed to open the session. Check if a session with the same id is still open.")
         return session_id
     except Exception as e:
         return _create_error_response(e)
@@ -759,10 +732,10 @@ async def configure_logging(obj: ConfigureLoggingReq, request: Request):
 async def abort_request(obj: AbortReq, request: Request):
     """Abort a request."""
     try:
-        _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
-        )
-        return Response(status_code=200)
+        result = await _global_state.tokenizer_manager.abort_request(rid=obj.rid, abort_all=obj.abort_all)
+        if obj.abort_all:
+            return ORJSONResponse(content={"usages": result}, status_code=200)
+        return ORJSONResponse(content={"usage": result}, status_code=200)
     except Exception as e:
         return _create_error_response(e)
 
@@ -781,9 +754,7 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
     # 3) Organize the response content
     response_data = {
         "normal_text": normal_text,
-        "calls": [
-            call.model_dump() for call in calls
-        ],  # Convert pydantic objects to dictionaries
+        "calls": [call.model_dump() for call in calls],  # Convert pydantic objects to dictionaries
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -835,19 +806,13 @@ async def continue_generation(request: Request):
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
-    return await raw_request.app.state.openai_serving_completion.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_completion.handle_request(request, raw_request)
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
-async def openai_v1_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
-):
+async def openai_v1_chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_chat.handle_request(request, raw_request)
 
 
 @app.post(
@@ -857,9 +822,7 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_embedding.handle_request(request, raw_request)
 
 
 @app.get("/v1/models", response_class=ORJSONResponse)
@@ -906,9 +869,7 @@ async def retrieve_model(model: str):
 @app.post("/v1/score", dependencies=[Depends(validate_json_request)])
 async def v1_score_request(request: ScoringRequest, raw_request: Request):
     """Endpoint for the decoder-only scoring API. See Engine.score() for detailed documentation."""
-    return await raw_request.app.state.openai_serving_score.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_score.handle_request(request, raw_request)
 
 
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
@@ -916,9 +877,7 @@ async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
     request_obj = ResponsesRequest(**request)
-    result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
-    )
+    result = await raw_request.app.state.openai_serving_responses.create_responses(request_obj, raw_request)
 
     # Handle streaming responses
     if isinstance(result, AsyncGenerator):
@@ -934,27 +893,19 @@ async def v1_responses_request(request: dict, raw_request: Request):
 @app.get("/v1/responses/{response_id}")
 async def v1_retrieve_responses(response_id: str, raw_request: Request):
     """Retrieve a response by ID."""
-    return await raw_request.app.state.openai_serving_responses.retrieve_responses(
-        response_id
-    )
+    return await raw_request.app.state.openai_serving_responses.retrieve_responses(response_id)
 
 
 @app.post("/v1/responses/{response_id}/cancel")
 async def v1_cancel_responses(response_id: str, raw_request: Request):
     """Cancel a background response."""
-    return await raw_request.app.state.openai_serving_responses.cancel_responses(
-        response_id
-    )
+    return await raw_request.app.state.openai_serving_responses.cancel_responses(response_id)
 
 
-@app.api_route(
-    "/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)]
-)
+@app.api_route("/v1/rerank", methods=["POST", "PUT"], dependencies=[Depends(validate_json_request)])
 async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     """Endpoint for reranking documents based on query relevance."""
-    return await raw_request.app.state.openai_serving_rerank.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_rerank.handle_request(request, raw_request)
 
 
 ## SageMaker API
@@ -965,13 +916,9 @@ async def sagemaker_health() -> Response:
 
 
 @app.post("/invocations")
-async def sagemaker_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
-):
+async def sagemaker_chat_completions(request: ChatCompletionRequest, raw_request: Request):
     """OpenAI-compatible chat completion endpoint."""
-    return await raw_request.app.state.openai_serving_chat.handle_request(
-        request, raw_request
-    )
+    return await raw_request.app.state.openai_serving_chat.handle_request(request, raw_request)
 
 
 ## Vertex AI API
@@ -982,15 +929,9 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
     inputs = {}
     for input_key in ("text", "input_ids", "input_embeds"):
         if vertex_req.instances[0].get(input_key):
-            inputs[input_key] = [
-                instance.get(input_key) for instance in vertex_req.instances
-            ]
+            inputs[input_key] = [instance.get(input_key) for instance in vertex_req.instances]
             break
-    image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+    image_data = [instance.get("image_data") for instance in vertex_req.instances if instance.get("image_data") is not None] or None
     req = GenerateReqInput(
         **inputs,
         image_data=image_data,
@@ -1003,9 +944,7 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Reque
 
 
 def _create_error_response(e):
-    return ORJSONResponse(
-        {"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST
-    )
+    return ORJSONResponse({"error": {"message": str(e)}}, status_code=HTTPStatus.BAD_REQUEST)
 
 
 def launch_server(
@@ -1021,16 +960,16 @@ def launch_server(
     - HTTP server: A FastAPI server that routes requests to the engine.
     - The engine consists of three components:
         1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches,
+           forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result
+           back to the Tokenizer Manager.
 
     Note:
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(
-        server_args=server_args
-    )
+    tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses(server_args=server_args)
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
@@ -1140,9 +1079,7 @@ def _execute_server_warmup(
     # Debug dumping
     if server_args.debug_tensor_dump_input_file:
         json_data.pop("text", None)
-        json_data["input_ids"] = np.load(
-            server_args.debug_tensor_dump_input_file
-        ).tolist()
+        json_data["input_ids"] = np.load(server_args.debug_tensor_dump_input_file).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     try:
@@ -1157,7 +1094,7 @@ def _execute_server_warmup(
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
-            logger.info(f"Start of pd disaggregation warmup ...")
+            logger.info("Start of pd disaggregation warmup ...")
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1167,11 +1104,9 @@ def _execute_server_warmup(
                 "bootstrap_host": [FAKE_BOOTSTRAP_HOST] * server_args.dp_size,
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
-                "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.world_size)
-                    for i in range(server_args.dp_size)
-                ],
-                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+                "bootstrap_room": [i * (2**63 // server_args.dp_size) + (i % server_args.world_size) for i in range(server_args.dp_size)],
+                # 16 token: SP 分片下 4 token 不够分会让部分 rank 拿 0 token; DFLASH 还须 >= block_size。
+                "input_ids": [list(range(16))] * server_args.dp_size,
             }
             res = requests.post(
                 url + request_name,
@@ -1180,16 +1115,10 @@ def _execute_server_warmup(
                 timeout=1800,  # because of deep gemm precache is very long if not precache.
             )
             if res.status_code == 200:
-                logger.info(
-                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
-                )
+                logger.info(f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}")
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
-                logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
-                )
+                logger.info(f"Prefill disaggregation mode warm Up Failed, status code: {res.status_code}")
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
     except Exception:

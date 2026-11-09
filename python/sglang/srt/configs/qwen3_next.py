@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +22,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
-from sglang.srt.distributed.utils import divide
+from sglang.srt.utils.common import divide
 
 logger = logging.get_logger(__name__)
 
@@ -210,7 +209,7 @@ class Qwen3NextConfig(PretrainedConfig):
         norm_topk_prob=True,
         output_router_logits=False,
         router_aux_loss_coef=0.001,
-        mlp_only_layers=[],
+        mlp_only_layers=None,
         layer_types=None,
         **kwargs,
     ):
@@ -250,14 +249,14 @@ class Qwen3NextConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
-        self.mlp_only_layers = mlp_only_layers
+        self.mlp_only_layers = mlp_only_layers if mlp_only_layers is not None else []
 
     @property
     def layers_block_type(self):
         layer_type_list = []
 
-        for l in range(self.num_hidden_layers):
-            if (l + 1) % self.full_attention_interval == 0:
+        for layer_idx in range(self.num_hidden_layers):
+            if (layer_idx + 1) % self.full_attention_interval == 0:
                 layer_type_list.append(HybridLayerType.full_attention.value)
             else:
                 layer_type_list.append(HybridLayerType.linear_attention.value)
@@ -266,28 +265,18 @@ class Qwen3NextConfig(PretrainedConfig):
 
     @property
     def linear_layer_ids(self):
-        return [
-            i
-            for i, type_value in enumerate(self.layers_block_type)
-            if type_value == HybridLayerType.linear_attention.value
-        ]
+        return [i for i, type_value in enumerate(self.layers_block_type) if type_value == HybridLayerType.linear_attention.value]
 
     @property
     def full_attention_layer_ids(self):
-        return [
-            i
-            for i, type_value in enumerate(self.layers_block_type)
-            if type_value == HybridLayerType.full_attention.value
-        ]
+        return [i for i, type_value in enumerate(self.layers_block_type) if type_value == HybridLayerType.full_attention.value]
 
     @property
     def mamba2_cache_params(self):
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.layers.attention.dp_attention import get_attention_tp_size
+
         world_size = get_attention_tp_size()
-        conv_dim = (
-            self.linear_key_head_dim * self.linear_num_key_heads * 2
-            + self.linear_value_head_dim * self.linear_num_value_heads
-        )
+        conv_dim = self.linear_key_head_dim * self.linear_num_key_heads * 2 + self.linear_value_head_dim * self.linear_num_value_heads
         conv_state_shape = (
             divide(conv_dim, world_size),
             self.linear_conv_kernel_dim - 1,
@@ -315,12 +304,7 @@ class Qwen3NextConfig(PretrainedConfig):
 
     @property
     def mamba_cache_per_req(self):
-        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = (
-            self.mamba2_cache_params
-        )
+        conv_state_shape, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = self.mamba2_cache_params
         mamba_layers_len = len(mamba_layers)
 
-        return (
-            int(np.prod(conv_state_shape)) * conv_dtype.itemsize
-            + int(np.prod(temporal_state_shape)) * ssm_dtype.itemsize
-        ) * mamba_layers_len
+        return (int(np.prod(conv_state_shape)) * conv_dtype.itemsize + int(np.prod(temporal_state_shape)) * ssm_dtype.itemsize) * mamba_layers_len

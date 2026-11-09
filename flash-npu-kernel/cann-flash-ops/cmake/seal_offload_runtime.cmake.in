@@ -1,0 +1,9 @@
+# Executed at install/CPack staging time, never against an old installed vendor.
+set(_sfa1_vendor "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/packages/vendors/@VENDOR_NAME@")
+execute_process(
+    COMMAND "@FLASH_OPS_PACKAGE_PYTHON@" "@CMAKE_CURRENT_SOURCE_DIR@/tools/seal_offload_runtime.py" "${_sfa1_vendor}"
+    RESULT_VARIABLE _sfa1_seal_status
+)
+if(NOT _sfa1_seal_status EQUAL 0)
+    message(FATAL_ERROR "Cannot seal the actual ALL SFA1 runtime: ${_sfa1_seal_status}")
+endif()

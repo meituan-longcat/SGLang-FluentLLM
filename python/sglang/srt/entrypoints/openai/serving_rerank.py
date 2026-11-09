@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
@@ -29,9 +29,8 @@ class OpenAIServingRerank(OpenAIServingBase):
         if not request.query:
             return "Query cannot be empty"
 
-        if isinstance(request.query, str):
-            if not request.query.strip():
-                return "Query cannot be empty or whitespace only"
+        if isinstance(request.query, str) and not request.query.strip():
+            return "Query cannot be empty or whitespace only"
 
         if not request.documents:
             return "Documents cannot be empty"
@@ -44,9 +43,7 @@ class OpenAIServingRerank(OpenAIServingBase):
 
         return None
 
-    async def _convert_to_internal_request(
-        self, request: V1RerankReqInput
-    ) -> tuple[EmbeddingReqInput, V1RerankReqInput]:
+    async def _convert_to_internal_request(self, request: V1RerankReqInput) -> tuple[EmbeddingReqInput, V1RerankReqInput]:
         """Convert OpenAI rerank request to internal embedding format"""
         # Create pairs of [query, document] for each document
         pairs = []
@@ -65,12 +62,10 @@ class OpenAIServingRerank(OpenAIServingBase):
         adapted_request: EmbeddingReqInput,
         request: V1RerankReqInput,
         raw_request: Request,
-    ) -> Union[List[RerankResponse], ErrorResponse, ORJSONResponse]:
+    ) -> Union[list[RerankResponse], ErrorResponse, ORJSONResponse]:
         """Handle the rerank request"""
         try:
-            ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
+            ret = await self.tokenizer_manager.generate_request(adapted_request, raw_request).__anext__()
 
         except ValueError as e:
             return self.create_error_response(str(e))
@@ -81,9 +76,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         responses = self._build_rerank_response(ret, request)
         return responses
 
-    def _build_rerank_response(
-        self, ret: List[Dict[str, Any]], request: V1RerankReqInput
-    ) -> List[RerankResponse]:
+    def _build_rerank_response(self, ret: list[dict[str, Any]], request: V1RerankReqInput) -> list[RerankResponse]:
         """Build the rerank response from generation results"""
         responses = []
         for idx, ret_item in enumerate(ret):

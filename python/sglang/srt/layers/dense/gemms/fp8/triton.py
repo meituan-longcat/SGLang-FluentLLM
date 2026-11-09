@@ -1,5 +1,6 @@
 import functools
 import json
+import logging
 import os
 from typing import Any, Dict, List, Optional
 
@@ -11,10 +12,7 @@ from sglang.srt.utils import get_device_name, log_info_on_rank0
 
 VLLM_AVAILABLE = False
 
-from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import (
-    is_fp8_fnuz,
-    per_token_group_quant_fp8,
-)
+from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import is_fp8_fnuz, per_token_group_quant_fp8, prepare_block_fp8_matmul_inputs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
@@ -25,6 +23,8 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
+
+logger = logging.getLogger(__name__)
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -53,9 +53,7 @@ USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 
 @functools.lru_cache
-def get_w8a8_block_fp8_configs(
-    N: int, K: int, block_n: int, block_k: int
-) -> Optional[Dict[int, Any]]:
+def get_w8a8_block_fp8_configs(N: int, K: int, block_n: int, block_k: int) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the w8a8 block fp8 kernel.
 
@@ -70,9 +68,7 @@ def get_w8a8_block_fp8_configs(
     device_name = get_device_name().replace(" ", "_")
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=fp8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
+    config_file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name)
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             log_info_on_rank0(
@@ -85,14 +81,10 @@ def get_w8a8_block_fp8_configs(
     # If no optimized configuration is available, we will use the default
     # configuration
     logger.warning(
-        (
-            "Using default W8A8 Block FP8 kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s"
-        ),
+        ("Using default W8A8 Block FP8 kernel config. Performance might be sub-optimal! Config file not found at %s"),
         config_file_path,
     )
     return None
-
 
 
 @triton.jit
@@ -231,9 +223,7 @@ def w8a8_block_fp8_matmul_triton(
         }
 
     def grid(META):
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+        return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
 
@@ -271,21 +261,18 @@ def triton_w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    *args,
+    **kwargs,
 ) -> torch.Tensor:
     assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
-    )
-    output = w8a8_block_fp8_matmul_triton(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype
-    )
+    q_input, x_scale = per_token_group_quant_fp8(input_2d, block_size[1], column_major_scales=False)
+    output = w8a8_block_fp8_matmul_triton(q_input, weight, x_scale, weight_scale, block_size, output_dtype=input_2d.dtype)
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
-
 
 
 @triton.jit
@@ -340,16 +327,10 @@ def scaled_mm_kernel(
     # NOTE: BLOCK_SIZE_SCALE_A could be 1 or BLOCK_SIZE_M, so need to create
     # appropriate offsets and masks for each case. Same goes for
     # BLOCK_SIZE_SCALE_B.
-    offsets_scale_am = (
-        tl.arange(0, BLOCK_SIZE_SCALE_A)
-        + (BLOCK_SIZE_SCALE_A > 1) * pid_m * BLOCK_SIZE_M
-    )
+    offsets_scale_am = tl.arange(0, BLOCK_SIZE_SCALE_A) + (BLOCK_SIZE_SCALE_A > 1) * pid_m * BLOCK_SIZE_M
     masks_scale_am = offsets_scale_am < M
 
-    offsets_scale_bn = (
-        tl.arange(0, BLOCK_SIZE_SCALE_B)
-        + (BLOCK_SIZE_SCALE_B > 1) * pid_n * BLOCK_SIZE_N
-    )
+    offsets_scale_bn = tl.arange(0, BLOCK_SIZE_SCALE_B) + (BLOCK_SIZE_SCALE_B > 1) * pid_n * BLOCK_SIZE_N
     masks_scale_bn = offsets_scale_bn < N
 
     a_ptrs = a_ptr + offsets_a
@@ -442,9 +423,7 @@ def triton_scaled_mm(
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     result = torch.empty((M, N), dtype=out_dtype, device=input.device)
 

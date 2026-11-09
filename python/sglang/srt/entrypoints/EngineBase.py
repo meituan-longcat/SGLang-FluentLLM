@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from collections.abc import Iterator
+from typing import Optional, Union
 
 import torch
 
@@ -13,22 +14,22 @@ class EngineBase(ABC):
     @abstractmethod
     def generate(
         self,
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
-        image_data: Optional[Union[List[str], str]] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
+        prompt: Optional[Union[list[str], str]] = None,
+        sampling_params: Optional[Union[list[dict], dict]] = None,
+        input_ids: Optional[Union[list[list[int]], list[int]]] = None,
+        image_data: Optional[Union[list[str], str]] = None,
+        return_logprob: Optional[Union[list[bool], bool]] = False,
+        logprob_start_len: Optional[Union[list[int], int]] = None,
+        top_logprobs_num: Optional[Union[list[int], int]] = None,
+        token_ids_logprob: Optional[Union[list[list[int]], list[int]]] = None,
+        custom_logit_processor: Optional[Union[list[str], str]] = None,
         return_hidden_states: Optional[bool] = None,
         stream: Optional[bool] = None,
-        bootstrap_host: Optional[Union[List[str], str]] = None,
-        bootstrap_port: Optional[Union[List[int], int]] = None,
-        bootstrap_room: Optional[Union[List[int], int]] = None,
+        bootstrap_host: Optional[Union[list[str], str]] = None,
+        bootstrap_port: Optional[Union[list[int], int]] = None,
+        bootstrap_room: Optional[Union[list[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
-    ) -> Union[Dict, Iterator[Dict]]:
+    ) -> Union[dict, Iterator[dict]]:
         """Generate outputs based on given inputs."""
         pass
 
@@ -40,7 +41,7 @@ class EngineBase(ABC):
     @abstractmethod
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: list[tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):

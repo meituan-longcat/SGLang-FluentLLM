@@ -6,6 +6,7 @@ from torch.nn import Module
 from sglang.srt.layers.moe.layouts.w8a8 import PerChannelQuantLayout
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
 
+
 class Fp8MoEPerChannelQuantLayout(PerChannelQuantLayout):
     def __init__(self, quant_config: W8A8Int8Config):
         super().__init__(quant_config)

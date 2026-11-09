@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import os
 import random
@@ -7,17 +8,16 @@ import threading
 import warnings
 from collections import deque
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
-
 import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import get_ip, get_colorful_logger
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessorOutput
+from sglang.srt.utils import get_colorful_logger, get_ip
 
 if TYPE_CHECKING:
     from sglang.srt.managers.req import Req
@@ -27,27 +27,25 @@ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 # env var for testing failure, convert to float explicitly
 FAILURE_PROB = float(os.getenv("DISAGGREGATION_TEST_FAILURE_PROB", 0))
 logger = get_colorful_logger(__name__)
-import ctypes
+
 
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"
     DECODE = "decode"
+    ENCODE = "encode"
 
 
 def poll_and_all_reduce(pollers, gloo_group, device=None):
     # at a certain prob, the poll is failed to simulate failure
-    device = 'cpu' if device is None else device
+    device = "cpu" if device is None else device
     if FAILURE_PROB > 0:
         from sglang.srt.disaggregation.base import KVPoll
 
-        polls = [
-            int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll())
-            for poller in pollers
-        ]
+        polls = [int(KVPoll.Failed) if random.random() < FAILURE_PROB else int(poller.poll()) for poller in pollers]  # noqa: S311
     else:
         polls = [int(poller.poll()) for poller in pollers]
-    tensor_to_reduce=torch.tensor(polls, dtype=torch.uint8, device=device)
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device=device)
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
 
@@ -65,7 +63,7 @@ class ReqToMetadataIdxAllocator:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self) -> List[int]:
+    def alloc(self) -> list[int]:
         if len(self.free_slots) == 0:
             return None
 
@@ -90,8 +88,6 @@ class KVClassType(Enum):
 
 
 def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
-    from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
-
     if transfer_backend == TransferBackend.MOONCAKE:
         from sglang.srt.disaggregation.mooncake import (
             MooncakeKVBootstrapServer,
@@ -110,8 +106,8 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
 
     if transfer_backend == TransferBackend.MOONCAKE_ASYNC:
         from sglang.srt.disaggregation.mooncake import (
-            MooncakeKVBootstrapServer,
             MooncakeAsyncKVManager,
+            MooncakeKVBootstrapServer,
             MooncakeKVReceiver,
             MooncakeKVSender,
         )
@@ -158,7 +154,7 @@ class PDRegistryRequest:
 
     mode: str
     registry_url: str
-    bootstrap_port: Optional[int] = None
+    bootstrap_port: int | None = None
 
     def __post_init__(self):
         if self.mode == "prefill" and self.bootstrap_port is None:
@@ -166,14 +162,10 @@ class PDRegistryRequest:
         elif self.mode == "decode" and self.bootstrap_port is not None:
             raise ValueError("Bootstrap port must not be set in DECODE mode.")
         elif self.mode not in ["prefill", "decode"]:
-            raise ValueError(
-                f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'."
-            )
+            raise ValueError(f"Invalid mode: {self.mode}. Must be 'prefill' or 'decode'.")
 
 
-def register_disaggregation_server(
-    mode: str, server_port: int, bootstrap_port: int, pdlb_url: str
-):
+def register_disaggregation_server(mode: str, server_port: int, bootstrap_port: int, pdlb_url: str):
     boostrap_port = bootstrap_port if mode == "prefill" else None
     registry_request = PDRegistryRequest(
         mode=mode,
@@ -183,28 +175,26 @@ def register_disaggregation_server(
     res = requests.post(
         f"{pdlb_url}/register",
         json=dataclasses.asdict(registry_request),
+        timeout=30,
     )
     if res.status_code != 200:
-        warnings.warn(
-            f"Failed to register disaggregation server: {res.status_code} {res.text}"
-        )
+        warnings.warn(f"Failed to register disaggregation server: {res.status_code} {res.text}", stacklevel=2)
     else:
         logger.info(f"register to {pdlb_url} success {res.status_code=} {res.text=}")
 
 
 def is_mla_backend(target_kv_pool) -> bool:
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-
-    return isinstance(target_kv_pool, MLATokenToKVPool)
+    return target_kv_pool.is_mla_backend
 
 
-def prepare_abort(req: Req, error_message: str, status_code = None, err_type = None):
-    from sglang.srt.managers.req import ABORT_CODE, FINISH_ABORT
+def prepare_abort(req: Req, error_message: str, status_code=None, err_type=None):
+    from sglang.srt.managers.req import AbortCode, FinishAbort
+
     if err_type is None:
-        err_type = ABORT_CODE.UnknownError
+        err_type = AbortCode.UnknownError
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code = status_code, err_type = err_type)
+    req.finished_reason = FinishAbort(error_message, status_code=status_code, err_type=err_type)
 
     if req.return_logprob:
         req.input_token_logprobs_val = []
@@ -223,19 +213,13 @@ class MetadataBuffers:
         # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
         self.device = device
         self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
-        self.output_token_logprobs_val = torch.zeros(
-            (size, 16), dtype=torch.float32, device=device
-        )
-        self.output_token_logprobs_idx = torch.zeros(
-            (size, 16), dtype=torch.int32, device=device
-        )
-        self.output_top_logprobs_val = torch.zeros(
-            (size, max_top_logprobs_num), dtype=torch.float32, device=device
-        )
-        self.output_top_logprobs_idx = torch.zeros(
-            (size, max_top_logprobs_num), dtype=torch.int32, device=device
-        )
+        self.output_token_logprobs_val = torch.zeros((size, 16), dtype=torch.float32, device=device)
+        self.output_token_logprobs_idx = torch.zeros((size, 16), dtype=torch.int32, device=device)
+        self.output_top_logprobs_val = torch.zeros((size, max_top_logprobs_num), dtype=torch.float32, device=device)
+        self.output_top_logprobs_idx = torch.zeros((size, max_top_logprobs_num), dtype=torch.int32, device=device)
         self.cached_tokens = torch.zeros((size, 1), dtype=torch.int32, device=device)
+        self.dequeue_time = torch.zeros((size, 1), dtype=torch.float32, device=device)
+        self.abort_flags = torch.zeros((size, 1), dtype=torch.int32, device=device)
 
     def get_buf_infos(self):
         ptrs = [
@@ -245,6 +229,8 @@ class MetadataBuffers:
             self.output_top_logprobs_val.data_ptr(),
             self.output_top_logprobs_idx.data_ptr(),
             self.cached_tokens.data_ptr(),
+            self.dequeue_time.data_ptr(),
+            self.abort_flags.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
@@ -253,6 +239,8 @@ class MetadataBuffers:
             self.output_top_logprobs_val.nbytes,
             self.output_top_logprobs_idx.nbytes,
             self.cached_tokens.nbytes,
+            self.dequeue_time.nbytes,
+            self.abort_flags.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
@@ -261,6 +249,8 @@ class MetadataBuffers:
             self.output_top_logprobs_val[0].nbytes,
             self.output_top_logprobs_idx[0].nbytes,
             self.cached_tokens[0].nbytes,
+            self.dequeue_time[0].nbytes,
+            self.abort_flags[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
 
@@ -272,67 +262,69 @@ class MetadataBuffers:
             self.output_top_logprobs_val[idx],
             self.output_top_logprobs_idx[idx],
             self.cached_tokens[idx],
+            self.dequeue_time[idx],
+            self.abort_flags[idx],
         )
 
     def set_buf_by_batch(
         self,
         output_ids: torch.Tensor,
-        output_buffer_indices: List[int],
+        output_buffer_indices_d: list[int],
         logits_output: LogitsProcessorOutput,
-        output_token_logprobs_indices: Optional[List[Tuple[int, int]]] = None,
-        output_top_logprobs_indices: Optional[List[Tuple[int], int]] = None,
-        cached_tokens: Optional[torch.Tensor] = None,
+        output_token_logprobs_indices: list[tuple[int, int]] | None = None,
+        output_top_logprobs_indices: list[tuple[int, int]] | None = None,
+        cached_tokens_d: torch.Tensor | None = None,
+        abort_flags_d: torch.Tensor | None = None,
     ):
-        self.output_ids[torch.tensor(output_buffer_indices).to(self.device, non_blocking=True), 0] = output_ids
-        if cached_tokens is not None:
-            self.cached_tokens[torch.tensor(output_buffer_indices).to(self.device, non_blocking=True), 0] = cached_tokens
+        self.output_ids[output_buffer_indices_d, 0] = output_ids
+        if cached_tokens_d is not None:
+            self.cached_tokens[output_buffer_indices_d, 0] = cached_tokens_d
+        if abort_flags_d is not None:
+            self.abort_flags[output_buffer_indices_d, 0] = abort_flags_d
 
         if output_token_logprobs_indices:
             for src_idx, dst_idx in output_token_logprobs_indices:
-                self.output_token_logprobs_val[dst_idx][0] = logits_output.next_token_top_logprobs_val[src_idx]
-                self.output_token_logprobs_idx[dst_idx][0] = logits_output.next_token_top_logprobs_idx[src_idx]
+                self.output_token_logprobs_val[dst_idx][0] = logits_output.next_token_logprobs[src_idx]
+                self.output_token_logprobs_idx[dst_idx][0] = output_ids[src_idx]
 
         if output_top_logprobs_indices:
             for src_idx, dst_idx in output_top_logprobs_indices:
-                self.output_top_logprobs_val[dst_idx][
-                    : len(logits_output.next_token_top_logprobs_val[src_idx][0])
-                ] = torch.tensor(
-                    logits_output.next_token_top_logprobs_val[src_idx][0], dtype=torch.float32, device="cpu"
+                # next_token_top_logprobs_val/idx are per-request lists of k
+                # floats/ints (already tolist()'ed in the sampler), so index
+                # with [src_idx] only -- unlike set_buf(req) where the req-level
+                # list is per-token and [0] picks the first token.
+                self.output_top_logprobs_val[dst_idx][: len(logits_output.next_token_top_logprobs_val[src_idx])] = torch.tensor(
+                    logits_output.next_token_top_logprobs_val[src_idx], dtype=torch.float32, device="cpu"
                 )
-                self.output_top_logprobs_idx[dst_idx][
-                    : len(logits_output.next_token_top_logprobs_idx[src_idx][0])
-                ] = torch.tensor(
-                    logits_output.next_token_top_logprobs_idx[src_idx][0], dtype=torch.int32, device="cpu"
+                self.output_top_logprobs_idx[dst_idx][: len(logits_output.next_token_top_logprobs_idx[src_idx])] = torch.tensor(
+                    logits_output.next_token_top_logprobs_idx[src_idx], dtype=torch.int32, device="cpu"
                 )
 
     def set_buf(self, req: Req):
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        self.abort_flags[req.metadata_buffer_index][0] = int(req.to_abort_grammar)
+        self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
+        self.dequeue_time[req.metadata_buffer_index][0] = req.dequeue_time if req.dequeue_time is not None else 0.0
         if req.return_logprob:
             if req.output_token_logprobs_val:  # not none or empty list
-                self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_val[0]
-                )
+                self.output_token_logprobs_val[req.metadata_buffer_index][0] = req.output_token_logprobs_val[0]
             if req.output_token_logprobs_idx:  # not none or empty list
-                self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_idx[0]
-                )
+                self.output_token_logprobs_idx[req.metadata_buffer_index][0] = req.output_token_logprobs_idx[0]
 
             if req.output_top_logprobs_val:  # not none or empty list
-                self.output_top_logprobs_val[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_val[0])
-                ] = torch.tensor(
+                self.output_top_logprobs_val[req.metadata_buffer_index][: len(req.output_top_logprobs_val[0])] = torch.tensor(
                     req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
                 )
             if req.output_top_logprobs_idx:  # not none or empty list
-                self.output_top_logprobs_idx[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_idx[0])
-                ] = torch.tensor(
+                self.output_top_logprobs_idx[req.metadata_buffer_index][: len(req.output_top_logprobs_idx[0])] = torch.tensor(
                     req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
                 )
 
+
 class FastQueue:
-    class Empty(Exception):
+    class EmptyError(Exception):
         """Exception raised when the queue is empty."""
+
         pass
 
     def __init__(self):
@@ -355,13 +347,13 @@ class FastQueue:
     def get_nowait(self):
         with self._cond:
             if not self._buf:
-                raise FastQueue.Empty()
+                raise FastQueue.EmptyError()
             return self._buf.popleft()
 
 
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int64], dst_indices: npt.NDArray[np.int64]
-) -> Tuple[List[npt.NDArray[np.int64]], List[npt.NDArray[np.int64]]]:
+) -> tuple[list[npt.NDArray[np.int64]], list[npt.NDArray[np.int64]]]:
     """Vectorised NumPy implementation."""
     if src_indices.size == 0:
         return [], []
@@ -377,15 +369,14 @@ def group_concurrent_contiguous(
 
 
 class StepCounter:
-    COUNT_NUM_MAX: int = 2 ** 62
+    COUNT_NUM_MAX: int = 2**62
 
     @classmethod
     def is_step_ready(cls, current_step: int, target_step: int) -> bool:
         # because COUNT_NUM_MAX is very large, we can make sure that if diff is > COUNT_NUM_MAX / 2 means the flush is finished
         # and if the current_sent_count == task_stop_count also means the flush is not finished
         # so if current_sent_count != task_stop_count and diff < COUNT_NUM_MAX / 2, the flush is not finished
-        return target_step != current_step and \
-            (target_step + cls.COUNT_NUM_MAX - current_step) % cls.COUNT_NUM_MAX > cls.COUNT_NUM_MAX / 2
+        return target_step != current_step and (target_step + cls.COUNT_NUM_MAX - current_step) % cls.COUNT_NUM_MAX > cls.COUNT_NUM_MAX / 2
 
     def __init__(self, device: str, gpu_id: int):
         # utilities for cache step
@@ -404,7 +395,7 @@ class StepCounter:
         self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.aux_step: int = 0
 
-    def current_step(self) -> Tuple[int, int]:
+    def current_step(self) -> tuple[int, int]:
         return self.cache_step, self.aux_step
 
     def advance_step(self, delta_cache_step: int, delta_aux_step: int):
@@ -419,14 +410,15 @@ class StepCounter:
         self.d_ready_aux_step = (self.d_ready_aux_step + 1) % self.COUNT_NUM_MAX
         self.h_ready_aux_step.copy_(self.d_ready_aux_step, non_blocking=True)
 
-    def query_ready_cache_step(self)  -> int:
+    def query_ready_cache_step(self) -> int:
         return ctypes.c_int64.from_address(self.h_ready_cache_step.data_ptr()).value
 
     def query_ready_aux_step(self) -> int:
         return ctypes.c_int64.from_address(self.h_ready_aux_step.data_ptr()).value
 
+
 @dataclasses.dataclass
 class PageTransferMetadata:
     indices_are_local: bool
     page_transfer_mask: npt.NDArray[np.bool_]
-    page_local_indices: Optional[npt.NDArray[np.int64]] = None
+    page_local_indices: npt.NDArray[np.int64] | None = None

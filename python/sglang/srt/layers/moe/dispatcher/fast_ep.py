@@ -22,9 +22,7 @@ class FastEP:
         )
         return _FAST_EP
 
-    def dispatch(
-        self, dp_x: torch.Tensor, indices: torch.Tensor, num_global_tokens: int
-    ):
+    def dispatch(self, dp_x: torch.Tensor, indices: torch.Tensor, num_global_tokens: int):
         global _FAST_EP
         if _FAST_EP is None:
             _FAST_EP = self.construct_fast_ep()
@@ -57,11 +55,10 @@ class FastEP:
         indices: torch.Tensor,
         weights: torch.Tensor,
         expert_y: torch.Tensor,
+        dp_x: torch.Tensor,
         num_global_tokens: int,
     ):
-        assert (
-            indices.dtype == torch.int32
-        ), f"indices dtype: {indices.dtype} != torch.int32"
+        assert indices.dtype == torch.int32, f"indices dtype: {indices.dtype} != torch.int32"
 
         # Combine
         y = torch.empty(
@@ -74,6 +71,7 @@ class FastEP:
             out_tokens=y,
             weights=weights,
             expert_y=expert_y,
+            dp_x=dp_x,
             num_global_tokens=num_global_tokens,
         )
 

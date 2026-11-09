@@ -66,11 +66,7 @@ def _fwd_kernel(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    off_q = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs
-        + cur_head * stride_qh
-        + offs_d[None, :]
-    )
+    off_q = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs + cur_head * stride_qh + offs_d[None, :]
     off_k = offs_n[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None]
     off_v = offs_n[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :]
 
@@ -92,11 +88,7 @@ def _fwd_kernel(
 
     block_mask = tl.where(block_start_loc < cur_batch_seq_len, 1, 0)
 
-    end_n = (
-        cur_batch_seq_len
-        if not IS_CAUSAL
-        else tl.minimum((start_m + 1) * BLOCK_M, cur_batch_seq_len)
-    )
+    end_n = cur_batch_seq_len if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, cur_batch_seq_len)
     for start_n in range(0, block_mask * end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
@@ -113,15 +105,12 @@ def _fwd_kernel(
 
         if IS_CAUSAL:
             qk += tl.where(
-                (start_n + offs_n[None, :] < cur_batch_seq_len)
-                & (offs_m[:, None] >= (start_n + offs_n[None, :])),
+                (start_n + offs_n[None, :] < cur_batch_seq_len) & (offs_m[:, None] >= (start_n + offs_n[None, :])),
                 0,
                 float("-inf"),
             )
         else:
-            qk += tl.where(
-                (start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf")
-            )
+            qk += tl.where((start_n + offs_n[None, :]) < cur_batch_seq_len, 0, float("-inf"))
 
         # -- compute m_ij, p, l_ij
         m_ij = tl.max(qk, 1)
@@ -152,32 +141,21 @@ def _fwd_kernel(
         l_i = l_i_new
         m_i = m_i_new
     # initialize pointers to output
-    off_o = (
-        (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs
-        + cur_head * stride_oh
-        + offs_d[None, :]
-    )
+    off_o = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs + cur_head * stride_oh + offs_d[None, :]
     out_ptrs = Out + off_o
-    tl.store(
-        out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :])
-    )
+    tl.store(out_ptrs, acc, mask=(offs_m[:, None] < cur_batch_seq_len) & (mask_d[None, :]))
 
 
-def context_attention_fwd(
-    q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True
-):
+def context_attention_fwd(q, k, v, o, b_start_loc, b_seq_len, max_input_len, is_causal=True):
     """
     q, k, v: [b * s, head, head_dim]
     b_start_loc: [b]
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    if is_cuda_available and CUDA_CAPABILITY[0] > 8:
-        BLOCK = 128
-    else:
-        BLOCK = 64
+    BLOCK = 128 if is_cuda_available and CUDA_CAPABILITY[0] > 8 else 64
 
-    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+    Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
     sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]

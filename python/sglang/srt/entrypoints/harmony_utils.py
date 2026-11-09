@@ -69,9 +69,7 @@ def get_system_message(
     if model_identity is not None:
         sys_msg_content = sys_msg_content.with_model_identity(model_identity)
     if reasoning_effort is not None:
-        sys_msg_content = sys_msg_content.with_reasoning_effort(
-            REASONING_EFFORT[reasoning_effort]
-        )
+        sys_msg_content = sys_msg_content.with_reasoning_effort(REASONING_EFFORT[reasoning_effort])
     if start_date is None:
         start_date = datetime.datetime.now().strftime("%Y-%m-%d")
     sys_msg_content = sys_msg_content.with_conversation_start_date(start_date)
@@ -83,9 +81,7 @@ def get_system_message(
     return sys_msg
 
 
-def get_developer_message(
-    instructions: Optional[str] = None, tools: Optional[list[Tool]] = None
-) -> Message:
+def get_developer_message(instructions: Optional[str] = None, tools: Optional[list[Tool]] = None) -> Message:
     dev_msg_content = DeveloperContent.new()
     if instructions is not None:
         dev_msg_content = dev_msg_content.with_instructions(instructions)
@@ -108,9 +104,7 @@ def get_developer_message(
                 )
                 for tool in function_tools
             ]
-            dev_msg_content = dev_msg_content.with_function_tools(
-                function_tool_descriptions
-            )
+            dev_msg_content = dev_msg_content.with_function_tools(function_tool_descriptions)
     dev_msg = Message.from_role_and_content(Role.DEVELOPER, dev_msg_content)
     return dev_msg
 
@@ -145,10 +139,7 @@ def parse_response_input(
         call_id = response_msg["call_id"]
         call_response: Optional[ResponseFunctionToolCall] = None
         for prev_response in reversed(prev_responses):
-            if (
-                isinstance(prev_response, ResponseFunctionToolCall)
-                and prev_response.call_id == call_id
-            ):
+            if isinstance(prev_response, ResponseFunctionToolCall) and prev_response.call_id == call_id:
                 call_response = prev_response
                 break
         if call_response is None:
@@ -201,9 +192,7 @@ def parse_chat_input(chat_msg) -> Message:
 
 def render_for_completion(messages: list[Message]) -> list[int]:
     conversation = Conversation.from_messages(messages)
-    token_ids = get_encoding().render_conversation_for_completion(
-        conversation, Role.ASSISTANT
-    )
+    token_ids = get_encoding().render_conversation_for_completion(conversation, Role.ASSISTANT)
     return token_ids
 
 
@@ -231,13 +220,9 @@ def parse_output_message(message: Message):
         browser_call = json.loads(content.text)
         # TODO: translate to url properly!
         if recipient == "browser.search":
-            action = ActionSearch(
-                query=f"cursor:{browser_call.get('query', '')}", type="search"
-            )
+            action = ActionSearch(query=f"cursor:{browser_call.get('query', '')}", type="search")
         elif recipient == "browser.open":
-            action = ActionOpenPage(
-                url=f"cursor:{browser_call.get('url', '')}", type="open_page"
-            )
+            action = ActionOpenPage(url=f"cursor:{browser_call.get('url', '')}", type="open_page")
         elif recipient == "browser.find":
             action = ActionFind(
                 pattern=browser_call["pattern"],
@@ -259,11 +244,7 @@ def parse_output_message(message: Message):
                 id=f"rs_{random_uuid()}",
                 type="reasoning",
                 summary=[],
-                content=[
-                    ResponseReasoningTextContent(
-                        text=content.text, type="reasoning_text"
-                    )
-                ],
+                content=[ResponseReasoningTextContent(text=content.text, type="reasoning_text")],
                 status=None,
             )
             output_items.append(reasoning_item)
@@ -280,19 +261,13 @@ def parse_output_message(message: Message):
                     id=f"ft_{random_id}",
                 )
                 output_items.append(response_item)
-        elif message.recipient.startswith("python") or message.recipient.startswith(
-            "browser"
-        ):
+        elif message.recipient.startswith("python") or message.recipient.startswith("browser"):
             for content in message.content:
                 reasoning_item = ResponseReasoningItem(
                     id=f"rs_{random_uuid()}",
                     type="reasoning",
                     summary=[],
-                    content=[
-                        ResponseReasoningTextContent(
-                            text=content.text, type="reasoning_text"
-                        )
-                    ],
+                    content=[ResponseReasoningTextContent(text=content.text, type="reasoning_text")],
                     status=None,
                 )
                 output_items.append(reasoning_item)
@@ -335,21 +310,13 @@ def parse_remaining_state(parser: StreamableParser):
             id=f"rs_{random_uuid()}",
             type="reasoning",
             summary=[],
-            content=[
-                ResponseReasoningTextContent(
-                    text=parser.current_content, type="reasoning_text"
-                )
-            ],
+            content=[ResponseReasoningTextContent(text=parser.current_content, type="reasoning_text")],
             status=None,
         )
         return [reasoning_item]
     elif parser.current_channel == "final":
         output_text = ResponseOutputText(
-            content=[
-                ResponseReasoningTextContent(
-                    text=parser.current_content, type="reasoning_text"
-                )
-            ],
+            content=[ResponseReasoningTextContent(text=parser.current_content, type="reasoning_text")],
             annotations=[],  # TODO
             type="output_text",
             logprobs=None,  # TODO

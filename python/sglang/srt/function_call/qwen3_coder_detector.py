@@ -1,9 +1,10 @@
+# ruff: noqa: S105
 import ast
 import html
 import json
 import logging
 import re
-from typing import Any, Dict, List, Tuple, Union, Literal
+from typing import Any, Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -45,23 +46,15 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.tool_call_start_token: str = "<tool_call>"
         self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_prefix: str = "<function="
-        self.tool_call_regex = re.compile(
-            r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
-        )
-        self.tool_call_function_regex = re.compile(
-            r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
-        )
-        self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL
-        )
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL)
+        self.tool_call_function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
+        self.tool_call_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>|<parameter=(.*?)$", re.DOTALL)
         self._buf: str = ""
 
         # Streaming state variables
         self._current_function_name: str = ""
-        self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[str, str] = (
-            {}
-        )  # Track what parameter content we've streamed
+        self._current_parameters: dict[str, Any] = {}
+        self._streamed_parameters: dict[str, str] = {}  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
@@ -69,23 +62,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return self.tool_call_start_token in text
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         normal, calls = self._extract(text, tools, tool_choice)
         return StreamingParseResult(normal_text=normal, calls=calls)
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         self._buf += new_text
         normal = ""
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
 
         # Build tool indices for validation
         if not hasattr(self, "_tool_indices"):
@@ -196,9 +183,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                                     parameters="}",
                                 )
                             )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                current_streamed + "}"
-                            )
+                            self.streamed_args_for_tool[self.current_tool_id] = current_streamed + "}"
 
                     # Complete the tool call
                     self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
@@ -211,7 +196,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal, calls=calls)
 
-    def _parse_and_stream_parameters(self, text_to_parse: str) -> List[ToolCallItem]:
+    def _parse_and_stream_parameters(self, text_to_parse: str) -> list[ToolCallItem]:
         """
         Parse complete parameter blocks from text and return any tool call items to emit.
 
@@ -227,14 +212,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         Returns:
             List of ToolCallItem objects to emit (may be empty)
         """
-        calls: List[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
 
         # Find all complete parameter patterns
-        param_matches = list(
-            re.finditer(
-                r"<parameter=([^>]+)>(.*?)</parameter>", text_to_parse, re.DOTALL
-            )
-        )
+        param_matches = list(re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", text_to_parse, re.DOTALL))
 
         # Build new parameters dictionary
         new_params = {}
@@ -254,9 +235,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 # First parameter(s) - start JSON object but don't close it yet
                 items = []
                 for key, value in new_params.items():
-                    items.append(
-                        f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
-                    )
+                    items.append(f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}")
                 json_fragment = "{" + ", ".join(items)
 
                 calls.append(
@@ -276,9 +255,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     continuation_parts = []
                     for key in new_keys:
                         value = new_params[key]
-                        continuation_parts.append(
-                            f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
-                        )
+                        continuation_parts.append(f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}")
 
                     json_fragment = ", " + ", ".join(continuation_parts)
 
@@ -289,9 +266,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                             parameters=json_fragment,
                         )
                     )
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        previous_args_json + json_fragment
-                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = previous_args_json + json_fragment
 
             # Update current state
             self._current_parameters = new_params
@@ -309,13 +284,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self.current_tool_name_sent = False
 
     def _extract(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
-    ) -> Tuple[str, List[ToolCallItem]]:
-        normal_parts: List[str] = []
-        calls: List[ToolCallItem] = []
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+    ) -> tuple[str, list[ToolCallItem]]:
+        normal_parts: list[str] = []
+        calls: list[ToolCallItem] = []
         cursor = 0
         while True:
             s = text.find(self.tool_call_start_token, cursor)
@@ -332,16 +304,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
             calls.extend(self._parse_block(block, tools, tool_choice))
         return "".join(normal_parts), calls
 
-    def _get_arguments_config(
-        self, func_name: str, tools: List[Tool] = None
-    ) -> dict:
+    def _get_arguments_config(self, func_name: str, tools: list[Tool] = None) -> dict:
         """Extract argument configuration for a function."""
         if tools is None:
             return {}
         for config in tools:
-            if not hasattr(config, "type") or not (
-                hasattr(config, "function") and hasattr(config.function, "name")
-            ):
+            if not hasattr(config, "type") or not (hasattr(config, "function") and hasattr(config.function, "name")):
                 continue
             if config.type == "function" and config.function.name == func_name:
                 if not hasattr(config.function, "parameters"):
@@ -356,9 +324,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         logger.warning("Tool '%s' is not defined in the tools list.", func_name)
         return {}
 
-    def _convert_param_value(
-        self, param_value: str, param_name: str, param_config: dict, func_name: str
-    ) -> Any:
+    def _convert_param_value(self, param_value: str, param_name: str, param_config: dict, func_name: str) -> Any:
         """Convert parameter value based on its type in the schema."""
         # Handle null value for any type
         if param_value is None:
@@ -369,25 +335,20 @@ class Qwen3CoderDetector(BaseFormatDetector):
         if param_name not in param_config:
             if param_config != {}:
                 logger.warning(
-                    "Parsed parameter '%s' is not defined in the tool "
-                    "parameters for tool '%s', directly returning the "
-                    "string value.",
+                    "Parsed parameter '%s' is not defined in the tool parameters for tool '%s', directly returning the string value.",
                     param_name,
                     func_name,
                 )
             return param_value
 
-        if (
-            isinstance(param_config[param_name], dict)
-            and "type" in param_config[param_name]
-        ):
+        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
             param_type = str(param_config[param_name]["type"]).strip().lower()
         else:
             param_type = "string"
         if param_type in ["string", "str", "text"]:
             if not isinstance(param_value, str):
                 if isinstance(param_value, dict):
-                    param_value=json.dumps(
+                    param_value = json.dumps(
                         param_value,
                         indent=2,
                         ensure_ascii=False,
@@ -408,8 +369,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 return int(param_value)
             except (ValueError, TypeError):
                 logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not an "
-                    "integer in tool '%s', degenerating to string.",
+                    "Parsed value '%s' of parameter '%s' is not an integer in tool '%s', degenerating to string.",
                     param_value,
                     param_name,
                     func_name,
@@ -418,49 +378,33 @@ class Qwen3CoderDetector(BaseFormatDetector):
         elif param_type.startswith("num") or param_type.startswith("float"):
             try:
                 float_param_value = float(param_value)
-                return (
-                    float_param_value
-                    if float_param_value - int(float_param_value) != 0
-                    else int(float_param_value)
-                )
+                return float_param_value if float_param_value - int(float_param_value) != 0 else int(float_param_value)
             except (ValueError, TypeError):
                 logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not a float "
-                    "in tool '%s', degenerating to string.",
+                    "Parsed value '%s' of parameter '%s' is not a float in tool '%s', degenerating to string.",
                     param_value,
                     param_name,
                     func_name,
                 )
                 return param_value
         elif param_type in ["boolean", "bool", "binary"]:
-            if isinstance(param_value, str):
-                param_value = param_value.lower()
-            else:
-                param_value = str(param_value).lower()
+            param_value = param_value.lower() if isinstance(param_value, str) else str(param_value).lower()
             if param_value not in ["true", "false"]:
                 logger.warning(
-                    "Parsed value '%s' of parameter '%s' is not a boolean "
-                    "(`true` or `false`) in tool '%s', degenerating to "
-                    "false.",
+                    "Parsed value '%s' of parameter '%s' is not a boolean (`true` or `false`) in tool '%s', degenerating to false.",
                     param_value,
                     param_name,
                     func_name,
                 )
             return param_value == "true"
         else:
-            if (
-                param_type in ["object", "array", "arr"]
-                or param_type.startswith("dict")
-                or param_type.startswith("list")
-            ):
+            if param_type in ["object", "array", "arr"] or param_type.startswith("dict") or param_type.startswith("list"):
                 try:
                     param_value = json.loads(param_value)
                     return param_value
                 except (json.JSONDecodeError, TypeError, ValueError):
                     logger.warning(
-                        "Parsed value '%s' of parameter '%s' cannot be "
-                        "parsed with json.loads in tool '%s', will try "
-                        "other methods to parse it.",
+                        "Parsed value '%s' of parameter '%s' cannot be parsed with json.loads in tool '%s', will try other methods to parse it.",
                         param_value,
                         param_name,
                         func_name,
@@ -469,9 +413,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 param_value = ast.literal_eval(param_value)  # safer
             except (ValueError, SyntaxError, TypeError):
                 logger.warning(
-                    "Parsed value '%s' of parameter '%s' cannot be "
-                    "converted via Python `ast.literal_eval()` in tool "
-                    "'%s', degenerating to string.",
+                    "Parsed value '%s' of parameter '%s' cannot be converted via Python `ast.literal_eval()` in tool '%s', degenerating to string.",
                     param_value,
                     param_name,
                     func_name,
@@ -479,11 +421,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
             return param_value
 
     def parse_base_json(
-        self,
-        action: Any,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
-    ) -> List[ToolCallItem]:
+        self, action: Any, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+    ) -> list[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
             action = [action]
@@ -491,7 +430,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         for act in action:
             func_name = act.get("name")
             if not (func_name and func_name in tool_indices):
-                logger.warning(f"Model attempted to call undefined function: {name}")
+                logger.warning(f"Model attempted to call undefined function: {func_name}")
                 if tool_choice != "bypass_check":
                     continue
 
@@ -514,12 +453,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return results
 
     def _parse_block(
-        self,
-        block: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
-    ) -> List[ToolCallItem]:
-        res: List[ToolCallItem] = []
+        self, block: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+    ) -> list[ToolCallItem]:
+        res: list[ToolCallItem] = []
         for m in self.tool_call_function_regex.findall(block):
             txt = m[0] if m[0] else m[1]
             if ">" not in txt:
@@ -527,7 +463,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
             idx = txt.index(">")
             fname = txt[:idx].strip()
             body = txt[idx + 1 :]
-            params: Dict[str, Any] = {}
+            params: dict[str, Any] = {}
             for pm in self.tool_call_parameter_regex.findall(body):
                 ptxt = pm[0] if pm[0] else pm[1]
                 if ">" not in ptxt:

@@ -9,10 +9,10 @@ import torch
 
 MARLIN_FP8_AVAILABLE = False
 
+
 def dummy_func(*args, **kwargs):
-    raise ImportError(
-        "marlin FP8 requires some operators from vllm. Please install vllm."
-    )
+    raise ImportError("marlin FP8 requires some operators from vllm. Please install vllm.")
+
 
 apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
@@ -62,13 +62,9 @@ class Fp8Config(QuantizationConfig):
         self.ignored_layers = ignored_layers or []
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
-                )
+                raise ValueError(f"The block-wise quantization only supports fp8-serialized checkpoint for now.")
             if len(weight_block_size) != 2:
-                raise ValueError(
-                    f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
-                )
+                raise ValueError(f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions.")
             if activation_scheme != "dynamic":
                 raise ValueError(
                     f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."

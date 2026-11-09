@@ -12,9 +12,7 @@ class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
 
     @abstractmethod
-    def create_weights(
-        self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
-    ):
+    def create_weights(self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs):
         """Create weights for a layer.
 
         The weights will be set as attributes of the layer."""
@@ -87,9 +85,7 @@ class QuantizationConfig(ABC):
         for key in keys:
             if key in config:
                 return config[key]
-        raise ValueError(
-            f"Cannot find any of {keys} in the model's " "quantization config."
-        )
+        raise ValueError(f"Cannot find any of {keys} in the model's quantization config.")
 
     @staticmethod
     def get_from_keys_or(config: Dict[str, Any], keys: List[str], default: Any) -> Any:
@@ -165,7 +161,6 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 class FusedMoEMethodBase(QuantizeMethodBase):
-
     @abstractmethod
     def create_weights(
         self,

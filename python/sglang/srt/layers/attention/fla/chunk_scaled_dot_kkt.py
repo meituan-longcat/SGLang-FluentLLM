@@ -47,20 +47,14 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
     o_t = tl.arange(0, BT)
 
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_beta = tl.load(p_beta, boundary_check=(0,))
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
@@ -78,17 +72,13 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
 
     if USE_G:
-        p_g = tl.make_block_ptr(
-            g_cumsum + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-        )
+        p_g = tl.make_block_ptr(g_cumsum + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * safe_exp(b_g_diff)
 
     b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0)
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
+    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -127,9 +117,7 @@ def chunk_scaled_dot_kkt_fwd(
 
     H = beta.shape[-1]
     BT = chunk_size
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     A = torch.empty(B, T, H, BT, device=k.device, dtype=output_dtype)
     chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
@@ -144,7 +132,7 @@ def chunk_scaled_dot_kkt_fwd(
         Hg=Hg,
         K=K,
         BT=BT,
-        BK=64,
+        BK=128,
         num_warps=8,
         num_stages=3,
     )

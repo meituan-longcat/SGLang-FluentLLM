@@ -17,7 +17,6 @@ import json
 import multiprocessing
 import os
 import time
-from typing import Tuple
 
 import numpy as np
 import requests
@@ -30,9 +29,9 @@ from sglang.srt.utils import kill_process_tree
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
-    batch_size: Tuple[int] = (1,)
-    input_len: Tuple[int] = (1024,)
-    output_len: Tuple[int] = (16,)
+    batch_size: tuple[int] = (1,)
+    input_len: tuple[int] = (1024,)
+    output_len: tuple[int] = (16,)
     result_filename: str = "result.jsonl"
     base_url: str = ""
     skip_warmup: bool = False
@@ -40,18 +39,10 @@ class BenchArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
-        parser.add_argument(
-            "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
-        )
-        parser.add_argument(
-            "--input-len", type=int, nargs="+", default=BenchArgs.input_len
-        )
-        parser.add_argument(
-            "--output-len", type=int, nargs="+", default=BenchArgs.output_len
-        )
-        parser.add_argument(
-            "--result-filename", type=str, default=BenchArgs.result_filename
-        )
+        parser.add_argument("--batch-size", type=int, nargs="+", default=BenchArgs.batch_size)
+        parser.add_argument("--input-len", type=int, nargs="+", default=BenchArgs.input_len)
+        parser.add_argument("--output-len", type=int, nargs="+", default=BenchArgs.output_len)
+        parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument("--skip-warmup", action="store_true")
 
@@ -59,9 +50,7 @@ class BenchArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to case the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
 
 
 def launch_server_internal(server_args):
@@ -85,7 +74,7 @@ def launch_server_process(server_args: ServerArgs):
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
             }
-            response = requests.get(f"{base_url}/v1/models", headers=headers)
+            response = requests.get(f"{base_url}/v1/models", headers=headers, timeout=600)
             if response.status_code == 200:
                 return proc, base_url
         except requests.RequestException:
@@ -102,10 +91,7 @@ def run_one_case(
     run_name: str,
     result_filename: str,
 ):
-    input_ids = [
-        [int(x) for x in np.random.randint(0, high=16384, size=(input_len,))]
-        for _ in range(batch_size)
-    ]
+    input_ids = [[int(x) for x in np.random.randint(0, high=16384, size=(input_len,))] for _ in range(batch_size)]
 
     tic = time.time()
     response = requests.post(
@@ -118,6 +104,7 @@ def run_one_case(
                 "ignore_eos": True,
             },
         },
+        timeout=3600,
     )
     latency = time.time() - tic
 
@@ -163,9 +150,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     # benchmark
     try:
-        for bs, il, ol in itertools.product(
-            bench_args.batch_size, bench_args.input_len, bench_args.output_len
-        ):
+        for bs, il, ol in itertools.product(bench_args.batch_size, bench_args.input_len, bench_args.output_len):
             run_one_case(
                 base_url,
                 bs,

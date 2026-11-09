@@ -13,29 +13,30 @@
 # ==============================================================================
 
 """Inference-only Qwen3Next MTP Speculative Decoding."""
+
 import logging
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.layers.layernorm import GemmaRMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.embedding.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_next import Qwen3NextForCausalLM, Qwen3NextModel
+from sglang.srt.ops.layernorm import GemmaRMSNorm
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
 
 class Qwen3NextForCausalLMNextN(Qwen3NextForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -55,15 +56,11 @@ class Qwen3NextForCausalLMNextN(Qwen3NextForCausalLM):
         # (2) hardcode bias=False since not provided
         self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         RMSNorm_cls = GemmaRMSNorm
-        self.pre_fc_norm_embedding = RMSNorm_cls(
-            config.hidden_size, config.rms_norm_eps
-        )
+        self.pre_fc_norm_embedding = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
         config.num_hidden_layers = 1
         config.full_attention_interval = 1
-        self.model = Qwen3NextModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = Qwen3NextModel(config, quant_config, prefix=add_prefix("model", prefix))
         if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
@@ -105,13 +102,9 @@ class Qwen3NextForCausalLMNextN(Qwen3NextForCausalLM):
             hidden_states,
         )
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
-    ):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False):
         super().load_weights(weights, is_mtp=True)
 
 

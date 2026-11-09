@@ -10,4 +10,3 @@ __all__ = [
     "CompressedTensorsWNA16",
     "WNA16_SUPPORTED_BITS",
 ]
-

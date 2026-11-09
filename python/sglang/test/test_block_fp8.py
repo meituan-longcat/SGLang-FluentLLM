@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.ops.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import (
     per_token_group_quant_fp8,

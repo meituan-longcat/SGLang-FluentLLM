@@ -68,9 +68,7 @@ def _fwd_kernel_flash_decode_stage1(
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
     cur_batch_start_index = seq_start_block * BLOCK_SEQ
-    cur_batch_end_index = tl.minimum(
-        cur_batch_seq_len, cur_batch_start_index + BLOCK_SEQ
-    )
+    cur_batch_end_index = tl.minimum(cur_batch_seq_len, cur_batch_start_index + BLOCK_SEQ)
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
@@ -99,15 +97,11 @@ def _fwd_kernel_flash_decode_stage1(
             other=0,
         )
         off_k = k_loc[:, None] * stride_kbs + cur_kv_head * stride_kh + offs_d[None, :]
-        k = tl.load(
-            K + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0
-        )
+        k = tl.load(K + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)
         att_value = tl.sum(q[None, :] * k, 1)
         att_value *= sm_scale
         att_value = tl.where(offs_n_new < cur_batch_end_index, att_value, float("-inf"))
-        v = tl.load(
-            V + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0
-        )
+        v = tl.load(V + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)
 
         cur_max_logic = tl.max(att_value, axis=0)
         new_max_logic = tl.maximum(cur_max_logic, max_logic)
@@ -122,15 +116,8 @@ def _fwd_kernel_flash_decode_stage1(
 
     need_store = tl.where(block_n_size == 0, 0, 1)
     for _ in range(0, need_store, 1):
-        off_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + seq_start_block * stride_mid_os
-            + offs_d
-        )
-        off_mid_o_logexpsum = (
-            cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
-        )
+        off_mid_o = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + seq_start_block * stride_mid_os + offs_d
+        off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
         tl.store(Mid_O + off_mid_o, acc / sum_exp)
         tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp))
     return
@@ -141,7 +128,7 @@ def _fwd_kernel_flash_decode_stage2(
     B_Seqlen,
     Mid_O,  # [batch, head, seq_block_num, head_dim]
     Mid_O_LogExpSum,  # [batch, head, seq_block_num]
-    O,  # [batch, head, head_dim]
+    Out,  # [batch, head, head_dim]
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -161,10 +148,7 @@ def _fwd_kernel_flash_decode_stage2(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
 
-    block_n_size = (
-        tl.where(cur_batch_seq_len <= 0, 0, cur_batch_seq_len + BLOCK_SEQ - 1)
-        // BLOCK_SEQ
-    )
+    block_n_size = tl.where(cur_batch_seq_len <= 0, 0, cur_batch_seq_len + BLOCK_SEQ - 1) // BLOCK_SEQ
 
     sum_exp = 0.0
     max_logic = -float("inf")
@@ -184,7 +168,7 @@ def _fwd_kernel_flash_decode_stage2(
         sum_exp = sum_exp * old_scale + exp_logic
         max_logic = new_max_logic
 
-    tl.store(O + cur_batch * stride_obs + cur_head * stride_oh + offs_d, acc / sum_exp)
+    tl.store(Out + cur_batch * stride_obs + cur_head * stride_oh + offs_d, acc / sum_exp)
     return
 
 
@@ -252,7 +236,7 @@ def flash_decode_stage1(
 
 
 @torch.no_grad()
-def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
+def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, out, block_seq):
     Lk = mid_out.shape[-1]
     assert Lk in {16, 32, 64, 128}
     batch, head_num = mid_out.shape[0], mid_out.shape[1]
@@ -262,7 +246,7 @@ def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
         B_Seqlen,
         mid_out,
         mid_out_logexpsum,
-        O,
+        out,
         mid_out.stride(0),
         mid_out.stride(1),
         mid_out.stride(2),
@@ -270,9 +254,9 @@ def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
         mid_out_logexpsum.stride(0),
         mid_out_logexpsum.stride(1),
         mid_out_logexpsum.stride(2),
-        O.stride(0),
-        O.stride(1),
-        O.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=Lk,
         num_warps=4,
@@ -296,7 +280,6 @@ def flash_decode_attention_fwd(
     logit_cap=0.0,
 ):
     BLOCK_SEQ = 256
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
     # batch_size = q.shape[0]
 
     block_seq_num = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
@@ -306,9 +289,7 @@ def flash_decode_attention_fwd(
         dtype=torch.float32,
         device="cuda",
     )
-    mid_o_logexpsum = torch.empty(
-        [q.shape[0], q.shape[1], block_seq_num], dtype=torch.float32, device="cuda"
-    )
+    mid_o_logexpsum = torch.empty([q.shape[0], q.shape[1], block_seq_num], dtype=torch.float32, device="cuda")
 
     flash_decode_stage1(
         q,
@@ -375,11 +356,7 @@ def _sparse_fwd_kernel_flash_decode_stage1(  # Double Sparsity's approximate att
             mask=offs_n_new < cur_batch_end_index,
             other=0,
         )
-        offs_buf_k = (
-            k_loc[:, None] * stride_buf_kbs
-            + cur_kv_head * stride_buf_kh
-            + offs_d[None, :]
-        )
+        offs_buf_k = k_loc[:, None] * stride_buf_kbs + cur_kv_head * stride_buf_kh + offs_d[None, :]
         k = tl.load(
             K_Label_Buffer + offs_buf_k,
             mask=offs_n_new[:, None] < cur_batch_end_index,
@@ -438,15 +415,6 @@ def _sparse_fwd_kernel_flash_decode_stage2(
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
-    block_n_size = (
-        tl.where(
-            cur_batch_end_index - cur_batch_start_index <= 0,
-            0,
-            cur_batch_end_index - cur_batch_start_index + BLOCK_N - 1,
-        )
-        // BLOCK_N
-    )
-
     # offs_n = cur_batch_start_index + tl.arange(0, BLOCK_N)
     offs_n = tl.arange(0, BLOCK_N)
 
@@ -462,10 +430,7 @@ def _sparse_fwd_kernel_flash_decode_stage2(
         offs_n_new = start_n + offs_n
         # offs_n_new = cur_batch_start_index + start_n * BLOCK_N + offs_n
         topk_token_indices = tl.load(
-            Topk_token_indices
-            + stride_topk_token_indices_h * cur_head
-            + stride_topk_token_indices_b * cur_batch
-            + offs_n_new,
+            Topk_token_indices + stride_topk_token_indices_h * cur_head + stride_topk_token_indices_b * cur_batch + offs_n_new,
             mask=offs_n_new < cur_batch_end_index,
             other=0,
         )
@@ -475,15 +440,11 @@ def _sparse_fwd_kernel_flash_decode_stage2(
             other=0,
         )
         off_k = k_loc[:, None] * stride_kbs + cur_kv_head * stride_kh + offs_d[None, :]
-        k = tl.load(
-            K + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0
-        )
+        k = tl.load(K + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)
         att_value = tl.sum(q[None, :] * k, 1)
         att_value *= sm_scale
         att_value = tl.where(offs_n_new < cur_batch_end_index, att_value, float("-inf"))
-        v = tl.load(
-            V + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0
-        )
+        v = tl.load(V + off_k, mask=offs_n_new[:, None] < cur_batch_end_index, other=0.0)
 
         cur_max_logic = tl.max(att_value, axis=0)
         new_max_logic = tl.maximum(cur_max_logic, max_logic)
@@ -499,15 +460,8 @@ def _sparse_fwd_kernel_flash_decode_stage2(
     # need_store = tl.where(block_n_size == 0, 0, 1)
     need_store = 1
     for _ in range(0, need_store, 1):
-        off_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + seq_start_block * stride_mid_os
-            + offs_d
-        )
-        off_mid_o_logexpsum = (
-            cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
-        )
+        off_mid_o = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + seq_start_block * stride_mid_os + offs_d
+        off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh + seq_start_block
         tl.store(Mid_O + off_mid_o, acc / sum_exp)
         tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp))
     return
@@ -517,7 +471,7 @@ def _sparse_fwd_kernel_flash_decode_stage2(
 def _sparse_fwd_kernel_flash_decode_stage3(
     Mid_O,  # [batch, head, seq_block_num, head_dim]
     Mid_O_LogExpSum,  # [batch, head, seq_block_num]
-    O,  # [batch, head, head_dim]
+    Out,  # [batch, head, head_dim]
     seq_len,  # NOTE: This can be used as constexpr but we may support dynamic heavy token number in the future
     stride_mid_ob,
     stride_mid_oh,
@@ -554,7 +508,7 @@ def _sparse_fwd_kernel_flash_decode_stage3(
         sum_exp = sum_exp * old_scale + exp_logic
         max_logic = new_max_logic
 
-    tl.store(O + cur_batch * stride_obs + cur_head * stride_oh + offs_d, acc / sum_exp)
+    tl.store(Out + cur_batch * stride_obs + cur_head * stride_oh + offs_d, acc / sum_exp)
     return
 
 
@@ -581,10 +535,7 @@ def sparse_flash_decode_stage1(
     grid = (batch, head_num, triton.cdiv(max_len_in_batch, BLOCK))
     kv_group_num = q_label.shape[1] // k_label_buffer.shape[1]
 
-    if kv_group_num == 1:
-        num_warps = 4
-    else:
-        num_warps = 2
+    num_warps = 4 if kv_group_num == 1 else 2
 
     _sparse_fwd_kernel_flash_decode_stage1[grid](
         q_label,
@@ -671,7 +622,7 @@ def sparse_flash_decode_stage2(
 
 
 @torch.no_grad()
-def sparse_flash_decode_stage3(Seqlen, mid_out, mid_out_logexpsum, O, block_seq):
+def sparse_flash_decode_stage3(Seqlen, mid_out, mid_out_logexpsum, out, block_seq):
     Lk = mid_out.shape[-1]
     assert Lk in {16, 32, 64, 128}
     batch, head_num = mid_out.shape[0], mid_out.shape[1]
@@ -680,15 +631,15 @@ def sparse_flash_decode_stage3(Seqlen, mid_out, mid_out_logexpsum, O, block_seq)
     _sparse_fwd_kernel_flash_decode_stage3[grid](
         mid_out,
         mid_out_logexpsum,
-        O,
+        out,
         Seqlen,
         mid_out.stride(0),
         mid_out.stride(1),
         mid_out.stride(2),
         mid_out_logexpsum.stride(0),
         mid_out_logexpsum.stride(1),
-        O.stride(0),
-        O.stride(1),
+        out.stride(0),
+        out.stride(1),
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=Lk,
         num_warps=4,
@@ -716,7 +667,6 @@ def flash_decode_sparse_attention_fwd(
     BLOCK_SEQ=256,
 ):
     # TODO(Andy): Tune BLOCK_SEQ & BLOCK_D
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
     # batch_size = q.shape[0]
 
     # Step 1: BGEMV approximate attention (page implementation)
@@ -836,24 +786,12 @@ def _fwd_kernel(
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
 
-    offs_q = (
-        (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_qbs
-        + cur_head * stride_qh
-        + offs_d[None, :]
-    )
-    q = tl.load(
-        Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0
-    )
+    offs_q = (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qbs + cur_head * stride_qh + offs_d[None, :]
+    q = tl.load(Q_Extend + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0)
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
-        offs_qpe = (
-            (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
-            * stride_qbs
-            + cur_head * stride_qh
-            + offs_dpe[None, :]
-        )
+        offs_qpe = (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qbs + cur_head * stride_qh + offs_dpe[None, :]
         qpe = tl.load(Q_Extend + offs_qpe, mask=mask_m[:, None], other=0.0)
 
     # stage 1: compute scores with prefix
@@ -866,28 +804,16 @@ def _fwd_kernel(
     for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
-        offs_b_loc_prefix = cur_batch_req_idx * stride_req_to_tokens_b + (
-            cur_seq_prefix_start_in_loc + start_n + offs_n
-        )
+        offs_b_loc_prefix = cur_batch_req_idx * stride_req_to_tokens_b + (cur_seq_prefix_start_in_loc + start_n + offs_n)
         offs_kv_loc = tl.load(Req_to_tokens + offs_b_loc_prefix, mask=mask_n, other=0)
 
         # load k in transposed way
-        offs_buf_k = (
-            offs_kv_loc[None, :] * stride_buf_kbs
-            + cur_kv_head * stride_buf_kh
-            + offs_d[:, None]
-        )
-        k = tl.load(
-            K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-        )
+        offs_buf_k = offs_kv_loc[None, :] * stride_buf_kbs + cur_kv_head * stride_buf_kh + offs_d[:, None]
+        k = tl.load(K_Buffer + offs_buf_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0)
 
         qk = tl.dot(q.to(k.dtype), k)
         if BLOCK_DPE > 0:
-            offs_kpe = (
-                offs_kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_dpe[:, None]
-            )
+            offs_kpe = offs_kv_loc[None, :] * stride_buf_kbs + cur_kv_head * stride_buf_kh + offs_dpe[:, None]
             kpe = tl.load(
                 K_Buffer + offs_kpe,
                 mask=mask_n[None, :],
@@ -906,14 +832,8 @@ def _fwd_kernel(
         p = tl.exp(qk - n_e_max[:, None])
         deno = deno * re_scale + tl.sum(p, 1)
 
-        offs_buf_v = (
-            offs_kv_loc[:, None] * stride_buf_vbs
-            + cur_kv_head * stride_buf_vh
-            + offs_dv[None, :]
-        )
-        v = tl.load(
-            V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-        )
+        offs_buf_v = offs_kv_loc[:, None] * stride_buf_vbs + cur_kv_head * stride_buf_vh + offs_dv[None, :]
+        v = tl.load(V_Buffer + offs_buf_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
@@ -927,23 +847,12 @@ def _fwd_kernel(
         mask_n = (start_n + offs_n) < cur_block_m_end
 
         # load k in transposed way
-        offs_k = (
-            (cur_seq_extend_start_contiguous + start_n + offs_n[None, :]) * stride_kbs
-            + cur_kv_head * stride_kh
-            + offs_d[:, None]
-        )
-        k = tl.load(
-            K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
-        )
+        offs_k = (cur_seq_extend_start_contiguous + start_n + offs_n[None, :]) * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None]
+        k = tl.load(K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0)
 
         qk = tl.dot(q, k, out_dtype=tl.float32)
         if BLOCK_DPE > 0:
-            offs_kpe = (
-                (cur_seq_extend_start_contiguous + start_n + offs_n[None, :])
-                * stride_kbs
-                + cur_kv_head * stride_kh
-                + offs_dpe[:, None]
-            )
+            offs_kpe = (cur_seq_extend_start_contiguous + start_n + offs_n[None, :]) * stride_kbs + cur_kv_head * stride_kh + offs_dpe[:, None]
             kpe = tl.load(
                 K_Extend + offs_kpe,
                 mask=mask_n[None, :],
@@ -956,9 +865,7 @@ def _fwd_kernel(
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
 
-        mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
-            start_n + offs_n[None, :]
-        )
+        mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (start_n + offs_n[None, :])
         mask_causual &= mask_m[:, None] & mask_n[None, :]
         qk = tl.where(mask_causual, qk, float("-inf"))
 
@@ -967,28 +874,15 @@ def _fwd_kernel(
         p = tl.exp(qk - n_e_max[:, None])
         deno = deno * re_scale + tl.sum(p, 1)
 
-        offs_v = (
-            (cur_seq_extend_start_contiguous + start_n + offs_n[:, None]) * stride_vbs
-            + cur_kv_head * stride_vh
-            + offs_dv[None, :]
-        )
-        v = tl.load(
-            V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
-        )
+        offs_v = (cur_seq_extend_start_contiguous + start_n + offs_n[:, None]) * stride_vbs + cur_kv_head * stride_vh + offs_dv[None, :]
+        v = tl.load(V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0)
         p = p.to(v.dtype)
         acc = acc * re_scale[:, None] + tl.dot(p, v)
 
         e_max = n_e_max
 
-    offs_o = (
-        (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None])
-        * stride_obs
-        + cur_head * stride_oh
-        + offs_dv[None, :]
-    )
-    tl.store(
-        O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :]
-    )
+    offs_o = (cur_seq_extend_start_contiguous + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs + cur_head * stride_oh + offs_dv[None, :]
+    tl.store(O_Extend + offs_o, acc / deno[:, None], mask=mask_m[:, None] & mask_dv[None, :])
 
 
 def extend_attention_fwd(

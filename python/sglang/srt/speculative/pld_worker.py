@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
+from flashinfer import ngram_matching
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.scheduling.schedule_batch import ModelWorkerBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
 )
-from sglang.srt.utils import get_colorful_logger
-from sglang.srt.oe_utils import update_token_table
 from sglang.srt.speculative.base_spec_worker import BaseSpecDeocdingWorker
 from sglang.srt.speculative.pld_cuda_graph_runner import PLDCudaGraphRunner
-from flashinfer import ngram_matching
+from sglang.srt.utils import get_colorful_logger
+from sglang.srt.utils.oe_utils import update_token_table
 
 logger = get_colorful_logger(__name__)
 
@@ -61,39 +61,21 @@ class PLDWorker(BaseSpecDeocdingWorker):
         max_context_len = self.target_worker.model_runner.model_config.context_len
 
         with torch.device(self.device):
-            self.context_tokens = torch.zeros(
-                (max_bs, max_context_len), dtype=torch.int32
-            )
+            self.context_tokens = torch.zeros((max_bs, max_context_len), dtype=torch.int32)
             self.context_lens = torch.zeros((max_bs,), dtype=torch.int32)
             self.accept_lengths_buffer = torch.zeros((max_bs,), dtype=torch.int32)
-            self.verified_tokens_buffer = torch.zeros(
-                (max_bs * draft_token_num,), dtype=torch.int32
-            )
-            self.draft_tokens_output = torch.zeros(
-                (max_bs, draft_token_num - 1), dtype=torch.int32
-            )
+            self.verified_tokens_buffer = torch.zeros((max_bs * draft_token_num,), dtype=torch.int32)
+            self.draft_tokens_output = torch.zeros((max_bs, draft_token_num - 1), dtype=torch.int32)
             self.ngram_min_n = self.server_args.prompt_lookup_min
             self.ngram_max_n = self.server_args.prompt_lookup_max
 
-    def forward_decode_spec(
-        self, forward_batch: ForwardBatch, vocab_masks: Optional[torch.Tensor] = None
-    ):
+    def forward_decode_spec(self, forward_batch: ForwardBatch, vocab_masks: Optional[torch.Tensor] = None):
         if self.use_over_embedding:
-            forward_batch.oe_column_starts[: forward_batch.batch_size] = (
-                forward_batch.req_to_token_pool.verified_lens[
-                    forward_batch.req_pool_indices
-                ]
-            )
-            forward_batch.oe_req_lens[: forward_batch.batch_size] = (
-                self.server_args.speculative_num_draft_tokens
-            )
+            forward_batch.oe_column_starts[: forward_batch.batch_size] = forward_batch.req_to_token_pool.verified_lens[forward_batch.req_pool_indices]
+            forward_batch.oe_req_lens[: forward_batch.batch_size] = self.server_args.speculative_num_draft_tokens
             bs = forward_batch.batch_size
             num_verify_tokens = self.server_args.speculative_num_draft_tokens
-            forward_batch.oe_out_column_starts[:bs] = (
-                forward_batch.req_to_token_pool.verified_lens[
-                    forward_batch.req_pool_indices
-                ]
-            )
+            forward_batch.oe_out_column_starts[:bs] = forward_batch.req_to_token_pool.verified_lens[forward_batch.req_pool_indices]
             forward_batch.oe_out_req_lens[:bs] = num_verify_tokens
             update_token_table(
                 oe_token_table=forward_batch.oe_token_table,
@@ -102,19 +84,11 @@ class PLDWorker(BaseSpecDeocdingWorker):
                 column_starts=forward_batch.oe_out_column_starts,
                 oe_req_lens=forward_batch.oe_out_req_lens,
             )
-        logits_output = self.target_worker.model_runner.forward_extend(
-            forward_batch, skip_metadata_init=True
-        )
-        target_predict, logits_output, accept_length, accept_index = (
-            self.rejection_sampling(forward_batch, logits_output, vocab_masks)
-        )
+        logits_output = self.target_worker.model_runner.forward_extend(forward_batch, skip_metadata_init=True)
+        target_predict, logits_output, accept_length, accept_index = self.rejection_sampling(forward_batch, logits_output, vocab_masks)
         if self.use_over_embedding:
             bs = forward_batch.batch_size
-            forward_batch.oe_out_column_starts[:bs] = (
-                forward_batch.req_to_token_pool.verified_lens[
-                    forward_batch.req_pool_indices
-                ]
-            )
+            forward_batch.oe_out_column_starts[:bs] = forward_batch.req_to_token_pool.verified_lens[forward_batch.req_pool_indices]
             forward_batch.oe_out_req_lens[:bs] = accept_length
 
             update_token_table(
@@ -124,20 +98,15 @@ class PLDWorker(BaseSpecDeocdingWorker):
                 column_starts=forward_batch.oe_out_column_starts,
                 oe_req_lens=forward_batch.oe_out_req_lens,
             )
-        new_verified_id = self.preprocess_for_draft_after_decode(
-            forward_batch, accept_length, accept_index, target_predict, with_draft_model=False
-        )
-
         output_ids = target_predict[accept_index]
+        # Compute logprobs for accepted tokens (must be before preprocess_for_draft_after_decode)
+        self.compute_spec_logprobs(forward_batch, logits_output, accept_index, accept_length, output_ids)
+        new_verified_id = self.preprocess_for_draft_after_decode(forward_batch, accept_length, accept_index, target_predict, with_draft_model=False)
 
         req_pool_indices = forward_batch.req_pool_indices
-        self.target_worker.model_runner.req_to_token_pool.verified_lens[
-            req_pool_indices
-        ] += accept_length
+        self.target_worker.model_runner.req_to_token_pool.verified_lens[req_pool_indices] += accept_length
 
-        token_list = self.propose(
-            forward_batch, target_predict, accept_length
-        )
+        token_list = self.propose(forward_batch, target_predict, accept_length)
         return (
             logits_output,
             output_ids,
@@ -146,24 +115,14 @@ class PLDWorker(BaseSpecDeocdingWorker):
             token_list,
         )
 
-    def forward_prefill_spec(
-        self, model_worker_batch: ModelWorkerBatch, forward_batch: ForwardBatch
-    ):
+    def forward_prefill_spec(self, model_worker_batch: ModelWorkerBatch, forward_batch: ForwardBatch):
         """Handle prefill phase."""
         if self.use_over_embedding:
-            forward_batch.oe_column_starts[: forward_batch.batch_size] = (
-                forward_batch.extend_prefix_lens
-            )
-            forward_batch.oe_req_lens[: forward_batch.batch_size] = (
-                forward_batch.extend_seq_lens
-            )
-        target_logits_output = self.target_worker.model_runner.forward_extend(
-            forward_batch, skip_metadata_init=True
-        )
+            forward_batch.oe_column_starts[: forward_batch.batch_size] = forward_batch.extend_prefix_lens
+            forward_batch.oe_req_lens[: forward_batch.batch_size] = forward_batch.extend_seq_lens
+        target_logits_output = self.target_worker.model_runner.forward_extend(forward_batch, skip_metadata_init=True)
 
-        next_token_ids = self.target_worker.model_runner.sample(
-            target_logits_output, forward_batch
-        )
+        next_token_ids = self.target_worker.model_runner.sample(target_logits_output, forward_batch)
 
         if model_worker_batch.disagg_set_aux_fn is not None:
             model_worker_batch.disagg_set_aux_fn(next_token_ids, target_logits_output)
@@ -173,12 +132,8 @@ class PLDWorker(BaseSpecDeocdingWorker):
         self._copy_context_to_buffers(forward_batch, bs)
 
         req_pool_indices = forward_batch.req_pool_indices
-        self.target_worker.model_runner.req_to_token_pool.verified_lens[
-            req_pool_indices
-        ] += forward_batch.new_tokens_to_compute
-        accept_lengths_for_kernel = torch.ones(
-            bs, dtype=torch.int32, device=self.device
-        )
+        self.target_worker.model_runner.req_to_token_pool.verified_lens[req_pool_indices] += forward_batch.new_tokens_to_compute
+        accept_lengths_for_kernel = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         # In prefill, next_token_ids is 1D [bs], but _ngram_matching_kernel expects
         # verified_tokens to be in the format that can be indexed by [bs * draft_token_num]
@@ -195,9 +150,7 @@ class PLDWorker(BaseSpecDeocdingWorker):
         for i in range(bs):
             verified_tokens_for_kernel[i * draft_token_num] = next_token_ids[i]
 
-        token_list = self.propose(
-            forward_batch, verified_tokens_for_kernel, accept_lengths_for_kernel
-        )
+        token_list = self.propose(forward_batch, verified_tokens_for_kernel, accept_lengths_for_kernel)
 
         return (
             target_logits_output,
@@ -209,9 +162,7 @@ class PLDWorker(BaseSpecDeocdingWorker):
 
     def forward_idle(self, forward_batch: ForwardBatch):
         logits_output = self.target_worker.model_runner.forward(forward_batch)
-        next_token_ids = self.target_worker.model_runner.sample(
-            logits_output, forward_batch
-        )
+        next_token_ids = self.target_worker.model_runner.sample(logits_output, forward_batch)
 
         from sglang.srt.speculative.eagle_utils import EagleDraftOutput
 
@@ -227,7 +178,7 @@ class PLDWorker(BaseSpecDeocdingWorker):
         forward_batch: ForwardBatch,
         verified_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         """
         Unified n-gram matching using CUDA kernel.
         Returns EAGLE-compatible format: (scores_list, token_list, parents_list)

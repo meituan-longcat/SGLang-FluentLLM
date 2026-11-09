@@ -38,8 +38,9 @@ NUM_REQUESTS="100"
 OUTPUT_DIR="./benchmark_results/$(date +%Y%m%d_%H%M%S)"
 QUICK_TEST=false
 TIMEOUT=3600  # 1 hour timeout per test
-DATASET_PATH=""
-MODEL_PATH="/mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/Qwen/Qwen3-4B-Instruct-2507/main"
+# Environment defaults; command-line arguments take precedence.
+DATASET_PATH="${DATASET_PATH:-}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
 DEBUG=false
 FAIL_ON_ERROR=true
 MAX_RETRIES=3
@@ -156,8 +157,8 @@ Optional Arguments:
   --output-dir DIR          Output directory for results (default: ./benchmark_results/TIMESTAMP)
   --quick-test              Run quick test with 100 requests and 10min timeout
   --timeout SECONDS         Timeout per test in seconds (default: 3600)
-  --dataset-path PATH       Path to ShareGPT dataset (auto-detected if not specified)
-  --model-path PATH         Model path for tokenizer (default: meta-llama/Llama-3.1-8B-Instruct)
+  --dataset-path PATH       ShareGPT path (default: DATASET_PATH, otherwise auto-detected)
+  --model-path PATH         Model path or ID (default: MODEL_PATH or Qwen/Qwen3-4B-Instruct-2507)
   --debug                   Enable debug output
   --continue-on-error       Continue running other tests if one fails
   --max-retries N           Maximum retries per test (default: 3)
@@ -324,9 +325,8 @@ detect_dataset_path() {
     fi
 
     local common_paths=(
-        "/data/models/ShareGPT_V3_unfiltered_cleaned_split/ShareGPT_V3_unfiltered_cleaned_split.json"
         "./ShareGPT_V3_unfiltered_cleaned_split.json"
-        "~/.cache/huggingface/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
+        "${HF_HOME:-$HOME/.cache/huggingface}/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
     )
 
     for path in "${common_paths[@]}"; do

@@ -68,11 +68,7 @@ class MoELayout:
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
         weight_loader = partial(
-            load_model_weight,
-            tp_rank=get_moe_tensor_parallel_rank(),
-            is_bias=False,
-            use_presharded_weights=False,
-            do_transpose=False
+            load_model_weight, tp_rank=get_moe_tensor_parallel_rank(), is_bias=False, use_presharded_weights=False, do_transpose=False
         )  # FIXME
         set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
         set_weight_attrs(w2_weight, {"weight_loader": weight_loader})

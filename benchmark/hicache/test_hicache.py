@@ -23,24 +23,24 @@ HiCache PD 分离模式测试
 import argparse
 import json
 import os
+import queue
 import random
 import re
 import subprocess
 import sys
-import time
 import threading
-import queue
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+import time
+from dataclasses import asdict, dataclass
+
 import numpy as np
 import requests
-
 
 # 配置
 PAGE_SIZE = 64
 LB_URL = "http://0.0.0.0:8192"
-PREFILL_LOG = "/home/lijunjie78/fluentllm/logs/pr.log"
-DECODE_LOG = "/home/lijunjie78/fluentllm/logs/de.log"
+# 默认与 launch_hicache_pd.sh 的相对日志目录保持一致，可通过环境变量覆盖。
+PREFILL_LOG = os.environ.get("PREFILL_LOG") or "logs/pr.log"
+DECODE_LOG = os.environ.get("DECODE_LOG") or "logs/de.log"
 
 np.random.seed(1234)
 random.seed(1234)
@@ -52,7 +52,7 @@ class TestResult:
     test_name: str
     status: str
     message: str
-    metrics: Dict = None
+    metrics: dict = None
     timestamp: float = 0.0
 
 
@@ -72,16 +72,16 @@ class HiCacheTestSuite:
         try:
             response = requests.get(f"{LB_URL}/health", timeout=5)
             if response.status_code == 200:
-                print(f"✅ Load Balancer 已就绪")
+                print("✅ Load Balancer 已就绪")
                 return True
             else:
-                print(f"❌ Load Balancer 未就绪")
+                print("❌ Load Balancer 未就绪")
                 return False
         except Exception as e:
             print(f"❌ 连接失败: {e}")
             return False
     
-    def send_request(self, prompt: str, max_new_tokens: int = 32) -> Tuple[Dict, float]:
+    def send_request(self, prompt: str, max_new_tokens: int = 32) -> tuple[dict, float]:
         """发送请求并返回响应和延迟"""
         try:
             start_time = time.time()
@@ -125,7 +125,7 @@ class HiCacheTestSuite:
             print(f"❌ 读取日志失败: {e}")
             return ""
     
-    def analyze_prefill_cache(self, log_tail: str) -> Dict:
+    def analyze_prefill_cache(self, log_tail: str) -> dict:
         """分析 Prefill 的缓存使用情况"""
         metrics = {
             "new_tokens": 0,
@@ -194,7 +194,7 @@ class HiCacheTestSuite:
             prefill_log = self.get_log_tail(PREFILL_LOG, 500)
             prefill_metrics = self.analyze_prefill_cache(prefill_log)
             
-            print(f"\n📊 分析结果:")
+            print("\n📊 分析结果:")
             print(f"   Prefill 新 token: {prefill_metrics['new_tokens']}")
             print(f"   Prefill 缓存 token: {prefill_metrics['cached_tokens']}")
             print(f"   Prefill 预取尝试: {prefill_metrics['prefetch_attempted']}")
@@ -239,7 +239,7 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="full_prefix_reuse",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
@@ -272,7 +272,7 @@ class HiCacheTestSuite:
             
             # 第二轮对话 - 使用第一轮的输入+输出
             prompt2 = base_prompt + " " + output1
-            print(f"\n📤 第二轮对话...")
+            print("\n📤 第二轮对话...")
             print(f"   提示词长度: ~{len(prompt2.split())} tokens")
             resp2, latency2 = self.send_request(prompt2, max_new_tokens=16)
             output2 = resp2.get("text", "")
@@ -287,7 +287,7 @@ class HiCacheTestSuite:
             
             # 第三轮对话 - 使用第二轮的输入+输出
             prompt3 = prompt2 + " " + output2
-            print(f"\n📤 第三轮对话...")
+            print("\n📤 第三轮对话...")
             print(f"   提示词长度: ~{len(prompt3.split())} tokens")
             resp3, latency3 = self.send_request(prompt3, max_new_tokens=16)
             output3 = resp3.get("text", "")
@@ -303,7 +303,7 @@ class HiCacheTestSuite:
             # 检查是否有 Storage 预取完成
             storage_prefetch_completed = prefill_log.count("Prefetch completed with")
 
-            print(f"\n📊 分析结果:")
+            print("\n📊 分析结果:")
             print(f"   第一轮缓存前缀: {decode_prefix_len_1}")
             print(f"   第二轮缓存前缀: {decode_prefix_len_2}")
             print(f"   第三轮缓存前缀: {decode_prefix_len_3}")
@@ -351,7 +351,7 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="multiturn_conversation",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
@@ -374,7 +374,7 @@ class HiCacheTestSuite:
             extra = resp.get("output_extra_info", {})
             decode_prefix_len = extra.get("decode_prefix_len", 0)
             
-            print(f"\n📊 分析结果:")
+            print("\n📊 分析结果:")
             print(f"   Decode 前缀长度: {decode_prefix_len}")
             print(f"   Page Size: {PAGE_SIZE}")
             
@@ -410,7 +410,7 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="page_alignment",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
@@ -469,7 +469,7 @@ class HiCacheTestSuite:
             while not errors.empty():
                 failed.append(errors.get())
             
-            print(f"\n📊 分析结果:")
+            print("\n📊 分析结果:")
             print(f"   成功请求: {len(successful)}/{num_requests}")
             print(f"   失败请求: {len(failed)}/{num_requests}")
             
@@ -513,7 +513,7 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="concurrent_requests",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
@@ -543,9 +543,9 @@ class HiCacheTestSuite:
                 print(f"      缓存命中: {decode_prefix_len}")
             
             avg_cache = np.mean(cache_hits)
-            print(f"\n📊 分析结果:")
+            print("\n📊 分析结果:")
             print(f"   平均缓存命中: {avg_cache:.1f}")
-            print(f"   预期: 应该很少有缓存命中（< 32）")
+            print("   预期: 应该很少有缓存命中（< 32）")
             
             # 无前缀复用时，缓存命中应该很少
             passed = avg_cache < 32
@@ -574,7 +574,7 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="no_prefix_reuse",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
@@ -615,7 +615,7 @@ class HiCacheTestSuite:
             # 检查Decode是否只读GPU缓存
             decode_reads_gpu = "decode_prefix_len" in decode_log
 
-            print(f"\n📊 缓存分离分析:")
+            print("\n📊 缓存分离分析:")
             print(f"   Prefill 预取完成: {'✅' if has_prefetch_completed else '❌'}")
             print(f"   Prefill 缓存命中: {'✅' if has_cached_tokens else '❌'}")
             print(f"   Prefill 预取尝试: {prefill_metrics['prefetch_attempted']}")
@@ -654,7 +654,7 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="three_level_cache_separation",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
@@ -688,7 +688,7 @@ class HiCacheTestSuite:
             cache_variance = np.std(cache_lengths)
             avg_cache = np.mean(cache_lengths)
             
-            print(f"\n📊 缓存一致性分析:")
+            print("\n📊 缓存一致性分析:")
             print(f"   平均缓存长度: {avg_cache:.1f}")
             print(f"   缓存长度方差: {cache_variance:.1f}")
             print(f"   缓存长度列表: {cache_lengths}")
@@ -721,7 +721,7 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="cache_consistency",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
@@ -757,7 +757,7 @@ class HiCacheTestSuite:
             prefill_log = self.get_log_tail(PREFILL_LOG, 2000)
             eviction_detected = "evict" in prefill_log.lower() or "eviction" in prefill_log.lower()
 
-            print(f"\n📊 缓存驱逐分析:")
+            print("\n📊 缓存驱逐分析:")
             print(f"   缓存命中序列: {cache_hits}")
             print(f"   日志中检测到驱逐: {'✅' if eviction_detected else '⚠️ 未检测到'}")
             
@@ -797,11 +797,11 @@ class HiCacheTestSuite:
             return TestResult(
                 test_name="cache_eviction",
                 status="FAIL",
-                message=f"异常: {str(e)}",
+                message=f"异常: {e!s}",
                 timestamp=time.time()
             )
     
-    def run_all_tests(self) -> List[TestResult]:
+    def run_all_tests(self) -> list[TestResult]:
         """运行所有测试"""
         print("\n" + "="*80)
         print("🚀 HiCache 测试套件")
@@ -831,7 +831,7 @@ class HiCacheTestSuite:
                 self.results.append(TestResult(
                     test_name=test_func.__name__,
                     status="FAIL",
-                    message=f"异常: {str(e)}",
+                    message=f"异常: {e!s}",
                     timestamp=time.time()
                 ))
         

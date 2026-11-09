@@ -8,6 +8,9 @@ if [ "${SM}" = "sm90" ]; then
     export FLASHINFER_CUDA_ARCH_LIST="9.0a"
 elif [ "${SM}" = "sm80" ]; then
     export FLASHINFER_CUDA_ARCH_LIST="8.0"
+elif [ "${SM}" = "sm89" ]; then
+    export FLASHINFER_CUDA_ARCH_LIST="8.9"
+    export TORCH_CUDA_ARCH_LIST="8.9"
 fi
 
 export MAX_JOBS=16
@@ -16,7 +19,7 @@ cd 3rdparty/eps
 pip3 install -v . --no-build-isolation
 cd -
 
-pip3 install build nvidia-nvshmem-cu12 apache-tvm-ffi==0.1.5 nvidia-cudnn-frontend==1.16.0 nvidia-cutlass-dsl==4.3.2 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+pip3 install build nvidia-nvshmem-cu12==3.5.21 apache-tvm-ffi==0.1.6 nvidia-cudnn-frontend==1.16.0 nvidia-cutlass-dsl==4.3.2 tilelang==0.1.7.post3 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 
 echo "install flashinfer"
 pip3 uninstall -y flashinfer-python flashinfer-jit-cache
@@ -83,6 +86,8 @@ if [ ${SM} = "sm90" ]; then
     python3 setup.py install
     cd -
 fi
+
+pip3 install aiofile blake3 awscrt py-cpuinfo numba sortedcontainers
 
 pip3 install openai-harmony==0.0.3 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 unset MAX_JOBS

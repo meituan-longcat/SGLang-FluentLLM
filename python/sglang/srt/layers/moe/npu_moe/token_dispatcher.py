@@ -1,22 +1,22 @@
 import torch
 import torch_npu
 
-from typing import List
-from sglang.srt.utils import get_910b_num_gpus_per_node
-
 from sglang.srt.distributed import get_all2all_ep_group, get_ep_group
 from sglang.srt.env import ENV, global_server_args_dict
+from sglang.srt.utils import get_910b_num_gpus_per_node, get_colorful_logger
+
+logger = get_colorful_logger(__name__)
+
+
+def _is_a2_hierarchy_enabled():
+    return (
+        global_server_args_dict.get("npu_enable_a2_dispatch_combine_opt", False)
+        and get_910b_num_gpus_per_node() > 0
+    )
 
 
 class TokensDispatcherAgRs:
-    def __init__(
-            self,
-            layer,
-            num_experts: int,
-            zero_expert_num: int,
-            ep_size: int,
-            ep_rank: int,
-            quant: bool=False) -> None:
+    def __init__(self, layer, num_experts: int, zero_expert_num: int, ep_size: int, ep_rank: int, quant: bool = False) -> None:
         """
         Initialize the zero token dropping router.
         """
@@ -26,6 +26,7 @@ class TokensDispatcherAgRs:
         self.expert_idx_min = ep_rank * (num_experts // ep_size)
         self.expert_idx_max = self.expert_idx_min + (num_experts // ep_size)
         self.ep_group = get_ep_group()
+        self.is_dynamic_w4a4 = getattr(layer, "is_dynamic_w4a4", False)
 
     def pre_comm(self, hidden_states, sp_num_tokens=None):
         if not isinstance(hidden_states, (list, tuple)):
@@ -35,15 +36,36 @@ class TokensDispatcherAgRs:
             result.append(get_ep_group().all_gather(tensor, dim=0, output_split_sizes=sp_num_tokens))
         return result
 
-    def post_comm(self, hidden_states, reduce_type='all_reduce', sp_num_tokens=None):
-        if reduce_type == 'all_reduce':
+    def post_comm(self, hidden_states, reduce_type="all_reduce", sp_num_tokens=None):
+        if reduce_type == "all_reduce":
             return self.ep_group.all_reduce(hidden_states)
-        elif reduce_type == 'reduce_scatter':
+        elif reduce_type == "reduce_scatter":
             return self.ep_group.reduce_scatter(hidden_states, sp_num_tokens)
         else:
-            raise ValueError(f'{reduce_type=} not in support type [all_reduce, reduce_scatter]')
+            raise ValueError(f"{reduce_type=} not in support type [all_reduce, reduce_scatter]")
+
+    def dispatch_no_quant(self, hidden_states, top_experts):
+        scale = None
+        quant_mode = -1
+        expand_x, expanded_row_idx, expert_token_count, _ = torch_npu.npu_moe_init_routing_v2(
+            hidden_states,
+            expert_idx=top_experts,
+            scale=scale,
+            active_num=top_experts.numel(),
+            expert_num=self.num_experts,
+            quant_mode=quant_mode,
+            active_expert_range=[self.expert_idx_min, self.expert_idx_max],
+            expert_tokens_num_type=1,
+            expert_tokens_num_flag=True,
+            row_idx_type=0,
+            drop_pad_mode=0,
+        )
+        return expand_x, expert_token_count, expanded_row_idx
 
     def dispatch(self, hidden_states, top_experts, skip_comm=False, sp_num_tokens=None):
+        already_quant = isinstance(hidden_states, (list, tuple))
+        if self.is_dynamic_w4a4 and not already_quant:
+            return self.dispatch_no_quant(hidden_states, top_experts)
         dynamic_quant = None
         if isinstance(hidden_states, (list, tuple)):
             hidden_states, dynamic_quant = hidden_states
@@ -67,13 +89,13 @@ class TokensDispatcherAgRs:
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
             row_idx_type=0,
-            drop_pad_mode=0
+            drop_pad_mode=0,
         )
         if scale is not None or quant_mode != -1:
             expand_x = (expand_x, pertoken_scale)
         return expand_x, expert_token_count, expanded_row_idx
 
-    def combine(self, expanded_permuted_rows, topk_ids, topk_weight, expanded_row_idx, reduce_type='reduce_scatter', sp_token_num=None):
+    def combine(self, expanded_permuted_rows, topk_ids, topk_weight, expanded_row_idx, reduce_type="reduce_scatter", sp_token_num=None):
         output_combine = torch_npu.npu_moe_finalize_routing(
             expanded_permuted_rows.unsqueeze(1),
             scales=topk_weight.to(expanded_permuted_rows.dtype),
@@ -82,22 +104,15 @@ class TokensDispatcherAgRs:
             drop_pad_mode=3,
             skip1=None,
             skip2=None,
-            bias=None
+            bias=None,
         )
-        if reduce_type == 'skip':
+        if reduce_type == "skip":
             return output_combine
         return self.post_comm(output_combine, reduce_type, sp_token_num)
 
 
 class TokensDispatcherPA2A:
-    def __init__(
-            self,
-            layer,
-            num_experts: int,
-            zero_expert_num: int,
-            ep_size: int,
-            ep_rank: int,
-            quant: bool=False) -> None:
+    def __init__(self, layer, num_experts: int, zero_expert_num: int, ep_size: int, ep_rank: int, quant: bool = False) -> None:
         """
         Initialize the zero token dropping router.
         """
@@ -118,7 +133,7 @@ class TokensDispatcherPA2A:
         # if need quant here, set scale to smooth scale, else:
         # 1. set scale to None for no need quant, 2. or set scale to dynamic_quant for routing scale
         scale = self.layer.w13_smooth_scale_total if quant_mode == 1 else dynamic_quant
-        has_quant = ((quant_mode != -1) or (dynamic_quant is not None))
+        has_quant = (quant_mode != -1) or (dynamic_quant is not None)
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             expert_idx=top_experts.to(torch.int32),
@@ -130,7 +145,7 @@ class TokensDispatcherPA2A:
             quant_mode=quant_mode,
             active_expert_range=[0, self.num_experts],
             row_idx_type=0,
-            drop_pad_mode=0
+            drop_pad_mode=0,
         )
         if top_experts.numel() == 0:
             tokens_per_expert.zero_()
@@ -162,17 +177,14 @@ class TokensDispatcherPA2A:
         if has_quant:
             pertoken_scale = pertoken_scale[:expert_tokens]
             gathered_pertoken_scale = pertoken_scale.new_empty(gathered_tokens.shape[0])
-            torch.distributed.all_to_all_single(gathered_pertoken_scale, pertoken_scale,
-                                                output_splits, input_splits, group=self.ep_group.device_group)
+            torch.distributed.all_to_all_single(
+                gathered_pertoken_scale, pertoken_scale, output_splits, input_splits, group=self.ep_group.device_group
+            )
 
         # reroute
-        (
-            expand_x,
-            gathered_pertoken_scale,
-            permute_token_idx,
-            expert_token_count
-        ) = torch_npu.npu_moe_re_routing(gathered_tokens, tokens_per_expert_group.view(self.ep_group.world_size, -1),
-                                         per_token_scales=gathered_pertoken_scale)
+        (expand_x, gathered_pertoken_scale, permute_token_idx, expert_token_count) = torch_npu.npu_moe_re_routing(
+            gathered_tokens, tokens_per_expert_group.view(self.ep_group.world_size, -1), per_token_scales=gathered_pertoken_scale
+        )
         if has_quant:
             expand_x = (expand_x, gathered_pertoken_scale)
         dispatch_output = (tokens_per_expert_group, expanded_row_idx, permute_token_idx, input_splits, output_splits)
@@ -191,9 +203,8 @@ class TokensDispatcherPA2A:
         torch.distributed.all_to_all_single(gathered_tokens, new_x, input_splits, output_splits, group=self.ep_group.device_group)
         if gathered_tokens.size(0) < expanded_row_idx.size(0):
             gathered_tokens = torch.cat(
-                [gathered_tokens,
-                 gathered_tokens.new_zeros(expanded_row_idx.size(0) - gathered_tokens.size(0), gathered_tokens.size(1))
-                ], dim=0)
+                [gathered_tokens, gathered_tokens.new_zeros(expanded_row_idx.size(0) - gathered_tokens.size(0), gathered_tokens.size(1))], dim=0
+            )
         out = torch_npu.npu_moe_finalize_routing(
             gathered_tokens.unsqueeze(1),
             scales=topk_weight.to(gathered_tokens.dtype),
@@ -202,27 +213,20 @@ class TokensDispatcherPA2A:
             drop_pad_mode=3,
             skip1=None,
             skip2=None,
-            bias=None
+            bias=None,
         )
         return out
 
 
 class TokensDispatcherAll2All:
     def __init__(
-            self,
-            layer,
-            num_experts: int,
-            zero_expert_num: int,
-            ep_size: int,
-            ep_rank: int,
-            tp_size: int=1,
-            tp_rank: int=0,
-            quant: bool=False) -> None:
-        self.group_ep: str = ''
+        self, layer, num_experts: int, zero_expert_num: int, ep_size: int, ep_rank: int, tp_size: int = 1, tp_rank: int = 0, quant: bool = False
+    ) -> None:
+        self.group_ep: str = ""
         if ENV.npu_enable_all2all_comm:
-            self.group_ep = get_all2all_ep_group().device_group._get_backend(
-                                    torch.device("npu")).get_hccl_comm_name(ep_rank)
-        self.quant_mode = 2 if quant else 0
+            self.group_ep = get_all2all_ep_group().device_group._get_backend(torch.device("npu")).get_hccl_comm_name(ep_rank)
+        self.is_dynamic_w4a4 = getattr(layer, "is_dynamic_w4a4", False)
+        self.quant_mode = 2 if (quant and not self.is_dynamic_w4a4) else 0
         self.layer = layer
         self.common_kwargs = dict(
             group_ep=self.group_ep,
@@ -231,37 +235,91 @@ class TokensDispatcherAll2All:
             ep_rank_id=ep_rank,
             tp_rank_id=tp_rank,
             moe_expert_num=num_experts,
-            copy_expert_num=zero_expert_num
+            copy_expert_num=zero_expert_num,
         )
 
-    def dispatch(self, hidden_states, top_experts, expert_weights):
+    def dispatch(self, hidden_states, top_experts, expert_weights, active_mask=None):
+        is_packed_int4 = isinstance(hidden_states, (list, tuple))
+        token_scales = None
+        if is_packed_int4:
+            if not self.is_dynamic_w4a4:
+                raise ValueError(
+                    "Pre-quantized MoE Dispatch input is only supported for "
+                    "dynamic W4A4 experts."
+                )
+            if len(hidden_states) != 2:
+                raise ValueError(
+                    "Pre-quantized MoE Dispatch input must be "
+                    "(packed_x, per_token_scale)."
+                )
+            hidden_states, token_scales = hidden_states
+            self._validate_int4_dispatch_input(
+                hidden_states, token_scales, top_experts
+            )
+
         kwargs = dict(
             x=hidden_states,
             expert_ids=top_experts,
-            scales=self.layer.w13_smooth_scale_total if self.quant_mode else None,
-            quant_mode=self.quant_mode,
+            scales=(
+                token_scales
+                if is_packed_int4
+                else self.layer.w13_smooth_scale_total if self.quant_mode else None
+            ),
+            # Packed INT4 is already quantized. quant_mode=0 transports its
+            # INT32 storage and FP32 token scales without INT8 DynamicQuant.
+            quant_mode=0 if is_packed_int4 else self.quant_mode,
             global_bs=0,
             expert_scales=expert_weights,
         )
+        if active_mask is not None:
+            kwargs["x_active_mask"] = active_mask
         if ENV.npu_enable_graph:
-            kwargs['group_tp'] = self.group_ep
-        if global_server_args_dict["npu_enable_a2_dispatch_combine_opt"] and get_910b_num_gpus_per_node() > 0:
+            kwargs["group_tp"] = self.group_ep
+        if is_packed_int4 or _is_a2_hierarchy_enabled():
             kwargs["comm_alg"] = "hierarchy"
-        (
-            expand_x,
-            dynamic_quant,
-            expand_idx,
-            expert_token_count,
-            ep_recv_counts,
-            tp_recv_counts,
-            expand_scales
-        ) = torch_npu.npu_moe_distribute_dispatch_v2(**kwargs, **self.common_kwargs)
+        (expand_x, dynamic_quant, expand_idx, expert_token_count, ep_recv_counts, tp_recv_counts, expand_scales) = (
+            torch_npu.npu_moe_distribute_dispatch_v2(**kwargs, **self.common_kwargs)
+        )
         dispatch_output = (expand_idx, ep_recv_counts, tp_recv_counts, expand_scales)
-        if self.quant_mode == 2:
+        if is_packed_int4 or self.quant_mode == 2:
             expand_x = (expand_x, dynamic_quant)
         return expand_x, expert_token_count, dispatch_output
 
-    def combine(self, expert_output, top_experts, expert_weights, hidden_states, dispatch_output):
+    def _validate_int4_dispatch_input(self, packed_x, token_scales, expert_ids):
+        if not global_server_args_dict.get(
+            "npu_enable_a2_dispatch_combine_opt", False
+        ):
+            raise RuntimeError(
+                "Packed INT4 MoE Dispatch requires A2 hierarchy; enable "
+                "--npu-enable-a2-dispatch-combine-opt."
+            )
+        if get_910b_num_gpus_per_node() <= 0:
+            raise RuntimeError(
+                "Packed INT4 MoE Dispatch is currently supported only on A2."
+            )
+        if packed_x.dtype != torch.int32 or packed_x.dim() != 2:
+            raise ValueError(
+                "Packed INT4 MoE Dispatch expects a 2-D torch.int32 tensor, "
+                f"got dtype={packed_x.dtype}, shape={tuple(packed_x.shape)}."
+            )
+        if token_scales.dtype != torch.float32:
+            raise ValueError(
+                "Packed INT4 MoE Dispatch expects FP32 per-token scales, got "
+                f"{token_scales.dtype}."
+            )
+        batch_size = packed_x.shape[0]
+        if token_scales.dim() != 1 or token_scales.shape[0] != batch_size:
+            raise ValueError(
+                "Packed INT4 MoE Dispatch expects token scales with shape "
+                f"[{batch_size}], got {tuple(token_scales.shape)}."
+            )
+        if expert_ids.dim() != 2 or expert_ids.shape[0] != batch_size:
+            raise ValueError(
+                "Packed INT4 MoE Dispatch expects expert ids with shape "
+                f"[{batch_size}, top_k], got {tuple(expert_ids.shape)}."
+            )
+
+    def combine(self, expert_output, top_experts, expert_weights, hidden_states, dispatch_output, active_mask=None):
         expand_idx, ep_recv_counts, tp_recv_counts, expand_scales = dispatch_output
         kwargs = dict(
             expand_x=expert_output,
@@ -274,9 +332,11 @@ class TokensDispatcherAll2All:
             global_bs=0,
             ori_x=hidden_states,
         )
+        if active_mask is not None:
+            kwargs["x_active_mask"] = active_mask
         if ENV.npu_enable_graph:
-            kwargs['group_tp'] = self.group_ep
-        if global_server_args_dict["npu_enable_a2_dispatch_combine_opt"] and get_910b_num_gpus_per_node() > 0:
+            kwargs["group_tp"] = self.group_ep
+        if _is_a2_hierarchy_enabled():
             kwargs["comm_alg"] = "hierarchy"
         output_combine_all2all = torch_npu.npu_moe_distribute_combine_v2(**kwargs, **self.common_kwargs)
         return output_combine_all2all

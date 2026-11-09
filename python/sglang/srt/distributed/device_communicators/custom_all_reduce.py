@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt import _custom_ops as ops
+from sglang.srt.ops import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -70,16 +70,11 @@ class CustomAllreduce:
 
         self.group = group
 
-        assert (
-            dist.get_backend(group) != dist.Backend.NCCL
-        ), "CustomAllreduce should be attached to a non-NCCL group."
+        assert dist.get_backend(group) != dist.Backend.NCCL, "CustomAllreduce should be attached to a non-NCCL group."
 
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
-            logger.warning(
-                "Custom allreduce is disabled because this process group"
-                " spans across nodes."
-            )
+            logger.warning("Custom allreduce is disabled because this process group spans across nodes.")
             return
 
         rank = dist.get_rank(group=self.group)
@@ -114,9 +109,7 @@ class CustomAllreduce:
 
         physical_device_id = device_ids[device.index]
         tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        ]
+        gather_list = [torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)]
         dist.all_gather(gather_list, tensor, group=self.group)
         physical_device_ids = [t.item() for t in gather_list]
 
@@ -155,9 +148,7 @@ class CustomAllreduce:
         # Buffers memory are owned by this Python class and passed to C++.
         # Meta data composes of two parts: meta data for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
-        self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size, group=group
-        )
+        self.meta_ptrs = self.create_shared_buffer(ops.meta_size() + max_size, group=group)
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before allreduce is performed
         self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
@@ -166,19 +157,13 @@ class CustomAllreduce:
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
         # is enough for 131072 such tuples. The largest model I've seen only
         # needs less than 10000 of registered tuples.
-        self.rank_data = torch.empty(
-            8 * 1024 * 1024, dtype=torch.uint8, device=self.device
-        )
-        self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.full_nvlink
-        )
+        self.rank_data = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+        self._ptr = ops.init_custom_ar(self.meta_ptrs, self.rank_data, rank, self.full_nvlink)
         ops.register_buffer(self._ptr, self.buffer_ptrs)
         self.disabled = False
 
     @staticmethod
-    def create_shared_buffer(
-        size_in_bytes: int, group: Optional[ProcessGroup] = None
-    ) -> List[int]:
+    def create_shared_buffer(size_in_bytes: int, group: Optional[ProcessGroup] = None) -> List[int]:
         """
         Creates a shared buffer and returns a list of pointers
         representing the buffer on all processes in the group.
@@ -201,9 +186,7 @@ class CustomAllreduce:
         return pointers
 
     @staticmethod
-    def free_shared_buffer(
-        pointers: List[int], group: Optional[ProcessGroup] = None
-    ) -> None:
+    def free_shared_buffer(pointers: List[int], group: Optional[ProcessGroup] = None) -> None:
         rank = dist.get_rank(group=group)
         lib = CudaRTLibrary()
         lib.cudaFree(ctypes.c_void_p(pointers[rank]))
@@ -242,9 +225,7 @@ class CustomAllreduce:
         ranks = dist.get_process_group_ranks(group=self.group)
         ranks.sort()
         for i, rank in enumerate(ranks):
-            dist.broadcast_object_list(
-                all_data[i], src=rank, group=self.group, device="cpu"
-            )
+            dist.broadcast_object_list(all_data[i], src=rank, group=self.group, device="cpu")
 
         # we cannot directly use `dist.all_gather_object` here
         # because it is incompatible with `gloo` backend under inference mode.
@@ -267,15 +248,11 @@ class CustomAllreduce:
         # We cannot directly use `dist.all_gather_object` here
         # because it is incompatible with `gloo` backend under inference mode.
         # see https://github.com/pytorch/pytorch/issues/126032 for details.
-        all_data = [
-            [None, None] for _ in range(dist.get_world_size(group=self.group))
-        ]
+        all_data = [[None, None] for _ in range(dist.get_world_size(group=self.group))]
         all_data[self.rank] = [handle, offset]
         ranks = sorted(dist.get_process_group_ranks(group=self.group))
         for i, rank in enumerate(ranks):
-            dist.broadcast_object_list(
-                all_data[i], src=rank, group=self.group, device="cpu"
-            )
+            dist.broadcast_object_list(all_data[i], src=rank, group=self.group, device="cpu")
         # Unpack list of tuples to tuple of lists.
         handles = [d[0] for d in all_data]  # type: ignore
         offsets = [d[1] for d in all_data]  # type: ignore
@@ -329,9 +306,7 @@ class CustomAllreduce:
         if registered:
             ops.all_reduce(self._ptr, inp, out, 0, 0)
         else:
-            ops.all_reduce(
-                self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
-            )
+            ops.all_reduce(self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size)
         return out
 
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:

@@ -35,6 +35,7 @@ if _is_cuda:
         from flashinfer import int8_scaled_mm
     except ImportError as e:
         import logging
+
         logger = logging.getLogger(__name__)
         logger.error(f"Failed to import int8_scaled_mm from flashinfer: {e}")
         raise
@@ -65,9 +66,7 @@ def npu_wrapper_rmsnorm_forward(func):
         if not x.is_contiguous():
             x = x.contiguous()
         if residual is not None:
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
-                residual, x, self.weight.data, self.variance_epsilon
-            )
+            out, _, residual_out = torch_npu.npu_add_rms_norm(residual, x, self.weight.data, self.variance_epsilon)
             out = out + self.bias
             return out.to(x.dtype), residual_out
 
@@ -96,20 +95,11 @@ def npu_fused_experts(
     num_tokens = hidden_states.shape[0]
     num_experts = w13.shape[0]
     row_idx_len = num_tokens * top_k
-    row_idx = (
-        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-        .view(top_k, -1)
-        .permute(1, 0)
-        .contiguous()
+    row_idx = torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device).view(top_k, -1).permute(1, 0).contiguous()
+    hidden_states, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
+        hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
     )
-    hidden_states, expanded_row_idx, expanded_expert_idx = (
-        torch_npu.npu_moe_init_routing(
-            hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-        )
-    )
-    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-        expanded_expert_idx, num_experts
-    )
+    expert_tokens = torch_npu.npu_moe_compute_expert_tokens(expanded_expert_idx, num_experts)
     expert_tokens = expert_tokens.to(torch.int64)
     # gmm1: gate_up_proj
     hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
@@ -155,7 +145,6 @@ def npu_fused_experts(
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
 
@@ -178,9 +167,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         self.logical_widths = output_partition_sizes
 
         weight = ModelWeightParameter(
-            data=torch.empty(
-                sum(output_partition_sizes), input_size_per_partition, dtype=torch.int8
-            ),
+            data=torch.empty(sum(output_partition_sizes), input_size_per_partition, dtype=torch.int8),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,

@@ -40,9 +40,7 @@ def get_config_file_name(
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
-    block_shape_selector = (
-        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
-    )
+    block_shape_selector = "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
     per_channel_quant_selector = ",per_channel_quant=True" if per_channel_quant else ""
     down_moe_selector = "_down" if down_moe else ""
     return f"{E=},{inter_size=},{hidden_size=},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
@@ -72,9 +70,7 @@ def get_config_file_path(
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
     # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
-    config_dir = os.environ.get(
-        "SGLANG_MOE_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
-    )
+    config_dir = os.environ.get("SGLANG_MOE_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__)))
 
     config_file_path = os.path.join(
         config_dir,
@@ -213,42 +209,28 @@ def try_get_optimal_moe_config(
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
 
-        configs = get_moe_configs(
-            E, inter_size, hidden_size, dtype, block_n, block_k, down_moe=False
-        )
+        configs = get_moe_configs(E, inter_size, hidden_size, dtype, block_n, block_k, down_moe=False)
         if configs:
             # If an optimal configuration map has been found, look up the
             # optimal config
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         else:
             # Else use the default config
-            config = get_default_config(
-                M, E, inter_size, hidden_size, top_k, dtype, is_marlin, block_shape
-            )
+            config = get_default_config(M, E, inter_size, hidden_size, top_k, dtype, is_marlin, block_shape)
 
         if return_down_config:
-            down_configs = get_moe_configs(
-                E, inter_size, hidden_size, dtype, block_n, block_k, down_moe=True
-            )
+            down_configs = get_moe_configs(E, inter_size, hidden_size, dtype, block_n, block_k, down_moe=True)
             if down_configs:
-                down_config = down_configs[
-                    min(down_configs.keys(), key=lambda x: abs(x - M))
-                ]
+                down_config = down_configs[min(down_configs.keys(), key=lambda x: abs(x - M))]
                 down_config = dict(**down_config)
-                max_block_m = max(
-                    [cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()]
-                )
+                max_block_m = max([cfg["BLOCK_SIZE_M"] for cfg in down_configs.values()])
             else:
                 # FIXME: lifengcun
-                down_config = get_default_config(
-                    M, E, inter_size, hidden_size, top_k, dtype, is_marlin, block_shape
-                )
+                down_config = get_default_config(M, E, inter_size, hidden_size, top_k, dtype, is_marlin, block_shape)
                 max_block_m = down_config["BLOCK_SIZE_M"]
 
     if return_down_config:
-        assert (
-            down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
-        )
+        assert down_config is None or config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
         return config, (down_config, max_block_m)
     return config
 

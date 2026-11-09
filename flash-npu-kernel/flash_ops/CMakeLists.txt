@@ -13,7 +13,7 @@ include(cmake/torch.cmake)
 include(cmake/torch_npu.cmake)
 include(cmake/func.cmake)
 
-set(NPU_ARCH "dav-2201" CACHE STRING "NPU architecture (e.g. dav-3510, dav-2201)")
+set(NPU_ARCH "dav-2201" CACHE STRING "NPU architectures, semicolon-separated (e.g. dav-2201;dav-3510)")
 # torch.ops.<EXTENSION_MODULE_NAME> namespace exposed to Python
 set(EXTENSION_MODULE_NAME "flash" CACHE STRING "Extension module name")
 # Python package directory that receives the compiled libflash_*.so
@@ -52,6 +52,6 @@ set(COMPILE_OPTIONS
     -DEXTENSION_MODULE_NAME=${EXTENSION_MODULE_NAME}
 )
 
-# Each op in csrc/<op>/<arch>/ builds its own libflash_<op>.so
+# Each op in csrc/<op>/ builds its own libflash_<op>.so
 # directly into ${PYTHON_PACKAGE_DIR} via add_sources() in cmake/func.cmake.
 add_subdirectory(csrc)

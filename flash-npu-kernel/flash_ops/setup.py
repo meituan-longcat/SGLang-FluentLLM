@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import shutil
 import subprocess
 import logging
@@ -53,15 +54,11 @@ class BinaryDistribution(Distribution):
         return True
 
 
-class ABI3Wheel(bdist_wheel):
-    """
-    Force to use abi3 tag for wheel, this wheel supports multiple python versions >= 3.8
-    """
+class BinaryWheel(bdist_wheel):
     def get_tag(self):
-        python, abi, plat = super().get_tag()
-        python = "cp38"
-        abi = "abi3"
-        return python, abi, plat
+        _, _, plat = super().get_tag()
+        cpver = f"cp{sys.version_info.major}{sys.version_info.minor}"
+        return cpver, cpver, plat
 
     def run(self):
         self.run_command('cmake_build')
@@ -93,26 +90,50 @@ class CMakeBuildCommand(Command):
         TORCH_NPU_PATH = os.path.dirname(torch_npu.__file__)
         logging.info(f"Using Torch NPU path: {TORCH_NPU_PATH}")
 
-        # Get NPU_ARCH from environment variable or set default
-        NPU_ARCH = os.environ.get('NPU_ARCH', 'dav-3510')
-        logging.info(f"Using NPU_ARCH: {NPU_ARCH}")
+        # Get NPU_ARCH from environment variable or auto-detect from hardware
+        NPU_ARCH = os.environ.get('NPU_ARCH')
+        if not NPU_ARCH:
+            _soc_to_arch = {
+                'Ascend910B': 'dav-2201',
+                'Ascend910_93': 'dav-2201',
+                'Ascend950': 'dav-3510',
+            }
+            try:
+                if torch.npu.is_available():
+                    device_name = torch.npu.get_device_name(0)
+                    for soc_prefix, arch_name in _soc_to_arch.items():
+                        if device_name.startswith(soc_prefix):
+                            NPU_ARCH = arch_name
+                            break
+                if not NPU_ARCH:
+                    NPU_ARCH = 'dav-2201'
+            except Exception:
+                NPU_ARCH = 'dav-2201'
+            logging.info(f"NPU_ARCH not set, auto-detected: {NPU_ARCH}")
+        NPU_ARCH_CMAKE = NPU_ARCH.replace(',', ';')
+        logging.info(f"Using NPU_ARCH: {NPU_ARCH} -> CMake: {NPU_ARCH_CMAKE}")
 
-        # Build the CMake project
         build_temp = os.path.join(os.getcwd(), 'build')
         cmake_config_command = ['cmake', '-S', os.getcwd(), '-B', build_temp,
                                 '-DCMAKE_BUILD_TYPE=Release',
                                 f'-DTorch_DIR={Torch_DIR}',
                                 f'-DTORCH_NPU_PATH={TORCH_NPU_PATH}',
-                                f'-DNPU_ARCH={NPU_ARCH}'
+                                f'-DNPU_ARCH={NPU_ARCH_CMAKE}'
                                 ]
         subprocess.check_call(cmake_config_command, cwd=os.getcwd())
         subprocess.check_call(['cmake', '--build', build_temp, '--config', 'Release', '--parallel', num_jobs], cwd=os.getcwd())
+        arch_list = [a.replace('-', '_') for a in NPU_ARCH.split(',')]
+        pkg_dir = os.path.join(os.getcwd(), PACKAGE_NAME)
+        for f in os.listdir(pkg_dir):
+            if f.endswith('.so') and not any(f'_{a}.so' in f for a in arch_list):
+                os.remove(os.path.join(pkg_dir, f))
+                logging.info(f"Removed stale .so: {f}")
         logging.info("CMake extensions built successfully.")
 
 
 cmdclass = {
     'clean': CleanCommand,
-    'bdist_wheel': ABI3Wheel,
+    'bdist_wheel': BinaryWheel,
     'cmake_build': CMakeBuildCommand,
 }
 

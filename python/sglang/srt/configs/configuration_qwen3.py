@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +13,17 @@
 # limitations under the License.
 """Qwen3 model configuration"""
 
+import logging
+
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
-import logging
 
 ALLOWED_LAYER_TYPES = (
     "full_attention",
     "sliding_attention",
     "chunked_attention",
 )
+
 
 def layer_type_validation(layer_types: list[str]):
     """Check that each entry in `layer_types` are allowed."""
@@ -31,6 +32,7 @@ def layer_type_validation(layer_types: list[str]):
 
 
 logger = logging.getLogger(__name__)
+
 
 class Qwen3Config(PretrainedConfig):
     r"""
@@ -219,9 +221,7 @@ class Qwen3Config(PretrainedConfig):
         self.layer_types = layer_types
         if self.layer_types is None:
             self.layer_types = [
-                "sliding_attention"
-                if self.sliding_window is not None and i >= self.max_window_layers
-                else "full_attention"
+                "sliding_attention" if self.sliding_window is not None and i >= self.max_window_layers else "full_attention"
                 for i in range(self.num_hidden_layers)
             ]
         layer_type_validation(self.layer_types)

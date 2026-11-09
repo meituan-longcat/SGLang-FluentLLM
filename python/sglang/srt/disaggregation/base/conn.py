@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Optional, List, Tuple
+from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -13,14 +13,25 @@ class KVArgs:
     kv_data_ptrs: list[int]
     kv_data_lens: list[int]
     kv_item_lens: list[int]
-    offsets: List[Tuple[int]]
+    offsets: list[tuple[int]]
     aux_data_ptrs: list[int]
     aux_data_lens: list[int]
     aux_item_lens: list[int]
+    buffer_device_types: Optional[list]  # None 表示全部为 npu/gpu
     ib_device: str
     gpu_id: int
     target_layer_num: int
     draft_layer_num: int
+    # draft pool 是否被 TokenToKVPoolL15Wrapper 包装。MTP(NEXTN) draft 同为 MLA/DSA -> True (与
+    # target 共用局部页坐标); DFLASH draft 是 GQA -> False (全局页索引, 传输须单独一套坐标)。
+    draft_enable_mla_l1_5_cache: bool = False
+    # for mamba or swa
+    state_data_ptrs: list[int]
+    state_data_lens: list[int]
+    state_item_lens: list[int]
+    state_type: str  # "none", "mamba", "swa"
+    # for mamba state different tp slice transfer
+    state_dim_per_tensor: list[int]  # dimension to slice for each state tensor
 
     # for pp prefill
     pp_rank: int
@@ -59,11 +70,8 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-
     @abstractmethod
-    def __init__(
-        self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int
-    ): ...
+    def __init__(self, mgr: BaseKVManager, bootstrap_addr: str, bootstrap_room: int): ...
 
     @abstractmethod
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None, decode_prefix_len: Optional[int] = 0):
@@ -79,6 +87,7 @@ class BaseKVSender(ABC):
         kv_indices: npt.NDArray[np.int64],
         start_idx: Optional[int] = 0,
         mla_l1_5_args: Optional[PageTransferMetadata] = None,
+        state_indices: Optional[list[int]] = None,
     ):
         """
         Send the kv cache at the given kv indices to the decoder server
@@ -103,9 +112,16 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def abort(self) -> None:
+        """
+        Optional: request the peer to stop touching this request's buffers.
+
+        Default is no-op so existing backends keep working.
+        """
+        pass
+
 
 class BaseKVReceiver(ABC):
-
     @abstractmethod
     def __init__(
         self,
@@ -121,6 +137,7 @@ class BaseKVReceiver(ABC):
         aux_index: Optional[int] = None,
         decode_prefix_len: Optional[int] = 0,
         mla_l1_5_args: Optional[PageTransferMetadata] = None,
+        state_indices: Optional[list[int]] = None,
     ):
         """
         Notify the prefill server about the kv indices and aux index
@@ -144,6 +161,19 @@ class BaseKVReceiver(ABC):
         Raise an exception if the kv cache transfer fails
         """
         ...
+
+    def abort(self) -> None:
+        """
+        Optional: ask the prefill side to stop writing into our KV buffers.
+
+        Decode-initiated abort. The receiver should fan out an ABORT_REQ to
+        each prefill rank it registered with; the KV slot can only be
+        released once poll() returns KVPoll.Failed (delivered after every
+        prefill rank ACKs, or when the heartbeat path decides prefill died).
+
+        Default is no-op so existing backends keep working.
+        """
+        pass
 
 
 class BaseKVBootstrapServer(ABC):

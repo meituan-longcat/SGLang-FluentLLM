@@ -1,7 +1,8 @@
+# ruff: noqa: S105
 import json
 import logging
 import re
-from typing import List, Union, Literal
+from typing import Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -29,7 +30,9 @@ class DeepSeekV3Detector(BaseFormatDetector):
     ```
     Examples:
     ```
-    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Tokyo"}\n```<｜tool▁call▁end｜>
+    \n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_current_weather\n```json\n{"location": "Paris"}\n```<｜tool▁call▁end｜>
+    <｜tool▁calls▁end｜><｜end▁of▁sentence｜>
     ```
 
     Key Components:
@@ -56,10 +59,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         return self.bot_token in text
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -91,10 +91,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing tool calls for DeepSeekV3 format.
@@ -103,9 +100,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
         current_text = self._buffer
 
         # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = (
-            self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
-        )
+        has_tool_call = self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
 
         if not has_tool_call:
             self._buffer = ""
@@ -155,11 +150,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
                         "arguments": {},
                     }
                 else:
-                    argument_diff = (
-                        func_args_raw[len(self._last_arguments) :]
-                        if func_args_raw.startswith(self._last_arguments)
-                        else func_args_raw
-                    )
+                    argument_diff = func_args_raw[len(self._last_arguments) :] if func_args_raw.startswith(self._last_arguments) else func_args_raw
 
                     if argument_diff:
                         calls.append(
@@ -170,27 +161,19 @@ class DeepSeekV3Detector(BaseFormatDetector):
                             )
                         )
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += argument_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
                     if _is_complete_json(func_args_raw):
                         # Update the stored arguments
                         try:
                             parsed_args = json.loads(func_args_raw)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
+                            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed_args
                         except json.JSONDecodeError:
                             pass
 
                         # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
-                        )
-                        match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
+                        tool_call_end_pattern = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                        match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
                         if match:
                             # Remove the completed tool call from buffer, keep any remaining content
                             self._buffer = current_text[match.end() :]

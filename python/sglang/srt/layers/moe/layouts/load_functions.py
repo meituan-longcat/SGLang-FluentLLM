@@ -12,7 +12,7 @@ def _load_w13(
     is_bias: bool,
     use_presharded_weights: bool,
     do_transpose: bool,
-    load_up_proj_weight_first: bool
+    load_up_proj_weight_first: bool,
 ):
     # Index the loaded weight for tp sharding.
     # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
@@ -45,9 +45,7 @@ def _load_w13(
         if not is_bias and do_transpose:
             # do not transpose for bias
             loaded_weight = loaded_weight.transpose(-2, -1)
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
-        )
+        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank, shard_size)
 
     expert_data = expert_data.narrow(shard_dim, start, shard_size)
     expert_data.copy_(loaded_weight)
@@ -63,9 +61,7 @@ def _load_w2(
     use_presharded_weights: bool,
     do_transpose: bool,
 ):
-    if not isinstance(expert_data, torch.Tensor) or not isinstance(
-        loaded_weight, torch.Tensor
-    ):
+    if not isinstance(expert_data, torch.Tensor) or not isinstance(loaded_weight, torch.Tensor):
         raise ValueError("expert_data and loaded_weight must be torch.Tensor")
 
     if shard_id != "w2":
@@ -87,9 +83,7 @@ def _load_w2(
         if not is_bias and do_transpose:
             # do not transpose for bias
             loaded_weight = loaded_weight.transpose(-2, -1)
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
-        )
+        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank, shard_size)
 
     # w2, down_proj: Load into only logical weight of w2.
     expert_data.copy_(loaded_weight)
@@ -115,7 +109,7 @@ def load_model_weight(
     tp_rank: int,
     is_bias: bool,
     use_presharded_weights: bool,
-    do_transpose: bool
+    do_transpose: bool,
 ):
 
     expert_data = param.data[local_expert_id]
@@ -124,7 +118,7 @@ def load_model_weight(
     if shard_id == "w2":
         load_func = _load_w2
     elif shard_id in ("w1", "w3", "w13"):
-        load_func = partial(_load_w13, load_up_proj_weight_first=False) # FIXME
+        load_func = partial(_load_w13, load_up_proj_weight_first=False)  # FIXME
 
     load_func(
         expert_data,
@@ -157,42 +151,20 @@ def load_per_tensor_weight_scale(
         raise RuntimeError(f"Unrecognized shard_id: {shard_id}")
 
 
-def load_group_weight_scale(
-    param: torch.Tensor,
-    loaded_weight: torch.Tensor,
-    local_expert_id: int,
-    shard_id: str,
-    tp_rank: int,
-    do_transpose: bool
-):
+def load_group_weight_scale(param: torch.Tensor, loaded_weight: torch.Tensor, local_expert_id: int, shard_id: str, tp_rank: int, do_transpose: bool):
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
 
     if shard_id == "w2":
         load_func = _load_w2
     elif shard_id in ("w1", "w3", "w13"):
-        load_func = partial(_load_w13, load_up_proj_weight_first=False) # FIXME
+        load_func = partial(_load_w13, load_up_proj_weight_first=False)  # FIXME
 
-    load_func(
-        expert_data,
-        loaded_weight,
-        shard_id,
-        shard_dim,
-        tp_rank,
-        False,
-        False,
-        do_transpose,
-        False
-    )
+    load_func(expert_data, loaded_weight, shard_id, shard_dim, tp_rank, False, False, do_transpose, False)
 
 
 def load_per_channel_weight_scale(
-    param: torch.Tensor,
-    loaded_weight: torch.Tensor,
-    local_expert_id: int,
-    shard_id: str,
-    tp_rank: int,
-    do_transpose: bool
+    param: torch.Tensor, loaded_weight: torch.Tensor, local_expert_id: int, shard_id: str, tp_rank: int, do_transpose: bool
 ):
     expert_data = param.data[local_expert_id]
     shard_dim = get_shard_dim(param, shard_id, do_transpose)
@@ -201,17 +173,7 @@ def load_per_channel_weight_scale(
     if shard_id == "w2":
         expert_data.copy_(loaded_weight)
     elif shard_id in ("w1", "w3"):
-        _load_w13(
-            expert_data,
-            loaded_weight,
-            shard_id,
-            shard_dim,
-            tp_rank,
-            False,
-            False,
-            do_transpose,
-            False
-        )
+        _load_w13(expert_data, loaded_weight, shard_id, shard_dim, tp_rank, False, False, do_transpose, False)
 
 
 def load_g_idx(
@@ -234,10 +196,6 @@ def load_g_idx(
         expert_data.copy_(loaded_weight)
 
 
-def load_single_value(
-    param: torch.nn.Parameter,
-    loaded_weight: torch.Tensor,
-    local_expert_id: int
-):
+def load_single_value(param: torch.nn.Parameter, loaded_weight: torch.Tensor, local_expert_id: int):
     # Input scales can be loaded directly and should be equal.
     param.data[local_expert_id] = loaded_weight

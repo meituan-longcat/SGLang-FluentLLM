@@ -3,48 +3,43 @@ from __future__ import annotations
 import inspect
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union, Dict, Any
-
-import torch
-
-from sglang.srt.distributed import get_world_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
-from sglang.srt.layers.moe.config import EPConfig
-# from sglang.srt.layers.moe.ep_moe.deep import DeepEPDispatcher
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.utils import get_colorful_logger
+from typing import Any, Callable
 
 import deep_gemm
+import torch
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size, get_world_group
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.moe.config import EPConfig
+from sglang.srt.layers.moe.dispatcher.deep_ep import DeepEPDispatcher
+from sglang.srt.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
 
 @dataclass
-class Orchestration(object):
-    stages: List[Callable]
+class Orchestration:
+    stages: list[Callable]
     delta_stage: int
-    pre_process: Optional[Callable]
+    pre_process: Callable | None
     post_process: Callable
-    deep_gemm_num_sms: Optional[int] = None
+    deep_gemm_num_sms: int | None = None
 
 
-def tbo_stage(provides: Optional[Union[str, List[str]]] = None,
-              requires: Optional[Union[str, List[str]]] = None,
-              temp: bool = False,
-              use_globals: Optional[Union[str, List[str]]] = None):
+def tbo_stage(
+    provides: str | list[str] | None = None,
+    requires: str | list[str] | None = None,
+    temp: bool = False,
+    use_globals: str | list[str] | None = None,
+):
     def decorator(func: Callable) -> Callable:
-        setattr(func, 'tbo_metadata', {
-            'provides': provides,
-            'requires': requires,
-            'temp': temp,
-            'use_globals': use_globals
-        })
+        func.tbo_metadata = {"provides": provides, "requires": requires, "temp": temp, "use_globals": use_globals}
         return func
 
     return decorator
 
 
-class TBOExecutor(object):
+class TBOExecutor:
     def __init__(self, orchestration: Orchestration, layers):
         super().__init__()
         self.stages = []
@@ -75,24 +70,26 @@ class TBOExecutor(object):
         return self
 
     def register_stage(self, func):
-        metadata = getattr(func, 'tbo_metadata', {})
-        provides = metadata.get('provides')
-        requires = metadata.get('requires')
-        temp = metadata.get('temp', False)
-        use_globals = metadata.get('use_globals')
+        metadata = getattr(func, "tbo_metadata", {})
+        provides = metadata.get("provides")
+        requires = metadata.get("requires")
+        temp = metadata.get("temp", False)
+        use_globals = metadata.get("use_globals")
 
         inferred_requires = requires
         if inferred_requires is None:
             sig = inspect.signature(func)
             inferred_requires = list(sig.parameters.keys())
 
-        self.stages.append({
-            'func': func,
-            'provides': [provides] if isinstance(provides, str) else provides,
-            'requires': [inferred_requires] if isinstance(inferred_requires, str) else inferred_requires,
-            'temp': temp,
-            'use_globals': [use_globals] if isinstance(use_globals, str) else use_globals
-        })
+        self.stages.append(
+            {
+                "func": func,
+                "provides": [provides] if isinstance(provides, str) else provides,
+                "requires": [inferred_requires] if isinstance(inferred_requires, str) else inferred_requires,
+                "temp": temp,
+                "use_globals": [use_globals] if isinstance(use_globals, str) else use_globals,
+            }
+        )
 
         if provides:
             provides_list = [provides] if isinstance(provides, str) else provides
@@ -101,7 +98,7 @@ class TBOExecutor(object):
             else:
                 self.permanent_keys.update(provides_list)
 
-    def forward_overlap(self, **kwargs) -> Dict[str, Any]:
+    def forward_overlap(self, **kwargs) -> dict[str, Any]:
         with self.configure_deep_gemm_num_sms(self.orchestration.deep_gemm_num_sms):
             self.clear_states()
 
@@ -142,13 +139,13 @@ class TBOExecutor(object):
         current_layer_index = self._layer_indices[micro_batch_index]
         layer = self.layers[current_layer_index]
 
-        kwargs = {'layer': layer}
-        for key in stage['requires']:
+        kwargs = {"layer": layer}
+        for key in stage["requires"]:
             if key in self.context[micro_batch_index]:
                 kwargs[key] = self.context[micro_batch_index][key]
 
         try:
-            results = stage['func'](**kwargs)
+            results = stage["func"](**kwargs)
         except Exception as e:
             logger.error(
                 f"TBO failed to execute stage {stage}, "
@@ -164,14 +161,14 @@ class TBOExecutor(object):
                 del self.context[micro_batch_index][key]
 
         if results is not None:
-            if len(stage['provides']) == 1:
-                self.context[micro_batch_index][stage['provides'][0]] = results
+            if len(stage["provides"]) == 1:
+                self.context[micro_batch_index][stage["provides"][0]] = results
             else:
-                if isinstance(results, (tuple, list)) and len(results) == len(stage['provides']):
-                    for i, key in enumerate(stage['provides']):
+                if isinstance(results, (tuple, list)) and len(results) == len(stage["provides"]):
+                    for i, key in enumerate(stage["provides"]):
                         self.context[micro_batch_index][key] = results[i]
                 else:
-                    self.context[micro_batch_index][stage['provides'][0]] = results
+                    self.context[micro_batch_index][stage["provides"][0]] = results
 
         self._stage_indices[micro_batch_index] += 1
         if self._stage_indices[micro_batch_index] == len(self.stages):
@@ -198,7 +195,7 @@ class TBODeepEPDispatchers:
             rank=get_tensor_model_parallel_rank(),
             world_size=get_tensor_model_parallel_world_size(),
             group=get_world_group().device_group,
-            params_dtype=torch.bfloat16
+            params_dtype=torch.bfloat16,
         )
 
         self.deepep_dispatchers = [DeepEPDispatcher(config), DeepEPDispatcher(config)]

@@ -47,9 +47,7 @@ def find_nccl_library() -> str:
 
     # manually load the nccl library
     if so_file:
-        logger.info(
-            "Found nccl from environment variable SGLANG_NCCL_SO_PATH=%s", so_file
-        )
+        logger.info("Found nccl from environment variable SGLANG_NCCL_SO_PATH=%s", so_file)
     else:
         if torch.version.cuda is not None:
             so_file = "libnccl.so.2"
@@ -343,15 +341,9 @@ class NCCLLibrary:
         self.NCCL_CHECK(self._funcs["ncclGetUniqueId"](ctypes.byref(unique_id)))
         return unique_id
 
-    def ncclCommInitRank(
-        self, world_size: int, unique_id: ncclUniqueId, rank: int
-    ) -> ncclComm_t:
+    def ncclCommInitRank(self, world_size: int, unique_id: ncclUniqueId, rank: int) -> ncclComm_t:
         comm = ncclComm_t()
-        self.NCCL_CHECK(
-            self._funcs["ncclCommInitRank"](
-                ctypes.byref(comm), world_size, unique_id, rank
-            )
-        )
+        self.NCCL_CHECK(self._funcs["ncclCommInitRank"](ctypes.byref(comm), world_size, unique_id, rank))
         return comm
 
     def ncclAllReduce(
@@ -369,11 +361,7 @@ class NCCLLibrary:
         # both are aliases of `ctypes.c_int`
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
-        self.NCCL_CHECK(
-            self._funcs["ncclAllReduce"](
-                sendbuff, recvbuff, count, datatype, op, comm, stream
-            )
-        )
+        self.NCCL_CHECK(self._funcs["ncclAllReduce"](sendbuff, recvbuff, count, datatype, op, comm, stream))
 
     def ncclReduceScatter(
         self,
@@ -390,11 +378,7 @@ class NCCLLibrary:
         # both are aliases of `ctypes.c_int`
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
-        self.NCCL_CHECK(
-            self._funcs["ncclReduceScatter"](
-                sendbuff, recvbuff, count, datatype, op, comm, stream
-            )
-        )
+        self.NCCL_CHECK(self._funcs["ncclReduceScatter"](sendbuff, recvbuff, count, datatype, op, comm, stream))
 
     def ncclAllGather(
         self,
@@ -409,11 +393,7 @@ class NCCLLibrary:
         # which is an aliases of `ctypes.c_int`
         # when we pass int to a function, it will be converted to `ctypes.c_int`
         # by ctypes automatically
-        self.NCCL_CHECK(
-            self._funcs["ncclAllGather"](
-                sendbuff, recvbuff, count, datatype, comm, stream
-            )
-        )
+        self.NCCL_CHECK(self._funcs["ncclAllGather"](sendbuff, recvbuff, count, datatype, comm, stream))
 
     def ncclSend(
         self,
@@ -424,9 +404,7 @@ class NCCLLibrary:
         comm: ncclComm_t,
         stream: cudaStream_t,
     ) -> None:
-        self.NCCL_CHECK(
-            self._funcs["ncclSend"](sendbuff, count, datatype, dest, comm, stream)
-        )
+        self.NCCL_CHECK(self._funcs["ncclSend"](sendbuff, count, datatype, dest, comm, stream))
 
     def ncclRecv(
         self,
@@ -437,9 +415,7 @@ class NCCLLibrary:
         comm: ncclComm_t,
         stream: cudaStream_t,
     ) -> None:
-        self.NCCL_CHECK(
-            self._funcs["ncclRecv"](recvbuff, count, datatype, src, comm, stream)
-        )
+        self.NCCL_CHECK(self._funcs["ncclRecv"](recvbuff, count, datatype, src, comm, stream))
 
     def ncclBroadcast(
         self,
@@ -451,11 +427,7 @@ class NCCLLibrary:
         comm: ncclComm_t,
         stream: cudaStream_t,
     ) -> None:
-        self.NCCL_CHECK(
-            self._funcs["ncclBroadcast"](
-                sendbuff, recvbuff, count, datatype, root, comm, stream
-            )
-        )
+        self.NCCL_CHECK(self._funcs["ncclBroadcast"](sendbuff, recvbuff, count, datatype, root, comm, stream))
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))

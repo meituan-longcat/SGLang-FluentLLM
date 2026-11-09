@@ -1,0 +1,46 @@
+# EP128 看护用例集群配置模板
+# 复制为 ep128_cluster.conf 并填写实际节点。
+# 第0个节点同时作为 torchrun master (MASTER_ADDR)。
+NODES=(
+    "root@10.255.<ip0>"
+    "root@10.255.<ip1>"
+    "root@10.255.<ip2>"
+    "root@10.255.<ip3>"
+    "root@10.255.<ip4>"
+    "root@10.255.<ip5>"
+    "root@10.255.<ip6>"
+    "root@10.255.<ip7>"
+)
+
+MASTER_ADDR="10.255.<ip0>"
+MASTER_PORT=29500
+
+# 测试代码在各节点上的存放目录。
+REMOTE_DIR="/workdir/ep128_e2e"
+
+# 所有机器上的 Ascend 环境脚本路径。
+ASCEND_ENV="/usr/local/Ascend/ascend-toolkit/set_env.sh"
+
+# 8台机器使用相同的 SSH 端口和密码。
+SSH_PASSWORD='<your-password>'
+SSH_OPTIONS=(
+    -p 8022
+    -o ConnectTimeout=10
+    -o StrictHostKeyChecking=accept-new
+    -o PreferredAuthentications=password
+    -o PubkeyAuthentication=no
+    -o NumberOfPasswordPrompts=1
+)
+SCP_OPTIONS=(
+    -P 8022
+    -o ConnectTimeout=10
+    -o StrictHostKeyChecking=accept-new
+    -o PreferredAuthentications=password
+    -o PubkeyAuthentication=no
+    -o NumberOfPasswordPrompts=1
+)
+
+# 需要同步到各节点的文件。
+SYNC_FILES=(
+    "ep128_dispatch_e2e.py"
+)

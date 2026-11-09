@@ -14,54 +14,51 @@
 """ModelRunner runs the forward passes of the models."""
 
 import datetime
-from typing import Optional
-
-from sglang.srt.model_executor.attn_initializer import AttnInitializer
-from sglang.srt.model_executor.weight_mixin import WeightMixin
-from sglang.srt.distributed.parallel_state import get_world_group, get_pp_group
-from sglang.srt.utils import get_colorful_logger, monkey_patch_p2p_access_check
-import os
+import itertools
 import time
-from typing import List
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 
-from sglang.srt.env import ENV
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import (
-    get_tp_group,
-    init_distributed_environment,
-    initialize_model_parallel,
-    set_custom_all_reduce
-)
-from sglang.srt.layers.dp_attention import (
+from sglang.srt.configs.model_config import ModelConfig, is_deepseek_nsa
+from sglang.srt.distributed import get_tp_group, init_distributed_environment, initialize_model_parallel, set_custom_all_reduce
+from sglang.srt.distributed.parallel_state import get_pp_group, get_world_group
+from sglang.srt.env import ENV, envs, global_server_args_dict, global_server_args_dict_update
+from sglang.srt.layers.attention.dp_attention import (
+    get_attention_dp_rank,
     get_attention_tp_group,
     initialize_dp_attention,
     initialize_dp_dense,
-    get_attention_dp_rank,
     initialize_dp_draft_model,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.env import global_server_args_dict, global_server_args_dict_update, ENV
-
-from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.managers.expert_distribution import (
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler.sampler import Sampler
+from sglang.srt.managers.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
+from sglang.srt.model_executor.attn_initializer import AttnInitializer
+from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.eplb_mixin import EPLBMixin
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.weight_mixin import WeightMixin
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.speculative.spec_info import (
+    SpeculativeAlgorithm,
+    SpeculativeSamplingInfo,
+)
 from sglang.srt.utils import (
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_colorful_logger,
+    get_int_env_var,
     is_npu,
+    monkey_patch_p2p_access_check,
     set_cpu_offload_max_bytes,
 )
+from sglang.srt.utils.oe_utils import update_token_table
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 __is_npu__ = is_npu()
 if __is_npu__:
@@ -71,9 +68,8 @@ else:
     from sglang.srt.model_executor.prefill_cuda_graph_runner import PrefillCudaGraphRunner
 
 logger = get_colorful_logger(__name__)
-from sglang.srt.oe_utils import update_token_table
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = os.getenv("UNBALANCED_MODEL_LOADING_TIMEOUT_S", 300)
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = get_int_env_var("UNBALANCED_MODEL_LOADING_TIMEOUT_S", 300)
 
 
 class ModelRunner(EPLBMixin, WeightMixin):
@@ -96,9 +92,49 @@ class ModelRunner(EPLBMixin, WeightMixin):
         req_to_token_pool=None,
         kv_allocator=None,
         oe_token_table=None,
+        speculative_sampling_info=None,
         enable_overlap: bool = False,
-        draft_model_idx: Optional[int] = None
+        draft_model_idx: Optional[int] = None,
     ):
+        # Every P/D target and MTP worker enters here before set_device,
+        # communicator initialization or GE graph creation.
+        if server_args.device == "npu":
+            from sglang.srt.mem_cache.kv_offload.packed_host import packed_host_enabled
+            from sglang.srt.npu.sfa1_runtime import initialize_sfa1_runtime
+
+            packed_host = packed_host_enabled(server_args)
+            if packed_host and not is_draft_worker:
+                from sglang.srt.npu.offload_schedule import install
+                from sglang.srt.npu.packed_offload_runtime import get_packed_offload_ops
+
+                get_packed_offload_ops()
+                install()
+            self.use_sfa1 = initialize_sfa1_runtime(
+                eligible=(
+                    is_deepseek_nsa(model_config.hf_text_config)
+                    and ENV.npu_enable_mla_split_kv_kr
+                    and not server_args.npu_dsa_kv_int8
+                    and not ENV.npu_enable_sfad_rank_major_query
+                ),
+                offload_enabled=bool(server_args.offload_cache) and not packed_host,
+                # The same predicate attn_initializer builds the offload pool
+                # and its SparseCoordinator under. Only here is an ineligible
+                # layout fatal.
+                owns_offload_pool=(
+                    bool(server_args.offload_cache)
+                    and not packed_host
+                    and not is_draft_worker
+                    and server_args.disaggregation_mode != "prefill"
+                ),
+            )
+            logger.info(
+                "NPU attention ABI: rank=%s draft=%s model=%s route=%s",
+                global_rank, is_draft_worker, model_config.hf_text_config.architectures,
+                "fluent_sfa1" if self.use_sfa1 else "legacy/native",
+            )
+            from sglang.srt.npu.offload_runtime import initialize_host_copy_provider
+            if not packed_host:
+                initialize_host_copy_provider(server_args, is_draft_worker)
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
@@ -126,19 +162,22 @@ class ModelRunner(EPLBMixin, WeightMixin):
         self.req_to_token_pool = req_to_token_pool
         self.kv_allocator = kv_allocator
         self.forward_pass_id = 0
-        self.max_running_requests = server_args.max_running_requests
+        self.max_running_requests = server_args.max_running_requests // server_args.dp_size
         self.oe_token_table = oe_token_table
         self.eagle3_layers_to_capture = server_args.eagle3_layers_to_capture
+        self.speculative_sampling_info = speculative_sampling_info
+        self.target_layers_need_capture = server_args.target_layers_need_capture
 
         self.device_graph_runner = None
         self.spec_num_steps = self.server_args.speculative_num_steps
+        # Accumulated GPU memory used by captured graphs on this rank (GB).
+        # In speculative mode the capture happens in the spec worker, which
+        # accumulates into the target runner's counter.
+        self.graph_mem_usage_gb = 0.0
 
         # Global vars
         if server_args.show_time_cost:
             enable_show_time_cost()
-        if server_args.disable_outlines_disk_cache:
-            from outlines.caching import disable_cache
-            disable_cache()
 
         AttnInitializer.modify_args(self)
         global_server_args_dict_update(server_args)
@@ -146,56 +185,85 @@ class ModelRunner(EPLBMixin, WeightMixin):
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
-        )
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=self.server_args.enable_memory_saver)
 
         self.setup_eplb()
 
         self.sampler = Sampler()
 
-        AttnInitializer.modify_args(self)
-        global_server_args_dict_update(server_args)
         self.load_model(draft_model_idx=draft_model_idx)
         # Handle the case where some of models don't finish loading.
-        try:
-            dist.monitored_barrier(
-                group=get_tp_group().cpu_group,
-                timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
-                wait_all_ranks=True,
-            )
-        except RuntimeError:
-            raise ValueError(
-                f"TP rank {self.attn_tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-            ) from None
+        # Use world group instead of tp group to synchronize across all PP ranks,
+        # since the subsequent init_memory_pool uses world group for all_reduce.
+        # draft worker 跳过: 非末 PP stage 不构造 draft, 参与 world 同步会等不到伙伴。
+        if not self.is_draft_worker:
+            try:
+                dist.monitored_barrier(
+                    group=get_world_group().cpu_group,
+                    timeout=datetime.timedelta(seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"Global rank {self.global_rank} could finish the model loading, but there are other "
+                    "ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) "
+                    "or a slow node."
+                ) from None
 
         # Init memory pool and attention backends
-        AttnInitializer.init_memory_pool(
-            self,
-            min_per_gpu_memory,
-            server_args.max_running_requests,
-            server_args.max_total_tokens,
-            server_args.page_size
-        )
-
-        self.use_over_embedding = self.model_config.use_over_embedding
-        if self.use_over_embedding and self.oe_token_table is None:
-            self.oe_token_table = torch.empty(self.req_to_token_pool.size, self.model_config.context_len,
-                                              dtype=torch.int32, device=server_args.device)
-        AttnInitializer.init_attention_backend(self)
-        if self.device == "cuda":
-            self.init_cublas()
-            self.init_cuda_graphs()
+        # encoder_only: skip KV cache / attention backend / cuda graph — encoder
+        # only runs ViT forward and has no LM decoder, so none of these are needed.
+        if server_args.encoder_only:
+            logger.info("encoder_only=True: skipping KV cache, attention backend, and cuda graph init")
         else:
-            self.prefill_cuda_graph_runner = None
+            # self.max_running_requests is already per DP, matching
+            # TpModelWorker's admission limit. Do not divide by dp_size twice.
+            mem_max_running_requests = self.max_running_requests
+            AttnInitializer.init_memory_pool(self, min_per_gpu_memory, mem_max_running_requests, server_args.max_total_tokens, server_args.page_size)
+            if self.device == "npu":
+                if getattr(self.token_to_kv_pool, "dsa_kv_int8_packed", False):
+                    from sglang.srt.npu.offload_runtime import initialize_layer_copy_burst
+                    initialize_layer_copy_burst(self)
+                else:
+                    from sglang.srt.npu.bf16_layer_burst import initialize_bf16_layer_burst
+                    initialize_bf16_layer_burst(self)
+
+            self.use_over_embedding = self.model_config.use_over_embedding
+            if self.use_over_embedding and self.oe_token_table is None:
+                self.oe_token_table = torch.empty(
+                    self.req_to_token_pool.size, self.model_config.context_len, dtype=torch.int32, device=server_args.device
+                )
+
+            if self.speculative_sampling_info is None:
+                self.speculative_sampling_info = SpeculativeSamplingInfo.create(
+                    self.req_to_token_pool.size,
+                    server_args.speculative_num_draft_tokens,
+                    server_args.speculative_sampling_top_k,
+                    server_args.device,
+                )
+
+            AttnInitializer.init_attention_backend(self)
+            if self.device == "cuda":
+                self.init_cublas()
+                self.init_cuda_graphs()
+            else:
+                self.prefill_cuda_graph_runner = None
 
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             self.model.set_eagle3_layers_to_capture(self.eagle3_layers_to_capture)
 
-    def init_torch_distributed(self):
-        logger.info(f"Init torch distributed begin. Avail mem={get_available_gpu_memory(self.device, self.gpu_id):.4f} GB")
+        # DFLASH: target 抓 target_layers_need_capture 指定层的 hidden 喂 draft (K 层 cat -> [N, K*H]).
+        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            self.model.set_target_layers_need_capture(self.target_layers_need_capture)
+            if self.pp_size > 1:
+                self.model.model.aux_pp_direct = True
+                self.model.init_aux_pp_layout()
 
+    def init_torch_distributed(self):
+        # Set the device first so that get_available_gpu_memory does not warn about
+        # a device mismatch (current_device != gpu_id) when logging memory.
         torch.get_device_module(self.device).set_device(self.gpu_id)
+        logger.info(f"Init torch distributed begin. Avail mem={get_available_gpu_memory(self.device, self.gpu_id):.4f} GB")
         if self.device == "cuda":
             backend = "nccl"
         elif self.device == "npu":
@@ -204,10 +272,7 @@ class ModelRunner(EPLBMixin, WeightMixin):
         if not self.server_args.enable_p2p_check and self.device != "npu":
             monkey_patch_p2p_access_check()
 
-        if self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
-        else:
-            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+        dist_init_method = f"tcp://{self.server_args.dist_init_addr}" if self.server_args.dist_init_addr else f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
 
         if not self.is_draft_worker:
@@ -219,7 +284,7 @@ class ModelRunner(EPLBMixin, WeightMixin):
                 local_rank=self.gpu_id,
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
-                num_nodes=self.server_args.nnodes
+                num_nodes=self.server_args.nnodes,
             )
 
             # Currently PP is not supported, for non-attention parts the communication group is world regardless of layout
@@ -227,14 +292,16 @@ class ModelRunner(EPLBMixin, WeightMixin):
                 tensor_model_parallel_size=self.tp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 pipeline_model_parallel_size=self.pp_size,
-                mlp_tensor_model_parallel_size = self.server_args.dense_tp_size,
+                mlp_tensor_model_parallel_size=self.server_args.dense_tp_size,
                 attn_tp_size=self.attn_tp_size,
             )
 
             # Establish communication groups related to attention, PP not considered for now
-            max_num_tokens = self.server_args.chunked_prefill_size \
-                if self.server_args.chunked_prefill_size > 0 \
+            max_num_tokens = (
+                self.server_args.chunked_prefill_size
+                if self.server_args.chunked_prefill_size > 0
                 else self.server_args.max_prefill_tokens + self.server_args.context_length
+            )
             if self.server_args.enable_mla_l1_5_cache:
                 max_num_tokens = max(self.server_args.mla_max_chunk_capacity, max_num_tokens)
 
@@ -247,15 +314,16 @@ class ModelRunner(EPLBMixin, WeightMixin):
                 local_rank=self.global_rank % self.server_args.nprocs_per_node,
                 hidden_size=self.model_config.hidden_size,
                 max_num_tokens=max_num_tokens,
-                force_deterministic_rsag=global_server_args_dict["force_deterministic_rsag"]
+                force_deterministic_rsag=global_server_args_dict["force_deterministic_rsag"],
+                enable_grammar_cpu_group=self.server_args.grammar_backend is not None and self.server_args.grammar_mask_timeout_ms > 0,
             )
 
             # Establish communication groups related to dense
-            self.dense_tp_size=self.server_args.dense_tp_size
-            self.dense_dp_size=self.world_size // self.dense_tp_size
+            self.dense_tp_size = self.server_args.dense_tp_size
+            self.dense_dp_size = self.world_size // self.dense_tp_size
 
-            self.dense_tp_rank=self.global_rank % self.dense_tp_size
-            self.dense_dp_rank=self.global_rank // self.dense_tp_size
+            self.dense_tp_rank = self.global_rank % self.dense_tp_size
+            self.dense_dp_rank = self.global_rank // self.dense_tp_size
 
             initialize_dp_dense(
                 dense_tp_rank=self.dense_tp_rank,
@@ -286,24 +354,27 @@ class ModelRunner(EPLBMixin, WeightMixin):
         )
 
         # If distributed, all_reduce available GPU memory across all GPUs
+        # draft worker 跳过 world all_reduce (非末 PP stage 不构造 draft, 会等不到伙伴)。
         min_per_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=self.tp_size > 1,
+            distributed=(self.tp_size > 1) and not self.is_draft_worker,
             cpu_group=get_world_group().cpu_group,
         )
 
-        # Check memory for tensor parallelism
-        if self.pp_size==1:
-            if self.tp_size>1:
-                local_gpu_memory=get_available_gpu_memory(self.device, self.gpu_id)
-                if min_per_gpu_memory<local_gpu_memory*0.9:
-                    raise ValueError(
-                        "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
-                    )
-        else:
-            local_gpu_memory=get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(f"{local_gpu_memory=} {min_per_gpu_memory=}")
+        # Check memory balance across TP/PP ranks.  EPD launch scripts may opt out
+        # after deliberately reserving different amounts on different PP stages.
+        if self.tp_size > 1 or self.pp_size > 1:
+            local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
+            if min_per_gpu_memory < local_gpu_memory * 0.9:
+                msg = (
+                    "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+                    f"{min_per_gpu_memory=:.2f} GB, {local_gpu_memory=:.2f} GB"
+                )
+                if envs.SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK.get():
+                    logger.warning(msg)
+                else:
+                    raise ValueError(msg)
 
         return min_per_gpu_memory
 
@@ -329,10 +400,7 @@ class ModelRunner(EPLBMixin, WeightMixin):
             return
 
         if getattr(self.model_config.hf_config, "use_nsa", False):
-            self.model.init_cuda_graph_state_nsa(
-                self.max_running_requests, self.max_total_num_tokens,
-                self.model_config.context_len
-            )
+            self.model.init_cuda_graph_state_nsa(self.max_running_requests, self.max_total_num_tokens, self.model_config.context_len)
 
         if not self.spec_algorithm.is_none():
             # Outside
@@ -348,30 +416,83 @@ class ModelRunner(EPLBMixin, WeightMixin):
             self.prefill_cuda_graph_runner = PrefillCudaGraphRunner(self)
             after_capture_available_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
-                f"Capture Prefill cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
-                f"avail mem={after_capture_available_gpu_memory:.2f} GB"
+                f"Capture Prefill cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={after_capture_available_gpu_memory:.2f} GB"
             )
             logger.info(
                 f"{len(self.prefill_cuda_graph_runner.graphs)} graphs used "
                 f"mem={(before_capture_available_gpu_memory - after_capture_available_gpu_memory):.2f} GB"
             )
+            self.graph_mem_usage_gb += before_capture_available_gpu_memory - after_capture_available_gpu_memory
 
         tic = time.time()
         before_capture_available_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
-            "Capture cuda graph begin. This can take up to several minutes. "
-            f"avail mem={before_capture_available_gpu_memory:.2f} GB in model runner!"
+            f"Capture cuda graph begin. This can take up to several minutes. avail mem={before_capture_available_gpu_memory:.2f} GB in model runner!"
         )
         self.device_graph_runner = CudaGraphRunner(self)
         after_capture_available_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. "
-            f"avail mem={after_capture_available_gpu_memory:.2f} GB"
-        )
+        logger.info(f"Capture cuda graph end. Time elapsed: {time.time() - tic:.2f} s. avail mem={after_capture_available_gpu_memory:.2f} GB")
         logger.info(
             f"{len(self.device_graph_runner.graphs)} graphs used "
             f"mem={(before_capture_available_gpu_memory - after_capture_available_gpu_memory):.2f} GB"
         )
+        self.graph_mem_usage_gb += before_capture_available_gpu_memory - after_capture_available_gpu_memory
+
+    def get_memory_breakdown_gb(self, seen_data_ptrs: Optional[set] = None) -> dict:
+        """Classify this rank's GPU memory into weight groups, KV cache and
+        captured graphs, in GB.
+
+        seen_data_ptrs deduplicates tensors shared across models (e.g. the
+        draft model reuses the target's embedding / lm_head storage).
+        """
+        GB = 1024**3
+        breakdown = {
+            "attention_weights": 0.0,
+            "dense_mlp_weights": 0.0,
+            "moe_weights": 0.0,
+            "other_weights": 0.0,
+            "kv_cache": 0.0,
+        }
+
+        def add_tensor(name, t):
+            if not isinstance(t, torch.Tensor) or t.device.type == "meta":
+                return
+            if seen_data_ptrs is not None:
+                ptr = t.untyped_storage().data_ptr()
+                if ptr in seen_data_ptrs:
+                    return
+                seen_data_ptrs.add(ptr)
+            nbytes = t.numel() * t.element_size()
+            if ".self_attn." in name:
+                breakdown["attention_weights"] += nbytes
+            elif ".mlp." in name:
+                if ".experts." in name or ".shared_experts." in name or ".mlp.gate." in name:
+                    breakdown["moe_weights"] += nbytes
+                else:
+                    breakdown["dense_mlp_weights"] += nbytes
+            else:
+                breakdown["other_weights"] += nbytes
+
+        for name, t in itertools.chain(self.model.named_parameters(), self.model.named_buffers()):
+            add_tensor(name, t)
+        # MLA keeps dequantized bf16 copies of kv_b_proj as plain attributes.
+        for name, module in self.model.named_modules():
+            for attr in ("w_kc", "w_vc"):
+                add_tensor(f"{name}.self_attn.{attr}", getattr(module, attr, None))
+
+        for key in list(breakdown.keys()):
+            breakdown[key] /= GB
+
+        pool = getattr(self, "token_to_kv_pool", None)
+        if pool is not None and hasattr(pool, "get_kv_size_bytes"):
+            try:
+                kv_size = pool.get_kv_size_bytes()
+                breakdown["kv_cache"] = (sum(kv_size) if isinstance(kv_size, tuple) else kv_size) / GB
+            except Exception:
+                logger.warning("Failed to get KV cache size for memory summary", exc_info=True)
+
+        breakdown["cuda_graphs"] = self.graph_mem_usage_gb
+        return breakdown
 
     def init_npu_graphs(self):
         """Enable torch.compile and graph engine with Npu."""
@@ -381,16 +502,14 @@ class ModelRunner(EPLBMixin, WeightMixin):
             # TODO: Currently, npu graph only captures decode steps, which only exists for generation models
             return
         if self.is_draft_worker:
-            logger.info(f"Draft worker skip init npu graphs.")
+            logger.info("Draft worker skip init npu graphs.")
             return
         if not ENV.npu_enable_graph:
             return
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Compile graph with npu begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-        )
+        logger.info(f"Compile graph with npu begin. This can take up to several minutes. avail mem={before_mem:.2f} GB")
         self.device_graph_runner = NpuGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
@@ -403,9 +522,7 @@ class ModelRunner(EPLBMixin, WeightMixin):
 
         if forward_batch.can_run_tbo:
             micro_batches = forward_batch.split_micro_batch()
-            return self.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch, micro_batches=micro_batches
-            )
+            return self.model.forward(forward_batch.input_ids, forward_batch.positions, forward_batch, micro_batches=micro_batches)
         else:
             return self.model.forward(forward_batch.input_ids, forward_batch.positions, forward_batch)
 
@@ -430,9 +547,14 @@ class ModelRunner(EPLBMixin, WeightMixin):
         )
 
     def forward_idle(self, forward_batch: ForwardBatch):
-        return self.model.forward(
-            forward_batch.input_ids, forward_batch.positions, forward_batch
-        )
+        if self.server_args.enable_dsa_qcp:
+            # Idle forwards skip attention-metadata init, so clear stale QCP
+            # metadata here before the model-level `if CP_METADATA:` checks.
+            from sglang.srt.layers.utils import reset_cp_metadata
+
+            reset_cp_metadata()
+        return self.model.forward(forward_batch.input_ids, forward_batch.positions, forward_batch)
+
     @torch.inference_mode()
     def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         self.forward_pass_id += 1
@@ -450,16 +572,25 @@ class ModelRunner(EPLBMixin, WeightMixin):
 
     def _forward_raw(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
         can_run_graph = self.device_graph_runner and self.device_graph_runner.can_run_graph(forward_batch)
+        if not can_run_graph and forward_batch.forward_mode.is_decode() and not __is_npu__:
+            logger.warning(
+                f"rank={self.global_rank} decode forward (bs={forward_batch.batch_size}) "
+                f"falls back to eager mode (no cuda graph). "
+                f"max_bs={self.device_graph_runner.max_bs if self.device_graph_runner else 'N/A'}, "
+                f"disable_padding={self.server_args.disable_cuda_graph_padding}"
+            )
         if __is_npu__:
             if can_run_graph:
-                if self.server_args.speculative_num_draft_tokens == 1: # non mtp
+                if self.server_args.speculative_num_draft_tokens == 1:  # non mtp
                     compile_bs = self.device_graph_runner.compile_bs
                     if global_server_args_dict["npu_disable_all_gather"]:
                         padding_size = max(compile_bs)
                     else:
                         max_input_bs = max(forward_batch.global_num_tokens)
                         max_compile_bs = max(compile_bs)
-                        assert max_input_bs <= max_compile_bs, f"max input batch ({max_input_bs}) should less equal than max compile bs({max_compile_bs}) in graph mode"
+                        assert max_input_bs <= max_compile_bs, (
+                            f"max input batch ({max_input_bs}) should less equal than max compile bs({max_compile_bs}) in graph mode"
+                        )
                         padding_size = min(bs for bs in compile_bs if bs >= max_input_bs)
 
                     forward_batch.padding_for_npu_graph(self, padding_size)
@@ -468,22 +599,16 @@ class ModelRunner(EPLBMixin, WeightMixin):
                 forward_batch.can_run_with_graph = True
                 forward_batch.attn_metadata = get_attn_meta_npu(forward_batch, self)
                 bs = getattr(forward_batch, "ori_bs", forward_batch.batch_size)
-                with self.device_graph_runner.get_runner_context(
-                    forward_batch
-                ) as runner_fn:
+                with self.device_graph_runner.get_runner_context(forward_batch) as runner_fn:
                     if bs >= 1:
                         logger.debug(f"Forward with graph, bs {bs} padding to {forward_batch.batch_size}. ")
                     ret = runner_fn()
-                    fix_kvp_current_kv_cache = getattr(self.device_graph_runner.model_runner.model, "fix_kvp_current_kv_cache", None)
-                    if fix_kvp_current_kv_cache:
-                        self.device_graph_runner.model_runner.model.fix_kvp_current_kv_cache(forward_batch)
+                    self._fix_kvp_current_kv_cache(forward_batch)
 
-                if self.server_args.speculative_num_draft_tokens == 1: # unpadding in non mtp
+                if self.server_args.speculative_num_draft_tokens == 1:  # unpadding in non mtp
                     logits_output = LogitsProcessorOutput(
                         next_token_logits=ret.next_token_logits[:bs],
-                        hidden_states=(
-                            ret.hidden_states[:bs] if ret.hidden_states is not None else None
-                        ),
+                        hidden_states=(ret.hidden_states[:bs] if ret.hidden_states is not None else None),
                     )
                     forward_batch.batch_size = bs
                     return logits_output
@@ -503,17 +628,48 @@ class ModelRunner(EPLBMixin, WeightMixin):
             return self.prefill_cuda_graph_runner.replay(forward_batch)
 
         if forward_batch.forward_mode.is_decode():
-            return self.forward_decode(forward_batch)
+            output = self.forward_decode(forward_batch)
         elif forward_batch.forward_mode.is_extend():
-            return self.forward_extend(forward_batch)
+            output = self.forward_extend(forward_batch)
         elif forward_batch.forward_mode.is_idle():
+            # Idle owns no requests and carries no attn_metadata; there is no
+            # current KV to make persistent.
             return self.forward_idle(forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+        if __is_npu__:
+            self._fix_kvp_current_kv_cache(forward_batch)
+        return output
 
-    def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
-    ):
+    def _fix_kvp_current_kv_cache(self, forward_batch: ForwardBatch):
+        """Make rank 0's current KV persistent after a successful forward.
+
+        Graph and eager paths call this helper after a successful forward.
+        The model hook fills current rows not already covered by inline writes.
+        Offload, KVP ownership and rank checks remain in the model hook.
+        """
+        # npu_graph_runner.__init__ rebinds model_runner.model to
+        # .language_model for a VL wrapper, and the hook lives on the inner
+        # FLASHForCausalLM / FLASHForCausalLMNextN. Look through the wrapper
+        # too, so a configuration that never built that runner does not turn
+        # this into the silent no-op it is here to remove.
+        hook = getattr(self.model, "fix_kvp_current_kv_cache", None)
+        if hook is None:
+            inner = getattr(self.model, "language_model", None)
+            if inner is not None:
+                hook = getattr(inner, "fix_kvp_current_kv_cache", None)
+        if hook is not None:
+            inline_coverage = getattr(self.attn_backend, "inline_current_keyrope_layers", None)
+            inline_layers = inline_coverage(forward_batch) if inline_coverage else frozenset()
+            if inline_layers:
+                if self.is_draft_worker:
+                    hook(forward_batch, skip_keyrope_layers=inline_layers, skip_index_layers=inline_layers)
+                else:
+                    hook(forward_batch, skip_keyrope_layers=inline_layers)
+            else:
+                hook(forward_batch)
+
+    def _preprocess_logits(self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo):
         # Apply logit bias
         if sampling_info.sampling_info_done:
             # Overlap mode: the function update_regex_vocab_mask was executed
@@ -529,11 +685,11 @@ class ModelRunner(EPLBMixin, WeightMixin):
         self,
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[int],
+        top_logprobs_nums: list[int],
+        token_ids_logprobs: list[int],
         next_token_ids: torch.Tensor,
         *,
-        num_tokens_per_req: List[int],
+        num_tokens_per_req: list[int],
     ):
         """Update the logits_output's output logprob based on next_token_ids
 
@@ -596,33 +752,54 @@ class ModelRunner(EPLBMixin, WeightMixin):
             forward_batch.token_ids_logprobs,
         )
 
-        if self.use_over_embedding:
+        if self.use_over_embedding and not forward_batch.forward_mode.is_idle():
             # Update token_table start should be seq_len+1 here
-            if not __is_npu__:
-                forward_batch.oe_out_column_starts[:forward_batch.batch_size]=forward_batch.seq_lens
-                forward_batch.oe_out_req_lens[:forward_batch.batch_size]=1
-                update_token_table(oe_token_table=forward_batch.oe_token_table,
-                                   tokens=next_token_ids,
-                                   row_indices=forward_batch.req_pool_indices,
-                                   column_starts=forward_batch.oe_out_column_starts,
-                                   oe_req_lens=torch.ones_like(next_token_ids),
-                                   )
+            if forward_batch.oe_skip_token_table_update is not None:
+                indices = (~forward_batch.oe_skip_token_table_update).nonzero(as_tuple=True)[0]
+                if indices.numel() > 0:
+                    update_token_table(
+                        oe_token_table=forward_batch.oe_token_table,
+                        tokens=next_token_ids[indices],
+                        row_indices=forward_batch.req_pool_indices[indices],
+                        column_starts=forward_batch.seq_lens[indices].to(torch.int32),
+                        oe_req_lens=torch.ones(indices.numel(), dtype=torch.int32, device=next_token_ids.device),
+                    )
+            elif not __is_npu__:
+                forward_batch.oe_out_column_starts[: forward_batch.batch_size] = forward_batch.seq_lens
+                forward_batch.oe_out_req_lens[: forward_batch.batch_size] = 1
+                if forward_batch.oe_token_table is not None:
+                    update_token_table(
+                        oe_token_table=forward_batch.oe_token_table,
+                        tokens=next_token_ids,
+                        row_indices=forward_batch.req_pool_indices,
+                        column_starts=forward_batch.oe_out_column_starts,
+                        oe_req_lens=torch.ones_like(next_token_ids),
+                    )
             else:
-                req_pool_indices=forward_batch.req_pool_indices[:forward_batch.batch_size]
-                oe_out_column_starts=forward_batch.seq_lens[:forward_batch.batch_size]
-                oe_out_req_lens=torch.ones((forward_batch.batch_size,), device=next_token_ids.device, dtype=torch.int32)
-                update_token_table(oe_token_table=forward_batch.oe_token_table,
-                                   tokens=next_token_ids,
-                                   row_indices=req_pool_indices,
-                                   column_starts=oe_out_column_starts,
-                                   oe_req_lens=oe_out_req_lens,
-                                   )
+                req_pool_indices = forward_batch.req_pool_indices[: forward_batch.batch_size]
+                oe_out_column_starts = forward_batch.seq_lens[: forward_batch.batch_size]
+                oe_out_req_lens = torch.ones((forward_batch.batch_size,), device=next_token_ids.device, dtype=torch.int32)
+                update_token_table(
+                    oe_token_table=forward_batch.oe_token_table,
+                    tokens=next_token_ids,
+                    row_indices=req_pool_indices,
+                    column_starts=oe_out_column_starts,
+                    oe_req_lens=oe_out_req_lens,
+                )
         return next_token_ids
 
     @property
     def model_is_mrope(self) -> bool:
         """Detect if the model has "mrope" rope_scaling type.
-        mrope requires keep "rope_deltas" between prompt and decoding phases."""
+        mrope requires keep "rope_deltas" between prompt and decoding phases.
+        If SGLANG_CLEAR_ROPE_SCALING is set, rope_scaling is intentionally ignored
+        (hf_text_config.rope_scaling is already cleared in ModelConfig.__init__),
+        so we also skip mrope detection to avoid calling _compute_mrope_positions
+        on models that don't implement it (e.g. LongcatFlash with mrope-format config)."""
+        from sglang.srt.utils import get_bool_env_var
+
+        if get_bool_env_var("SGLANG_CLEAR_ROPE_SCALING"):
+            return False
         rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
@@ -633,6 +810,8 @@ class ModelRunner(EPLBMixin, WeightMixin):
         return self.model_config.hf_config.architectures[0] in [
             "Qwen3NextForCausalLM",
             "Qwen3NextForCausalLMNextN",
+            "Qwen3_5MoeForCausalLM",
+            "Qwen3_5MoeForCausalLMNextN",
         ]
 
     @property
@@ -642,5 +821,11 @@ class ModelRunner(EPLBMixin, WeightMixin):
         ]
 
     @property
+    def is_longcat_hybrid_linear(self):
+        arch = self.model_config.hf_config.architectures[0]
+        linear_method = str(getattr(self.model_config.hf_config, "linear_method", "")).upper()
+        return arch == "LongcatCausalLM" or (arch == "FLASHForCausalLM" and linear_method in {"KDA", "FGBKDA"})
+
+    @property
     def mambaish_config(self):
-        return self.is_hybrid_gdn or self.is_kimi_linear
+        return self.is_hybrid_gdn or self.is_kimi_linear or self.is_longcat_hybrid_linear

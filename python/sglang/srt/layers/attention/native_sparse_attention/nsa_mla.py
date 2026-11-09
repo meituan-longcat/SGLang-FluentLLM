@@ -1,33 +1,28 @@
 import math
-from typing import Optional, List
+from typing import Optional
 
 import torch
+from flash_attn_3.flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
 from torch import nn
+
 # from torch.profiler import record_function
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.attention.native_sparse_attention.compress_attn import (
+    _compress_attention_with_score_torch_aligned,
+    _fill_topk_idx_torch_aligned,
+    _transform_score_torch_aligned,
+)
 from sglang.srt.layers.attention.native_sparse_attention.compress_attn_v1 import (
     get_compressed_buffer_loc,
     get_compressed_seqlens,
 )
-
+from sglang.srt.layers.attention.native_sparse_attention.select_attn import _select_attention_torch_aligned
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.qwen3_nsa import AttentionGateFusion, Compress, CompressAttn, SelectiveAttn, load_cu_seqlens, load_kv_cache
 from sglang.srt.utils import add_prefix
-from sglang.srt.models.qwen3_nsa import (
-    CompressAttn, SelectiveAttn, Compress,
-    AttentionGateFusion,
-    load_cu_seqlens, load_kv_cache
-)
-from sglang.srt.layers.attention.native_sparse_attention.compress_attn import (
-    _compress_attention_with_score_torch_aligned,
-    _transform_score_torch_aligned,
-    _fill_topk_idx_torch_aligned,
-)
-from sglang.srt.layers.attention.native_sparse_attention.select_attn import (
-    _select_attention_torch_aligned
-)
-from flash_attn_3.flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
+
 
 class CompressAttnMLA(nn.Module):
     def __init__(
@@ -48,8 +43,8 @@ class CompressAttnMLA(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         kv_b_proj: nn.Module = None,
-        num_slc_score_heads: int=1,
-        virtual_k_group_agg_type: str="max",
+        num_slc_score_heads: int = 1,
+        virtual_k_group_agg_type: str = "max",
         cmp_gate_rescale: bool = False,
         prefix: str = "",
     ):
@@ -58,7 +53,7 @@ class CompressAttnMLA(nn.Module):
         self.mqa = CompressAttn(
             num_q_heads=num_q_heads,
             num_kv_heads=1,
-            qk_head_dim=kv_lora_rank+qk_rope_head_dim,
+            qk_head_dim=kv_lora_rank + qk_rope_head_dim,
             v_head_dim=kv_lora_rank,
             kernel_size=kernel_size,
             stride=stride,
@@ -71,11 +66,11 @@ class CompressAttnMLA(nn.Module):
             scaling=scaling,
             layer_id=layer_id,
             quant_config=quant_config,
-            prefix=prefix
+            prefix=prefix,
         )
         del self.mqa.compress_key
         del self.mqa.compress_value
-        
+
         self.num_q_heads = num_q_heads
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
@@ -91,7 +86,7 @@ class CompressAttnMLA(nn.Module):
         self.sm_scale = scaling
         self.layer_id = layer_id
         self.kv_b_proj = kv_b_proj
-        self.num_slc_score_heads=num_slc_score_heads
+        self.num_slc_score_heads = num_slc_score_heads
         self.virtual_k_group_agg_type = virtual_k_group_agg_type
         self.cmp_gate_rescale = cmp_gate_rescale
         self.compress_kv = Compress(
@@ -110,7 +105,7 @@ class CompressAttnMLA(nn.Module):
             cmp_gate_rescale=cmp_gate_rescale,
             prefix=add_prefix("compress_k_pe", prefix),
         )
-    
+
     def forward(
         self,
         q: torch.Tensor,
@@ -125,13 +120,13 @@ class CompressAttnMLA(nn.Module):
 
         self.compress_kv(
             forward_batch=forward_batch,
-            buffer=key_buffer[..., :self.kv_lora_rank],
-            compressed_buffer=compressed_key_buffer[..., :self.kv_lora_rank],
+            buffer=key_buffer[..., : self.kv_lora_rank],
+            compressed_buffer=compressed_key_buffer[..., : self.kv_lora_rank],
         )
         self.compress_k_pe(
             forward_batch=forward_batch,
-            buffer=key_buffer[..., self.kv_lora_rank:],
-            compressed_buffer=compressed_key_buffer[..., self.kv_lora_rank:],
+            buffer=key_buffer[..., self.kv_lora_rank :],
+            compressed_buffer=compressed_key_buffer[..., self.kv_lora_rank :],
         )
 
         o, topk_idx = self._compress_attention(
@@ -178,10 +173,7 @@ class CompressAttnMLA(nn.Module):
     ):
         # Need to first up-dimension the compress kv pool stuff before doing attn
         seq_lens_kv = forward_batch.seq_lens
-        if forward_batch.forward_mode.is_decode():
-            seqlens_q = seq_lens_kv.new_ones(seq_lens_kv.shape)
-        else:
-            seqlens_q = forward_batch.extend_seq_lens
+        seqlens_q = seq_lens_kv.new_ones(seq_lens_kv.shape) if forward_batch.forward_mode.is_decode() else forward_batch.extend_seq_lens
         seq_lens_block = get_compressed_seqlens(
             seqlens=seq_lens_kv,
             kernel_size=self.kernel_size,
@@ -216,13 +208,15 @@ class CompressAttnMLA(nn.Module):
         topk_idx = q.new_zeros(total_q_len, self.num_slc_score_heads, self.top_k)
 
         for q_start, q_end, kv_start, kv_end, block_start, block_end, p_start, p_end in zip(
-            cu_seq_lens_q[:-1], cu_seq_lens_q[1:],
-            cu_seq_lens_kv[:-1], cu_seq_lens_kv[1:],
-            cu_seq_lens_block[:-1], cu_seq_lens_block[1:],
-            cu_seq_lens_p[:-1], cu_seq_lens_p[1:],
+            cu_seq_lens_q[:-1],
+            cu_seq_lens_q[1:],
+            cu_seq_lens_kv[:-1],
+            cu_seq_lens_kv[1:],
+            cu_seq_lens_block[:-1],
+            cu_seq_lens_block[1:],
+            cu_seq_lens_p[:-1],
+            cu_seq_lens_p[1:],
         ):
-            per_seq_k = k[kv_start:kv_end]
-            per_seq_v = v[kv_start:kv_end]
             kv_len = kv_end - kv_start
             kv_len = kv_len.item()
             q_len = q_end - q_start
@@ -236,25 +230,18 @@ class CompressAttnMLA(nn.Module):
             # [com_block_num, nh, hd]
             cached_kv = compressed_key_buffer[per_seq_compressed_kv_buffer_loc]
             # [..., 576] -> [..., nh, 128], [..., 64]
-            cached_cmp_k_nope, cached_cmp_k_pe, cached_cmp_v =\
-                self.cached_lora_kv_to_kv(cached_kv)
-            
+            cached_cmp_k_nope, cached_cmp_k_pe, cached_cmp_v = self.cached_lora_kv_to_kv(cached_kv)
+
             com_block_num = per_seq_compressed_kv_buffer_loc.shape[0]
             cached_cmp_k = q.new_empty(com_block_num, self.num_q_heads, self.qk_head_dim)
-            cached_cmp_k[..., :self.qk_nope_head_dim] = cached_cmp_k_nope
-            cached_cmp_k[..., self.qk_nope_head_dim:] = cached_cmp_k_pe
+            cached_cmp_k[..., : self.qk_nope_head_dim] = cached_cmp_k_nope
+            cached_cmp_k[..., self.qk_nope_head_dim :] = cached_cmp_k_pe
             # compute mha
             per_seq_o, per_seq_p = _compress_attention_with_score_torch_aligned(
-                per_seq_q.unsqueeze(0),
-                cached_cmp_k.unsqueeze(0),
-                cached_cmp_v.unsqueeze(0),
-                kv_len,
-                self.kernel_size,
-                self.stride,
-                self.sm_scale
+                per_seq_q.unsqueeze(0), cached_cmp_k.unsqueeze(0), cached_cmp_v.unsqueeze(0), kv_len, self.kernel_size, self.stride, self.sm_scale
             )
             o[q_start:q_end] = per_seq_o.squeeze(0)[-q_len:]
-            p[:,p_start:p_end]= per_seq_p.squeeze(0)[:,-q_len:,:].view(self.num_q_heads, p_len)
+            p[:, p_start:p_end] = per_seq_p.squeeze(0)[:, -q_len:, :].view(self.num_q_heads, p_len)
 
             per_seq_select_score = _transform_score_torch_aligned(
                 compress_score=per_seq_p,
@@ -266,7 +253,7 @@ class CompressAttnMLA(nn.Module):
                 slc_att_num_init_blocks=self.slc_att_num_init_blocks,
                 slc_att_num_local_blocks=self.slc_att_num_local_blocks,
                 num_slc_score_heads=self.num_slc_score_heads,
-                virtual_k_group_agg_type=self.virtual_k_group_agg_type
+                virtual_k_group_agg_type=self.virtual_k_group_agg_type,
             )
             per_seq_topk_idx = _fill_topk_idx_torch_aligned(
                 select_probs=per_seq_select_score,
@@ -274,11 +261,11 @@ class CompressAttnMLA(nn.Module):
                 select_size=self.select_size,
                 top_k=self.top_k,
             )
-            topk_idx[q_start:q_end,:, :per_seq_topk_idx.shape[-1]] = per_seq_topk_idx.squeeze(0).transpose(0,1)[-q_len:,:,:]
+            topk_idx[q_start:q_end, :, : per_seq_topk_idx.shape[-1]] = per_seq_topk_idx.squeeze(0).transpose(0, 1)[-q_len:, :, :]
 
         o = o.view(-1, self.num_q_heads * self.v_head_dim)
         return o, topk_idx
-    
+
     def cached_lora_kv_to_kv(self, lora_kv: torch.Tensor):
         kv_a, k_pe = lora_kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         # k_b_proj, v_b_proj = self.kv_b_proj
@@ -312,7 +299,7 @@ class SelectiveAttnMLA(nn.Module):
         self.mqa = SelectiveAttn(
             num_q_heads=num_q_heads,
             num_kv_heads=1,
-            qk_head_dim=kv_lora_rank+qk_rope_head_dim,
+            qk_head_dim=kv_lora_rank + qk_rope_head_dim,
             v_head_dim=kv_lora_rank,
             select_size=select_size,
             scaling=scaling,
@@ -327,7 +314,7 @@ class SelectiveAttnMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.select_size = select_size
         self.sm_scale = scaling
-        self.num_slc_score_heads=num_slc_score_heads
+        self.num_slc_score_heads = num_slc_score_heads
 
     def forward(
         self,
@@ -338,7 +325,7 @@ class SelectiveAttnMLA(nn.Module):
         forward_batch: ForwardBatch,
         qv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        
+
         if qv is None:
             o = self.forward_normal(
                 q=q,
@@ -357,13 +344,13 @@ class SelectiveAttnMLA(nn.Module):
             )
 
         return o
-    
+
     def forward_normal(
         self,
         q: torch.Tensor,
         k,
         v,
-        selected_indices, # [qlen, score_head, topk]
+        selected_indices,  # [qlen, score_head, topk]
         forward_batch: ForwardBatch,
     ):
         """
@@ -377,7 +364,10 @@ class SelectiveAttnMLA(nn.Module):
         o = v.new_zeros(total_q_len, self.num_q_heads, self.v_head_dim)
 
         for q_start, q_end, kv_start, kv_end in zip(
-            cu_seqlens_q[:-1], cu_seqlens_q[1:], cu_seqlens_kv[:-1], cu_seqlens_kv[1:],
+            cu_seqlens_q[:-1],
+            cu_seqlens_q[1:],
+            cu_seqlens_kv[:-1],
+            cu_seqlens_kv[1:],
         ):
             per_seq_k = k[kv_start:kv_end]
             per_seq_v = v[kv_start:kv_end]
@@ -387,7 +377,7 @@ class SelectiveAttnMLA(nn.Module):
             num_selcct_blocks = math.ceil(kv_len / self.select_size)
             per_seq_topk_idx = per_seq_topk_idx[:, :, :num_selcct_blocks]
             per_seq_o = _select_attention_torch_aligned(
-                per_seq_q[None], # [1, qlen, qh, qknope+qkrope]
+                per_seq_q[None],  # [1, qlen, qh, qknope+qkrope]
                 per_seq_k[None],
                 per_seq_v[None],
                 per_seq_topk_idx[None],
@@ -399,6 +389,7 @@ class SelectiveAttnMLA(nn.Module):
 
         o = o.view(-1, self.num_q_heads * self.v_head_dim)
         return o
+
 
 class SlidingWindowAttnMLA(nn.Module):
     def __init__(
@@ -420,7 +411,7 @@ class SlidingWindowAttnMLA(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.sliding_window_size = sliding_window_size
-        self.scaling=scaling
+        self.scaling = scaling
         self.layer_id = layer_id
 
     def forward(
@@ -447,33 +438,31 @@ class SlidingWindowAttnMLA(nn.Module):
             )
 
         return o
-        
+
     def forward_absorb(
         self,
         q: torch.Tensor,
         forward_batch: ForwardBatch,
         qv: torch.Tensor,
     ):
-        seq_num, = forward_batch.seq_lens.shape
+        (seq_num,) = forward_batch.seq_lens.shape
 
         cache_seqlens = forward_batch.seq_lens.to(torch.int32)
         cache_batch_idx = forward_batch.req_pool_indices.to(torch.int32)
 
         if forward_batch.forward_mode.is_decode():
             causal = False
-            max_seqlen_q=1
+            max_seqlen_q = 1
             cu_seqlens_q = torch.arange(0, seq_num + 1, dtype=torch.int32, device=cache_seqlens.device)
         else:
             causal = True
             max_seqlen_q = max(forward_batch.extend_seq_lens_cpu)
-            cu_seqlens_q = torch.nn.functional.pad(
-                torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
-            )
+            cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32), (1, 0))
 
         # reference: https://github.com/Dao-AILab/flash-attention/issues/1471
         o = flash_attn_with_kvcache(
             q=q,
-            k_cache=forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id)[..., self.kv_lora_rank:].unsqueeze(1),
+            k_cache=forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id)[..., self.kv_lora_rank :].unsqueeze(1),
             v_cache=forward_batch.token_to_kv_pool.get_value_buffer(self.layer_id).unsqueeze(1),
             qv=qv,
             page_table=forward_batch.req_to_token_pool.req_to_token,
@@ -488,7 +477,7 @@ class SlidingWindowAttnMLA(nn.Module):
 
         o = o.view(-1, self.num_q_heads * self.kv_lora_rank)
         return o
-    
+
     def forward_normal(
         self,
         q: torch.Tensor,
@@ -502,9 +491,7 @@ class SlidingWindowAttnMLA(nn.Module):
         assert not forward_batch.forward_mode.is_decode()
         assert sum(forward_batch.extend_prefix_lens_cpu) == 0
 
-        cu_seqlens = torch.nn.functional.pad(
-            torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), (1, 0)
-        )
+        cu_seqlens = torch.nn.functional.pad(torch.cumsum(forward_batch.seq_lens, dim=0, dtype=torch.int32), (1, 0))
         max_seqlen = forward_batch.seq_lens.max().item()
 
         o = flash_attn_varlen_func(
@@ -544,15 +531,18 @@ class NativeSparseAttentionMLA(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         kv_b_proj: nn.Module = None,
-        num_slc_score_heads: int=1,
-        virtual_k_group_agg_type: str="max",
-        nsa_gate_mask: List = [1,1,1],
+        num_slc_score_heads: int = 1,
+        virtual_k_group_agg_type: str = "max",
+        nsa_gate_mask: list | None = None,
         nsa_gate_type: str = "softmax",
         gate_weight_head_not_share: bool = False,
         config: PretrainedConfig = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
+
+        if nsa_gate_mask is None:
+            nsa_gate_mask = [1, 1, 1]
 
         assert select_size >= kernel_size
         assert kernel_size % stride == 0
@@ -572,7 +562,7 @@ class NativeSparseAttentionMLA(nn.Module):
         self.config = config
         self.cmp_gate_rescale = getattr(config, "cmp_gate_rescale", False)
         self.fusion_gate_rescale = getattr(config, "fusion_gate_rescale", False)
-        qk_head_dim = qk_nope_head_dim+qk_rope_head_dim
+        qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
         self.compress_attn = CompressAttnMLA(
             num_q_heads=num_q_heads,
@@ -646,47 +636,45 @@ class NativeSparseAttentionMLA(nn.Module):
     ) -> torch.Tensor:
         """
         Native Sparse Attention MLA forward pass with dual execution modes.
-        
+
         === Execution Mode Details ===
-        
+
         1. **Standard MHA Mode** (qv=None):
            Input tensor shapes:
            • q: [total_q_len, num_q_heads, qk_nope_head_dim + qk_rope_head_dim]
              Complete query tensor containing both content (nope) and position (rope) components
-             
-           • k: [total_kv_len, num_q_heads, qk_nope_head_dim + qk_rope_head_dim] 
+
+           • k: [total_kv_len, num_q_heads, qk_nope_head_dim + qk_rope_head_dim]
              Key tensor for eache query heads, contains both content and position components
-             
+
            • v: [total_kv_len, num_q_heads, v_head_dim]
              Value tensors for each query heads, full dimensionality after LoRA projection
-        
+
         2. **Absorb MQA Mode** (qv!=None):
            Input tensor shapes:
-           • q: [total_q_len, num_q_heads, qk_rope_head_dim] 
+           • q: [total_q_len, num_q_heads, qk_rope_head_dim]
              Position-only query component (q_pe)
-             
+
            • k: [total_kv_len, 1, qk_rope_head_dim]
              Position-only key component (k_pe), shared across query heads
-             
+
            • v: [total_kv_len, 1, kv_lora_rank]
              LoRA-compressed value tensor (lora_kv), shared across query heads
-             
+
            • qv: [total_q_len, num_q_heads, kv_lora_rank]
              Same as q_nope_out, pre-computed content for absorb mode
-        
+
         Args:
             q, k, v, qv: Input tensors with mode-dependent shapes as described above
             forward_batch: Batch processing context containing memory pools and sequence metadata
             save_kv_cache: Whether to cache key-value pairs for subsequent attention steps
-            
+
         Returns:
             torch.Tensor: Attention output [total_q_len, num_q_heads * v_head_dim]
         """
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self, forward_batch.out_cache_loc, torch.cat([v, k], dim=-1), None
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(self, forward_batch.out_cache_loc, torch.cat([v, k], dim=-1), None)
 
         o_list = []
         cmp_o = select_o = window_o = None
@@ -719,17 +707,14 @@ class NativeSparseAttentionMLA(nn.Module):
             )
         o_list.append(window_o)
         num_q_tokens = q.shape[0]
-        o_list = list(map(
-            lambda e: None if e is None else \
-                e.view(num_q_tokens, self.num_q_heads, -1),
-            o_list
-        ))
+        o_list = list(map(lambda e: None if e is None else e.view(num_q_tokens, self.num_q_heads, -1), o_list))
         if qv is not None:
-            o_list = list(map(
-                # [qh, b, 512] @ [qh, 512, 128] -> [qh, b, 128] -> [b, qh, 128]
-                lambda e: None if e is None else \
-                    torch.bmm(e.transpose(0, 1), self.w_vc).transpose(0, 1),
-                o_list
-            ))
+            o_list = list(
+                map(
+                    # [qh, b, 512] @ [qh, 512, 128] -> [qh, b, 128] -> [b, qh, 128]
+                    lambda e: None if e is None else torch.bmm(e.transpose(0, 1), self.w_vc).transpose(0, 1),
+                    o_list,
+                )
+            )
         o = self.gate_fusion(*o_list)
         return o

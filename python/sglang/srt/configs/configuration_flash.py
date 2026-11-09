@@ -1,9 +1,16 @@
+import os
+
+import torch
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
+
+from sglang.srt.utils.common import divide
 
 logger = logging.get_logger(__name__)
 
 FLASH_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
+
+
 class FLASHConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`FLASHModel`]. It is used to instantiate an FLASH
@@ -85,8 +92,8 @@ class FLASHConfig(PretrainedConfig):
         num_layers=28,
         num_hidden_layers=None,
         num_attention_heads=96,
-        num_key_value_heads=128,
-        ep_size = 1,
+        num_key_value_heads=1,
+        ep_size=1,
         kv_lora_rank=512,
         q_lora_rank=1536,
         qk_rope_head_dim=64,
@@ -116,15 +123,25 @@ class FLASHConfig(PretrainedConfig):
         topk_method=None,
         routed_scaling_factor=None,
         zero_expert_num=0,
-        zero_expert_type="",
+        zero_expert_type=None,
         nextn_use_scmoe=False,
         oe_vocab_size_ratio=None,
         oe_neighbor_num=None,
         oe_split_num=None,
-        ignored_token_ids=None,
+        oe_ignore_tokens=None,
         ngram_vocab_size_ratio=None,
         emb_neighbor_num=None,
         emb_split_num=None,
+        embP=None,
+        indexer_rope_interleave: bool = True,
+        linear_method=None,
+        linear_hidden_size=None,
+        linear_head_dim=None,
+        linear_num_heads=None,
+        linear_conv_size=None,
+        fa_interval=4,
+        use_mla=1,
+        full_attention_layer_ids=None,
         **kwargs,
     ):
         super().__init__(
@@ -169,27 +186,109 @@ class FLASHConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.mla_scale_q_lora = mla_scale_q_lora
         self.mla_scale_kv_lora = mla_scale_kv_lora
-        self.zero_expert_num=zero_expert_num
-        self.zero_expert_type=zero_expert_type
-        self.routed_scaling_factor=routed_scaling_factor
+        # Whether the indexer uses interleaved (GPT-J style) rotary position
+        self.indexer_rope_interleave = indexer_rope_interleave
+        self.zero_expert_num = zero_expert_num
+        self.zero_expert_type = zero_expert_type
+        self.routed_scaling_factor = routed_scaling_factor
         self.hidden_act = "silu"
         self.use_over_embedding = oe_vocab_size_ratio is not None
         self.over_embedding_vocab_size_ratio = oe_vocab_size_ratio
+        self.over_embedding_base = vocab_size
         if self.use_over_embedding:
-            self.over_embedding_m = int(vocab_size * oe_vocab_size_ratio)
+            self.over_embedding_m = int(self.over_embedding_base * oe_vocab_size_ratio)
             self.oe_neighbor_num = oe_neighbor_num
             self.oe_split_num = oe_split_num
-            self.oe_ignore_tokens = []
-            if ignored_token_ids is not None and ignored_token_ids != '':
-                # Looks like this: "ignored_token_ids": "0:4,36:55" separated by commas, left-closed right-open
-                for id_range in ignored_token_ids.split(','):
-                    id_start = int(id_range.split(':')[0])
-                    id_end = int(id_range.split(':')[1])
-                    self.oe_ignore_tokens.extend(range(id_start, id_end))
+            self.embp = embP
+            self.oe_ignore_tokens = self.build_oe_ignore_tokens(oe_ignore_tokens)
         self.use_ngram_embedding = ngram_vocab_size_ratio is not None
         if self.use_ngram_embedding:
             self.use_over_embedding = True
-            self.over_embedding_m = int(ngram_vocab_size_ratio * vocab_size)
+            self.over_embedding_m = int(ngram_vocab_size_ratio * self.over_embedding_base)
             self.oe_neighbor_num = emb_neighbor_num
             self.oe_split_num = emb_split_num
-            self.oe_ignore_tokens = []
+            self.embp = None
+            self.oe_ignore_tokens = self.build_oe_ignore_tokens(oe_ignore_tokens)
+            self.eos_token_id = eos_token_id
+
+        # Optional hybrid linear attention (KDA/FGB-KDA) settings.
+        self.linear_method = linear_method
+        self.linear_hidden_size = linear_hidden_size if linear_hidden_size is not None else hidden_size
+        self.linear_head_dim = linear_head_dim if linear_head_dim is not None else hidden_size // num_attention_heads
+        self.linear_num_heads = linear_num_heads if linear_num_heads is not None else num_attention_heads
+        self.linear_conv_size = linear_conv_size if linear_conv_size is not None else 4
+        self.fa_interval = fa_interval
+        self.use_mla = use_mla
+        self.kda_nope = kwargs.get("kda_nope", False)
+
+        self.use_hybrid_linear_kda = str(self.linear_method).upper() in {"KDA", "FGBKDA"}
+        total_attention_layers = self.num_hidden_layers * 2
+        if full_attention_layer_ids is not None:
+            self.full_attention_layer_ids = list(full_attention_layer_ids)
+        elif self.use_hybrid_linear_kda and self.use_mla:
+            interval = max(int(self.fa_interval), 1)
+            self.full_attention_layer_ids = [i for i in range(total_attention_layers) if (i + 1) % interval == 0]
+        else:
+            self.full_attention_layer_ids = list(range(total_attention_layers))
+        self.linear_layer_ids = [i for i in range(total_attention_layers) if i not in set(self.full_attention_layer_ids)]
+
+    @staticmethod
+    def build_oe_ignore_tokens(oe_ignore_tokens):
+        """Parse and deduplicate the explicitly configured OE ignore tokens."""
+        tokens = set()
+
+        if oe_ignore_tokens is not None and oe_ignore_tokens != "":
+            if isinstance(oe_ignore_tokens, str):
+                for id_range in oe_ignore_tokens.split(","):
+                    id_range = id_range.strip()
+                    if not id_range:
+                        continue
+                    a, sep, b = id_range.partition(":")
+                    if sep:
+                        tokens.update(range(int(a), int(b)))
+                    else:
+                        tokens.add(int(a))
+            else:
+                tokens.update(int(t) for t in oe_ignore_tokens)
+
+        return sorted(tokens)
+
+    @property
+    def linear_attn_config(self):
+        return {
+            "head_dim": self.linear_head_dim,
+            "num_heads": self.linear_num_heads,
+            "short_conv_kernel_size": self.linear_conv_size,
+            "kda_layers": [i + 1 for i in self.linear_layer_ids],
+            "full_attn_layers": [i + 1 for i in self.full_attention_layer_ids],
+        }
+
+    @property
+    def mamba2_cache_params(self):
+        from sglang.srt.layers.attention.dp_attention import get_attention_tp_size
+
+        world_size = get_attention_tp_size()
+        num_heads = self.linear_num_heads
+        head_dim = self.linear_head_dim
+        conv_kernel_size = self.linear_conv_size
+        proj_size = num_heads * head_dim
+        conv_state_shape = (divide(proj_size, world_size), conv_kernel_size - 1)
+        temporal_state_shape = (divide(num_heads, world_size), head_dim, head_dim)
+        conv_state_shape = conv_state_shape[1], conv_state_shape[0]
+        conv_dtype = torch.bfloat16
+        dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+        ssm_dtype = dtype_map[os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "bfloat16")]
+        return (
+            [conv_state_shape, conv_state_shape, conv_state_shape],
+            temporal_state_shape,
+            conv_dtype,
+            ssm_dtype,
+            self.linear_layer_ids,
+        )
+
+    @property
+    def mamba_cache_per_req(self):
+        conv_state_shapes, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = self.mamba2_cache_params
+        conv_items = sum(int(torch.tensor(shape).prod().item()) for shape in conv_state_shapes)
+        temporal_items = int(torch.tensor(temporal_state_shape).prod().item())
+        return (conv_items * conv_dtype.itemsize + temporal_items * ssm_dtype.itemsize) * len(mamba_layers)

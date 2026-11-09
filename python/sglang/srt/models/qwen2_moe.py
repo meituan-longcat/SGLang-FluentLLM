@@ -16,48 +16,44 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
-from typing import Any, Dict, Iterable, Optional, Tuple
+# ruff: noqa: F821
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
-from sglang.srt.utils import is_npu
-_is_npu = is_npu()
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import get_dense_tp_rank, get_dense_tp_size
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.dp_attention import (
-    get_dense_tp_size, get_dense_tp_rank
-)
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
-from sglang.srt.layers.logits_processor import LogitsProcessor
-
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ops.activation import SiluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -110,12 +106,9 @@ class Qwen2MoeMLP(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("down_proj", prefix),
             )
-        
+
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -137,10 +130,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
         if self.tp_size > config.num_experts:
-            raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_experts}."
-            )
+            raise ValueError(f"Tensor parallel size {self.tp_size} is greater than the number of experts {config.num_experts}.")
 
         self.experts = FusedMoE(
             num_experts=config.num_experts,
@@ -152,9 +142,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        self.gate = ReplicatedLinear(
-            config.hidden_size, config.num_experts, bias=False, quant_config=None
-        )
+        self.gate = ReplicatedLinear(config.hidden_size, config.num_experts, bias=False, quant_config=None)
         if config.shared_expert_intermediate_size > 0:
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -174,15 +162,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
+                shared_output = F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1:
@@ -199,7 +183,7 @@ class Qwen2MoeAttention(nn.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -296,12 +280,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
 
         # Note: Qwen/Qwen2-57B-A14B-Instruct does not have
         # `mlp_only_layers` in the config.
-        mlp_only_layers = (
-            [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
-        )
-        if (layer_id not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0
-        ):
+        mlp_only_layers = [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
+        if (layer_id not in mlp_only_layers) and (config.num_experts > 0 and (layer_id + 1) % config.decoder_sparse_step == 0):
             self.mlp = Qwen2MoeSparseMoeBlock(config=config, quant_config=quant_config)
         else:
             self.mlp = Qwen2MoeMLP(
@@ -311,9 +291,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -355,10 +333,7 @@ class Qwen2MoeModel(nn.Module):
             config.hidden_size,
         )
         self.layers = nn.ModuleList(
-            [
-                Qwen2MoeDecoderLayer(config, layer_id, quant_config=quant_config)
-                for layer_id in range(config.num_hidden_layers)
-            ]
+            [Qwen2MoeDecoderLayer(config, layer_id, quant_config=quant_config) for layer_id in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -369,22 +344,16 @@ class Qwen2MoeModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            hidden_states, residual = layer(positions, hidden_states, forward_batch, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
 class Qwen2MoeForCausalLM(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -396,9 +365,7 @@ class Qwen2MoeForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = Qwen2MoeModel(config, quant_config)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
-        )
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -410,11 +377,9 @@ class Qwen2MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -482,9 +447,7 @@ class Qwen2MoeForCausalLM(nn.Module):
                         continue
 
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
 
 

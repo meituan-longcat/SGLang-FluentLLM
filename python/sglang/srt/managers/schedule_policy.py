@@ -23,10 +23,10 @@ from typing import Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.managers.req import Req
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.allocator import KVAllocator
+from sglang.srt.managers.scheduling.schedule_batch import ScheduleBatch, PrefillReqInfo
+from sglang.srt.mem_cache.memory_pool.kv_allocator import KVAllocator
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
+from sglang.srt.observability.metrics.collector import CacheHitMetrics
 from sglang.srt.utils import get_colorful_logger
 logger = get_colorful_logger(__name__)
 from sglang.srt.env import global_server_args_dict
@@ -73,7 +73,7 @@ class CacheAgnosticPolicy(Enum):
 class SchedulePolicy:
     Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 
-    def __init__(self, policy: str, tree_cache: BasePrefixCache, enable_hierarchical_cache: bool):
+    def __init__(self, policy: str, tree_cache: RadixCache, enable_hierarchical_cache: bool):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
@@ -116,7 +116,7 @@ class SchedulePolicy:
         return self.policy
 
     def _validate_and_adjust_policy(
-        self, policy: str, tree_cache: BasePrefixCache
+        self, policy: str, tree_cache
     ) -> Policy:
         """
         Validates the policy and adjusts it if necessary based on tree cache settings.
@@ -190,7 +190,7 @@ class SchedulePolicy:
 
     @staticmethod
     def _sort_by_dfs_weight(
-        waiting_queue: List[Req], tree_cache: BasePrefixCache
+        waiting_queue: List[Req], tree_cache: RadixCache
     ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
@@ -244,134 +244,120 @@ class SchedulePolicy:
 
 class AddReqResult(Enum):
     CONTINUE = auto()  # Continue to add requests
-    NO_TOKEN = auto()  # No token left
-    OTHER = auto()  # Other reasons to stop adding requests
-
+    NO_TOKEN = auto()  # No token left or no req slot
+    OTHER = auto()  # can not add any more
 
 class PrefillAdder:
     def __init__(
         self,
-        tree_cache: BasePrefixCache,
+        tree_cache: RadixCache,
         token_to_kv_pool_allocator: KVAllocator,
-        running_batch: ScheduleBatch,
-        new_token_ratio: float,
-        rem_input_tokens: int,
-        rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
+        chunk_size: int,
+        total_reserved_input_tokens: int,
+        total_reserved_kv_pages: int, #reserved kv pages
+        max_request_num: int, # can_run_list<=max_request_num
+        cache_hit_metrics: CacheHitMetrics,
     ):
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.running_batch = running_batch
-        self.new_token_ratio = new_token_ratio
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
-        self.rem_chunk_tokens = rem_chunk_tokens # chunked prefill size
-        if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= mixed_with_decode_tokens
+        self.remain_input_tokens = chunk_size - total_reserved_input_tokens
+        self.total_reserved_pages = total_reserved_kv_pages # remain_kv_tokens use property
+        self.page_size = self.token_to_kv_pool_allocator.page_size
+        self.max_request_num = max_request_num
 
-        self.rem_total_token_offset = mixed_with_decode_tokens
-        self.cur_rem_token_offset = mixed_with_decode_tokens
-
-        self.req_states = None
         self.can_run_list = []
-        self.new_chunked_req = None
+        self.chunked_req = None
+        self.batch_info = []
+
+        # Batch/chunk-level stats for Prefill batch log fields.
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
-        
-        # HiCache L1/L2/L3 statistics
-        self.log_l1_hit_tokens = 0  # GPU cache hits
-        self.log_l2_hit_tokens = 0  # Host/CPU cache hits
-        self.log_l3_hit_tokens = 0  # Storage cache hits (loaded from storage)
+        self.log_context_tokens = 0
+        self.dequeue_durations=[]
 
-        if running_batch is not None:
-            self.rem_total_token_offset += sum(
-                [
-                    min(
-                        (r.sampling_params.max_new_tokens - len(r.output_ids)),
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                    )
-                    * self.new_token_ratio
-                    for r in running_batch.reqs
-                ]
-            )
+        self.cache_hit_metrics = cache_hit_metrics
 
     @property
-    def rem_total_tokens(self):
+    def remain_kv_pages(self):
         return (
             self.token_to_kv_pool_allocator.available_size()
             + self.tree_cache.evictable_size()
-        ) * self.token_to_kv_pool_allocator.page_size - self.rem_total_token_offset
-
-    @property
-    def cur_rem_tokens(self):
-        return (
-            self.token_to_kv_pool_allocator.available_size()
-            + self.tree_cache.evictable_size()
-        ) * self.token_to_kv_pool_allocator.page_size - self.cur_rem_token_offset
-
-    def ceil_paged_tokens(self, tokens: int) -> int:
-        return -(-tokens // self.token_to_kv_pool_allocator.page_size) * self.token_to_kv_pool_allocator.page_size
+        ) - self.total_reserved_pages
 
     def budget_state(self):
-        if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+        if self.remain_input_tokens <= 0:
+            return AddReqResult.OTHER
+
+        if len(self.can_run_list) >= self.max_request_num:
             return AddReqResult.NO_TOKEN
 
-        if self.rem_input_tokens <= 0 or (
-            self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0
-        ):
-            return AddReqResult.OTHER
+        if self.remain_kv_pages <= 0:
+            return AddReqResult.NO_TOKEN
 
         return AddReqResult.CONTINUE
 
+    def is_full(self):
+        # when kv cache or request slot is not enough, batch is not full, then we can wait for some time
+        if self.remain_input_tokens<=0:
+            return True
+
+        if len(self.can_run_list)>=self.max_request_num:
+            return True
+
+        return False
+
     def _prefill_one_req(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int,
-        device_prefix_len: int = 0, host_hit_len: int = 0, storage_hit_len: int = 0
+        self, extend_input_len: int, max_new_tokens: int,
+        req: Req,
+        hit_len = 0, device_prefix_len: int = 0, host_hit_len: int = 0, storage_hit_len: int = 0,
     ):
-        self.rem_total_token_offset += extend_input_len + max_new_tokens
-        self.cur_rem_token_offset += extend_input_len
-        self.rem_input_tokens -= extend_input_len
-        if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= extend_input_len
+        reserved_pages = (
+            extend_input_len + max_new_tokens + self.page_size - 1
+        ) // self.page_size + 1  # One draft page per request.
+        self.total_reserved_pages += reserved_pages
+        self.remain_input_tokens -= extend_input_len
 
-        self.log_hit_tokens += prefix_len
+        self.log_hit_tokens += hit_len
         self.log_input_tokens += extend_input_len
-        
-        self.log_l1_hit_tokens += device_prefix_len
-        
-        self.log_l2_hit_tokens += host_hit_len
-        
-        self.log_l3_hit_tokens += storage_hit_len
-        
-        logger.debug(
-            f"[_prefill_one_req] extend_input_len={extend_input_len} prefix_len={prefix_len} device_prefix_len={device_prefix_len} host_hit_len={host_hit_len} storage_hit_len={storage_hit_len} "
-            f"log_l1={self.log_l1_hit_tokens} log_l2={self.log_l2_hit_tokens} log_l3={self.log_l3_hit_tokens} log_input={self.log_input_tokens}"
-        )
+        self.log_context_tokens += (req.prefix_len + extend_input_len)
 
-    def add_chunked_req(self, req: Req):
+        self.cache_hit_metrics.add(extend_input_len + hit_len, hit_len, device_prefix_len, host_hit_len, storage_hit_len)
+        self.batch_info.append(PrefillReqInfo(extend_input_len, req.prefix_len+extend_input_len, host_hit_len, storage_hit_len))
 
-        truncated = req.extend_input_len > self.rem_chunk_tokens
-        req.extend_input_len = min(req.extend_input_len, self.rem_chunk_tokens)
-        req.fill_ids = req.fill_ids[: req.prefix_len + req.extend_input_len]
-        req.draft_fill_ids = req.draft_fill_ids[: req.prefix_len + req.extend_input_len]
-        if "multi_ids" in global_server_args_dict["mm_mode"]:
-            req.fill_multi_ids = req.fill_multi_ids[: req.prefix_len + req.extend_input_len]
-        if req.input_embeds is not None:
-            # input_embeds only appear in input, ids/multi_ids will be used during autoregression
-            req.fill_input_embeds = req.input_embeds[: req.prefix_len + req.extend_input_len]
+    def get_reserved_new_token_num(self, req: Req):
+        if req.sampling_params.ignore_eos and global_server_args_dict["disaggregation_mode"]!="prefill":
+            reserved_new_token_num=req.sampling_params.max_new_tokens
+        else:
+            reserved_new_token_num=min(
+                req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+            )
+        return reserved_new_token_num
+
+    def _add_one_req_inner(self, req: Req,
+                           hit_len=0, device_prefix_len: int = 0, host_hit_len: int = 0, storage_hit_len: int = 0,):
+        truncated = req.extend_input_len > self.remain_input_tokens
+        if truncated:
+            input_tokens=self.remain_input_tokens
+            reserved_new_token_num=0
+            req.chunk_split(input_tokens)
+            assert self.chunked_req is None
+            self.chunked_req=req
+            logger.debug(f"[add_chunked_req] rid={req.rid}, len(fill_ids)={len(req.fill_ids)}, extend_input_len={req.extend_input_len}")
+        else:
+            input_tokens=req.extend_input_len
+            reserved_new_token_num=self.get_reserved_new_token_num(req)
+
         self.can_run_list.append(req)
-
         self._prefill_one_req(
-            0,
-            req.extend_input_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
-                if not truncated
-                else 0
-            ),
+            input_tokens,
+            reserved_new_token_num,
+            req=req,
+            hit_len=hit_len,
+            device_prefix_len=device_prefix_len,
+            host_hit_len=host_hit_len,
+            storage_hit_len=storage_hit_len,
         )
-        logger.debug(f"[add_chunked_req] rid={req.rid}, len(fill_ids)={len(req.fill_ids)}, extend_input_len={req.extend_input_len}")
-
-        # Return if chunked prefill not finished
-        return req if truncated else None
+        assert self.remain_kv_pages >= 0
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -381,116 +367,66 @@ class PrefillAdder:
         finally:
             self.tree_cache.dec_lock_ref(last_node)
 
-    def _add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
-        def add_req_state(r, insert_sort=False):
-            new_token_ratio = (
-                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            )
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
-                r.output_ids
-            )
-            tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
-
-            if tokens_left > 0:
-                if not insert_sort:
-                    self.req_states.append((tokens_left, tokens_occupied))
-                else:
-                    i = 0
-                    for i in range(len(self.req_states)):
-                        if tokens_left <= self.req_states[i][0]:
-                            break
-                    self.req_states.insert(i, (tokens_left, tokens_occupied))
-
-        if self.req_states is None:
-            self.req_states = []
-            add_req_state(req)
-            if self.running_batch is not None:
-                for r in self.running_batch.reqs:
-                    add_req_state(r)
-            for r in self.can_run_list:
-                add_req_state(r)
-            self.req_states.sort(key=lambda x: x[0])
+    def get_req_reserved_kv_pages(self, req: Req, host_hit_len=0):
+        extend_input_len = req.extend_input_len - host_hit_len
+        truncated = extend_input_len > self.remain_input_tokens
+        if truncated:
+            reserved_kv_tokens=self.remain_input_tokens + host_hit_len
         else:
-            add_req_state(req, insert_sort=True)
+            reserved_kv_tokens=extend_input_len + self.get_reserved_new_token_num(req)  + host_hit_len
 
-        cur_rem_tokens = self.cur_rem_tokens - len(req.origin_input_ids)
-        tokens_freed = 0
-        for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-            decode_steps = (
-                self.req_states[i + 1][0]
-                if i + 1 < len(self.req_states)
-                else tokens_left
-            )
-            bs = len(self.req_states) - i
-            if cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
-                return AddReqResult.NO_TOKEN
-            tokens_freed += tokens_occupied
+        reserved_kv_pages = (
+            reserved_kv_tokens + self.page_size - 1
+        ) // self.page_size + 1
+        return reserved_kv_pages
 
-        if (
-            self.rem_chunk_tokens is None
-            or req.extend_input_len <= self.rem_chunk_tokens
-        ):
-            # Non-chunked prefill
-            self.can_run_list.append(req)
-            self._prefill_one_req(
-                0,
-                req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION),
-            )
-        else:
-            # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
-            if trunc_len == 0:
-                return AddReqResult.OTHER
-
-            req.extend_input_len = trunc_len
-            req.fill_ids = req.fill_ids[:trunc_len]
-            if "multi_ids" in global_server_args_dict["mm_mode"]:
-                req.fill_multi_ids = req.fill_multi_ids[:trunc_len]
-            if req.input_embeds is not None:
-                req.fill_input_embeds= req.input_embeds[:trunc_len]
-            req.draft_fill_ids = req.draft_fill_ids[:trunc_len]
-            self.can_run_list.append(req)
-            self.new_chunked_req = req
-            self._prefill_one_req(0, trunc_len, 0)
-
-        return self.budget_state()
-
-    def add_one_req(self, req: Req, has_chunked_req: bool):
-        if req.sampling_params.ignore_eos and self.tree_cache.disable:
-            return self._add_one_req_ignore_eos(req, has_chunked_req)
-
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
-        )
-        input_tokens = req.extend_input_len
-        prefix_len = req.prefix_len
-
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
-
-        if input_tokens > self.rem_input_tokens and len(self.can_run_list) != 0:
+    def add_chunked_req(self, req: Req):
+        if self.remain_input_tokens <= 0:
             return AddReqResult.OTHER
 
+        if len(self.can_run_list) >= self.max_request_num:
+            return AddReqResult.NO_TOKEN
+
+        reserved_kv_pages = self.get_req_reserved_kv_pages(req)
+        if reserved_kv_pages > self.remain_kv_pages:
+            return AddReqResult.NO_TOKEN
+
+        self._add_one_req_inner(req)
+        return self.budget_state()
+
+    def add_one_req(self, req: Req):
+        if self.remain_input_tokens <= 0:
+            return AddReqResult.OTHER
+
+        if len(self.can_run_list) >= self.max_request_num:
+            return AddReqResult.NO_TOKEN
+
         with self._lock_node(req.last_node):
-            if total_tokens > self.rem_total_tokens:
+            reserved_kv_pages = self.get_req_reserved_kv_pages(
+                req, req.host_hit_length
+            )
+            if reserved_kv_pages>self.remain_kv_pages:
                 return AddReqResult.NO_TOKEN
 
             # Calculate L1, L2, L3 hit lengths
             # L1: Original GPU cache (device_prefix_len, already in GPU)
             l1_hit_len = req.prefix_len
+            prefix_len=req.prefix_len
             # L2: Host cache that will be loaded back (host native cache)
             if req.l2_cache_hit_len:
-                l2_hit_len = req.l2_cache_hit_len
-                l3_hit_len = req.host_hit_length - req.l2_cache_hit_len
+                l2_hit_len = min(req.l2_cache_hit_len, req.host_hit_length)
+                l3_hit_len = req.host_hit_length - l2_hit_len
             else:
                 l2_hit_len = 0
                 l3_hit_len = req.host_hit_length
-            
+
             if req.host_hit_length > 0:
-                new_indices, req.last_node = self.tree_cache.init_load_back(
+                load_back_result = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length
                 )
+                if load_back_result is None:
+                    return AddReqResult.NO_TOKEN
+                new_indices, req.last_node = load_back_result
                 if len(new_indices) > 0:
                     req.prefix_page_ids = torch.cat([req.prefix_page_ids.to(new_indices.device), new_indices])
                     prefix_len = len(req.prefix_page_ids) * self.token_to_kv_pool_allocator.page_size
@@ -499,61 +435,24 @@ class PrefillAdder:
                             f"prefix len should equal to page ids size "
                             f"rid={req.rid}, pages_len={prefix_len}, prefix_len={req.prefix_len}"
                         )
-                    
+
                     req.extend_input_len -= req.host_hit_length
-                    input_tokens = req.extend_input_len
-                
+
                     if req.sampling_params.max_new_tokens > 0:
                         assert req.extend_input_len > 0, (
                             f"extend_input_len should be > 0 for generation requests. "
                             f"rid={req.rid}, extend_input_len={req.extend_input_len}, "
                             f"prefix_len={req.prefix_len}, input_len={len(req.fill_ids)}"
                         )
+                else:
+                    l2_hit_len = 0
+                    l3_hit_len = 0
 
-
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
-                return AddReqResult.OTHER
-            
-            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
-                self.can_run_list.append(req)
-                self.tree_cache.inc_lock_ref(req.last_node)
-                self._prefill_one_req(
-                    prefix_len,
-                    input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS_ESTIMATION,
-                    ),
-                    device_prefix_len=l1_hit_len,  # L1: Original GPU cache
-                    host_hit_len=l2_hit_len,  # L2: Host cache loaded back
-                    storage_hit_len=l3_hit_len,  # L3: Storage cache loaded back
-                )
-            else:
-                # Chunked prefill
-                trunc_len = self.rem_chunk_tokens
-                if trunc_len == 0:
-                    return AddReqResult.OTHER
-
-
-                req.extend_input_len = trunc_len
-                req.fill_ids = req.fill_ids[: req.prefix_len + trunc_len]
-                req.draft_fill_ids = req.draft_fill_ids[
-                    : req.prefix_len + trunc_len
-                ]
-                if "multi_ids" in global_server_args_dict["mm_mode"]:
-                    req.fill_multi_ids = req.fill_multi_ids[: req.prefix_len + trunc_len]
-                if req.input_embeds is not None:
-                    req.fill_input_embeds = req.input_embeds[: req.prefix_len + trunc_len]
-
-                self.can_run_list.append(req)
-                self.new_chunked_req = req
-                self.tree_cache.inc_lock_ref(req.last_node)
-                self._prefill_one_req(
-                    prefix_len, trunc_len, 0,
-                    device_prefix_len=l1_hit_len,  # L1: Original GPU cache
-                    host_hit_len=l2_hit_len,  # L2: Host cache loaded back
-                    storage_hit_len=l3_hit_len,  # L3: Storage cache loaded back
-                )
+            self.tree_cache.inc_lock_ref(req.last_node)
+            self._add_one_req_inner(req,
+                                    hit_len=prefix_len,
+                                    device_prefix_len=l1_hit_len,
+                                    host_hit_len=l2_hit_len,
+                                    storage_hit_len=l3_hit_len)
 
         return self.budget_state()

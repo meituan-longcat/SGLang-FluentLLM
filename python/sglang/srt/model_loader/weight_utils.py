@@ -1,23 +1,19 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/weight_utils.py
 
 """Utilities for downloading and initializing model weights."""
+
 import fnmatch
 import glob
 import hashlib
 import json
-from sglang.srt.utils import get_colorful_logger
 import os
 import tempfile
 from collections import defaultdict
+from collections.abc import Generator, Iterable
 from typing import (
     Any,
     Callable,
-    Dict,
-    Generator,
-    Iterable,
-    List,
     Optional,
-    Tuple,
     Union,
 )
 
@@ -28,14 +24,15 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
+from safetensors.torch import save_file
 from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.utils import print_warning_once
+from sglang.srt.utils import get_colorful_logger, print_warning_once
 
 logger = get_colorful_logger(__name__)
 
@@ -129,9 +126,7 @@ def convert_bin_to_safetensor_file(
 
 
 # TODO(woosuk): Move this to other place.
-def get_quant_config(
-    model_config: ModelConfig, load_config: LoadConfig
-) -> QuantizationConfig:
+def get_quant_config(model_config: ModelConfig, load_config: LoadConfig) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
     # Read the quantization config from the HF model config, if available.
@@ -147,14 +142,9 @@ def get_quant_config(
         return quant_cls.from_config(hf_quant_config)
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
-        if (
-            not load_config.model_loader_extra_config
-            or "qlora_adapter_name_or_path" not in load_config.model_loader_extra_config
-        ):
+        if not load_config.model_loader_extra_config or "qlora_adapter_name_or_path" not in load_config.model_loader_extra_config:
             return quant_cls.from_config({"adapter_name_or_path": ""})
-        model_name_or_path = load_config.model_loader_extra_config[
-            "qlora_adapter_name_or_path"
-        ]
+        model_name_or_path = load_config.model_loader_extra_config["qlora_adapter_name_or_path"]
 
     else:
         model_name_or_path = model_config.model_path
@@ -181,16 +171,11 @@ def get_quant_config(
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
 
-    quant_config_files = [
-        f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)
-    ]
+    quant_config_files = [f for f in config_files if any(f.endswith(x) for x in possible_config_filenames)]
     if len(quant_config_files) == 0:
         raise ValueError(f"Cannot find the config file for {model_config.quantization}")
     if len(quant_config_files) > 1:
-        raise ValueError(
-            f"Found multiple config files for {model_config.quantization}: "
-            f"{quant_config_files}"
-        )
+        raise ValueError(f"Found multiple config files for {model_config.quantization}: {quant_config_files}")
 
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
@@ -202,10 +187,7 @@ def get_quant_config(
             if config["producer"]["name"] == "modelopt":
                 return quant_cls.from_config(config)
             else:
-                raise ValueError(
-                    f"Unsupported quantization config"
-                    f" found for {model_config.quantization} in {f}."
-                )
+                raise ValueError(f"Unsupported quantization config found for {model_config.quantization} in {f}.")
 
     return quant_cls.from_config(config)
 
@@ -213,9 +195,9 @@ def get_quant_config(
 def download_weights_from_hf(
     model_name_or_path: str,
     cache_dir: Optional[str],
-    allow_patterns: List[str],
+    allow_patterns: list[str],
     revision: Optional[str] = None,
-    ignore_patterns: Optional[Union[str, List[str]]] = None,
+    ignore_patterns: Optional[Union[str, list[str]]] = None,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -301,9 +283,7 @@ def download_safetensors_index_file_from_hf(
 # Passing both of these to the weight loader functionality breaks.
 # So, we use the index_file to
 # look up which safetensors files should be used.
-def filter_duplicate_safetensors_files(
-    hf_weights_files: List[str], hf_folder: str, index_file: str
-) -> List[str]:
+def filter_duplicate_safetensors_files(hf_weights_files: list[str], hf_folder: str, index_file: str) -> list[str]:
     # model.safetensors.index.json is a mapping from keys in the
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)
@@ -322,7 +302,7 @@ def filter_duplicate_safetensors_files(
     return hf_weights_files
 
 
-def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[str]:
+def filter_files_not_needed_for_inference(hf_weights_files: list[str]) -> list[str]:
     """
     Exclude files that are not needed for inference.
 
@@ -335,9 +315,7 @@ def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[s
         "scheduler.pt",
         "scaler.pt",
     ]
-    hf_weights_files = [
-        f for f in hf_weights_files if not any(f.endswith(x) for x in blacklist)
-    ]
+    hf_weights_files = [f for f in hf_weights_files if not any(f.endswith(x) for x in blacklist)]
     return hf_weights_files
 
 
@@ -352,15 +330,13 @@ def np_cache_weights_iterator(
     model_name_or_path: str,
     cache_dir: Optional[str],
     hf_folder: str,
-    hf_weights_files: List[str],
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    hf_weights_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model np files.
 
     Will dump the model weights to numpy files if they are not already dumped.
     """
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
+    enable_tqdm = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     # Convert the model weights from torch tensors to numpy arrays for
     # faster loading.
     np_folder = os.path.join(hf_folder, "np")
@@ -370,7 +346,7 @@ def np_cache_weights_iterator(
     # dumping the same model weights to numpy at the same time.
     with get_lock(model_name_or_path, cache_dir):
         if not os.path.exists(weight_names_file):
-            weight_names: List[str] = []
+            weight_names: list[str] = []
             for bin_file in tqdm(
                 hf_weights_files,
                 desc="Loading np_cache checkpoint shards",
@@ -401,7 +377,7 @@ def decrypt(fn, key):
 
 
 def safetensors_encrypted_weights_iterator(
-    hf_weights_files: List[str],
+    hf_weights_files: list[str],
     is_all_weights_sharded: bool = False,
     decryption_key: Optional[str] = None,
 ):
@@ -409,24 +385,20 @@ def safetensors_encrypted_weights_iterator(
 
 
 def safetensors_weights_iterator(
-    hf_weights_files: List[str],
+    hf_weights_files: list[str],
     is_all_weights_sharded: bool = False,
     decryption_key: Optional[str] = None,
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
     If is_all_weights_sharded is True, it uses more optimize read by reading an
     entire file instead of reading each tensor one by one.
     """
     if decryption_key:
-        yield from safetensors_encrypted_weights_iterator(
-            hf_weights_files, is_all_weights_sharded, decryption_key
-        )
+        yield from safetensors_encrypted_weights_iterator(hf_weights_files, is_all_weights_sharded, decryption_key)
         return
 
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
+    enable_tqdm = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     for st_file in tqdm(
         hf_weights_files,
         desc="Loading safetensors checkpoint shards",
@@ -434,17 +406,14 @@ def safetensors_weights_iterator(
         bar_format=_BAR_FORMAT,
     ):
         result = safetensors.torch.load_file(st_file, device="cpu")
-        for name, param in result.items():
-            yield name, param
+        yield from result.items()
 
 
 def pt_weights_iterator(
-    hf_weights_files: List[str],
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    hf_weights_files: list[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model bin/pt files."""
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
+    enable_tqdm = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     for bin_file in tqdm(
         hf_weights_files,
         desc="Loading pt checkpoint shards",
@@ -481,10 +450,7 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
             # "broadcast" instead of copy
             param.data.fill_(loaded_weight.item())
         else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
+            assert param.size() == loaded_weight.size(), f"Attempted to load weight ({loaded_weight.size()}) into parameter ({param.size()})"
 
             param.data.copy_(loaded_weight)
     except Exception:
@@ -493,9 +459,7 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         raise
 
 
-def row_parallel_weight_loader(
-    param: torch.Tensor, loaded_weight: torch.Tensor
-) -> None:
+def row_parallel_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Load weights that are row-parallelized."""
     tp_rank = get_tensor_model_parallel_rank()
     shard_dim = 0 if param.dim() != 1 else None
@@ -526,9 +490,7 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
     return loader
 
 
-def composed_weight_loader(
-    loader: LoaderFunction, fn: Callable[[torch.Tensor], torch.Tensor]
-) -> LoaderFunction:
+def composed_weight_loader(loader: LoaderFunction, fn: Callable[[torch.Tensor], torch.Tensor]) -> LoaderFunction:
     """Create a weight loader that post-processes the weights after loading"""
 
     def composed_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -613,10 +575,7 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
     for scale_name in possible_scale_names:
         if name.endswith(scale_name):
             # Check and remap the name based on modelopt scale names
-            if any(
-                modelopt_scale_name in name
-                for modelopt_scale_name in modelopt_scale_names
-            ):
+            if any(modelopt_scale_name in name for modelopt_scale_name in modelopt_scale_names):
                 remapped_name = name.replace(
                     f".self_attn.{scale_name[1]}_proj{scale_name}",
                     f".self_attn.attn{scale_name}",
@@ -644,14 +603,11 @@ class KVCacheQuantSchema(BaseModel):
     # layer indices to their per-tensor KV cache scaling factor.
     # TODO: Consider pulling this and its validation methods out into its
     # own schema class (tricky as its members are variable)
-    scaling_factor: Dict[int, Dict[int, float]]
+    scaling_factor: dict[int, dict[int, float]]
 
     @model_validator(mode="after")
     def check_is_fp8(self) -> "KVCacheQuantSchema":
-        assert self.dtype == "float8_e4m3fn", (
-            "Loaded scaling factors intended for KV cache dtype = "
-            f"{self.dtype} rather than float8_e4m3fn!"
-        )
+        assert self.dtype == "float8_e4m3fn", f"Loaded scaling factors intended for KV cache dtype = {self.dtype} rather than float8_e4m3fn!"
         return self
 
     @model_validator(mode="after")
@@ -661,19 +617,14 @@ class KVCacheQuantSchema(BaseModel):
             tp_size = context["tp_size"]
             num_hidden_layers = context["num_hidden_layers"]
             assert len(self.scaling_factor) == tp_size, (
-                f"Loaded dictionary has TP size {len(self.scaling_factor)} "
-                f"but LLM engine is currently running with TP size {tp_size}."
+                f"Loaded dictionary has TP size {len(self.scaling_factor)} but LLM engine is currently running with TP size {tp_size}."
             )
             for tp_rank, layer_maps in self.scaling_factor.items():
                 assert len(layer_maps) == num_hidden_layers, (
-                    f"KV cache scales map for TP rank {tp_rank} is malformed. "
-                    f"Expected {num_hidden_layers} layers, got "
-                    f"{len(layer_maps)}."
+                    f"KV cache scales map for TP rank {tp_rank} is malformed. Expected {num_hidden_layers} layers, got {len(layer_maps)}."
                 )
             for i in range(tp_size):
-                assert (
-                    i in self.scaling_factor
-                ), f"KV cache scales map for TP rank {i} not found."
+                assert i in self.scaling_factor, f"KV cache scales map for TP rank {i} not found."
         return self
 
     @model_validator(mode="after")
@@ -684,10 +635,7 @@ class KVCacheQuantSchema(BaseModel):
             num_hidden_layers = context["num_hidden_layers"]
             layer_scales_map = self.scaling_factor[tp_rank]
             for i in range(num_hidden_layers):
-                assert i in layer_scales_map, (
-                    f"Could not find KV cache scales for layer {i} in "
-                    f"TP rank {tp_rank}."
-                )
+                assert i in layer_scales_map, f"Could not find KV cache scales for layer {i} in TP rank {tp_rank}."
         return self
 
 
@@ -705,9 +653,7 @@ class QuantParamSchema(BaseModel):
             model_type = context.get("model_type", None)
             if model_type is not None:
                 assert model_type == self.model_type, (
-                    f"Model type is {model_type} but loaded "
-                    f"scaling factors belonging to different "
-                    f"model type {self.model_type}!"
+                    f"Model type is {model_type} but loaded scaling factors belonging to different model type {self.model_type}!"
                 )
         return self
 
@@ -718,7 +664,7 @@ def kv_cache_scales_loader(
     tp_size: int,
     num_hidden_layers: int,
     model_type: Optional[str],
-) -> Iterable[Tuple[int, float]]:
+) -> Iterable[tuple[int, float]]:
     """
     A simple utility to read in KV cache scaling factors that have been
     previously serialized to disk. Used by the model to populate the appropriate
@@ -748,11 +694,27 @@ def kv_cache_scales_loader(
     # Return an empty iterable (list) => no KV cache scales are loaded
     # which ultimately defaults to 1.0 scales
     logger.warning(
-        "Defaulting to KV cache scaling factors = 1.0 for all "
-        "layers in TP rank %d as an error occurred during loading.",
+        "Defaulting to KV cache scaling factors = 1.0 for all layers in TP rank %d as an error occurred during loading.",
         tp_rank,
     )
     return []
+
+
+def get_actual_shard_size(shard_size, weight_start, weight_end):
+    if weight_end < weight_start:
+        return 0
+
+    return min(shard_size, weight_end - weight_start)
+
+
+def reset_param_data_if_needed(param_data, dim, start, length):
+    if length == 0:
+        return
+
+    assert length > 0, f"Length should be positive, but got {length}"
+
+    param_data.narrow(dim, start, length).zero_()
+    return
 
 
 def narrow_padded_param_and_loaded_weight(
@@ -764,18 +726,14 @@ def narrow_padded_param_and_loaded_weight(
     shard_size,
     narrow_weight=True,
 ):
-    actual_shard_size = get_actual_shard_size(
-        shard_size, weight_start, loaded_weight.size(dim)
-    )
+    actual_shard_size = get_actual_shard_size(shard_size, weight_start, loaded_weight.size(dim))
 
     if narrow_weight:
         if actual_shard_size > 0:
             loaded_weight = loaded_weight.narrow(dim, weight_start, actual_shard_size)
         else:
             # No real data to load; create a dummy tensor filled with zeros
-            loaded_weight = torch.zeros_like(
-                param_data.narrow(dim, param_data_start, actual_shard_size)
-            )
+            loaded_weight = torch.zeros_like(param_data.narrow(dim, param_data_start, actual_shard_size))
 
     # [Note] Reset padded weights to zero.
     # If the actual shard size is less than the shard size, we need to reset

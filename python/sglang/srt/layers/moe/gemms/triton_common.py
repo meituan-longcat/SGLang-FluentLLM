@@ -18,10 +18,12 @@ from sglang.srt.layers.dense.gemms.int8.int8_kernel import (
     per_token_quant_int8,
     sglang_per_token_group_quant_int8,
 )
+
 try:
     from flashinfer import moe_align_block_size as sgl_moe_align_block_size
 except ImportError as e:
     import logging
+
     logger = logging.getLogger(__name__)
     logger.error(f"Failed to import moe_align_block_size from flashinfer: {e}")
     raise
@@ -38,7 +40,7 @@ try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     _support_tensor_descriptor = True
-except:
+except Exception:
     _support_tensor_descriptor = False
 
 _is_hip = is_hip()
@@ -219,27 +221,17 @@ def fused_moe_kernel(
         assert use_fp8_w8a8 and group_n > 0 and group_k > 0
         start_offs_m = pid_m * BLOCK_SIZE_M
     else:
-        a_ptrs = a_ptr + (
-            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-        )
+        a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
 
     if b_desc is not None:
         start_offs_n = pid_n * BLOCK_SIZE_N
     else:
-        b_ptrs = (
-            b_ptr
-            + off_experts * stride_be
-            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-        )
+        b_ptrs = b_ptr + off_experts * stride_be + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     if bias_ptr is not None:
-        bias = tl.load(
-            bias_ptr + off_experts * stride_bias_e + offs_bn[None, :] * stride_bias_n
-        )
+        bias = tl.load(bias_ptr + off_experts * stride_bias_e + offs_bn[None, :] * stride_bias_n)
     if use_int8_w8a16:
-        b_scale_ptrs = (
-            b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
-        )
+        b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
         b_scale = tl.load(b_scale_ptrs)
 
     if use_fp8_w8a8 or use_int8_w8a8:
@@ -253,14 +245,10 @@ def fused_moe_kernel(
                 offs_bsn = offs_bn // group_n
             else:
                 offs_bsn = pid_n * BLOCK_SIZE_N // group_n
-            b_scale_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
-            )
+            b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
         # channel-wise
         elif per_channel_quant:
-            b_scale_ptrs = (
-                b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
-            )
+            b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
             b_scale = tl.load(b_scale_ptrs)
             # Load per-token scale for activations
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
@@ -296,11 +284,7 @@ def fused_moe_kernel(
             )
 
         if b_desc is not None:
-            b = (
-                b_desc.load([off_experts_i32, start_offs_n, k_start])
-                .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K)
-                .T
-            )
+            b = b_desc.load([off_experts_i32, start_offs_n, k_start]).reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).T
         elif even_Ks:
             b = tl.load(b_ptrs)
         else:
@@ -312,9 +296,7 @@ def fused_moe_kernel(
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
                 offs_ks = k_start // group_k
-                a_scale = tl.load(
-                    a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
-                )
+                a_scale = tl.load(a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0)
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
                 if BLOCK_SIZE_N > group_n:
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
@@ -351,9 +333,7 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     if c_sorted:
-        c_ptrs = (
-            c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
-        )
+        c_ptrs = c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
     else:
         c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
@@ -397,9 +377,7 @@ def invoke_fused_moe_kernel(
             # activation tensor-wise fp8 quantization, dynamic or static
             padded_size = padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
-            A, A_scale = scaled_fp8_quant(
-                A, A_scale, use_per_token_if_dynamic=per_channel_quant
-            )
+            A, A_scale = scaled_fp8_quant(A, A_scale, use_per_token_if_dynamic=per_channel_quant)
         else:
             # activation block-wise fp8 quantization
             assert len(block_shape) == 2
@@ -415,9 +393,7 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation channel-wise int8 quantization
-            assert (
-                per_channel_quant
-            ), "int8 quantization only supports channel-wise quantization except for block-wise quantization"
+            assert per_channel_quant, "int8 quantization only supports channel-wise quantization except for block-wise quantization"
             A, A_scale = per_token_quant_int8(A)
         else:
             # activation block-wise int8 quantization
@@ -437,17 +413,13 @@ def invoke_fused_moe_kernel(
         assert A_scale is None
         assert B_scale is None
 
-    grid = lambda META: (
-        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
-    )
+    grid = lambda META: (triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),)
 
     K = B.shape[2] - padded_size
     if K % config["BLOCK_SIZE_K"] == 0:
         even_Ks = True
     else:
         even_Ks = False
-
 
     if a_use_tma or b_use_tma:
         # TMA descriptors require a global memory allocation
@@ -456,9 +428,7 @@ def invoke_fused_moe_kernel(
 
         triton.set_allocator(alloc_fn)
     if a_use_tma:
-        a_desc = TensorDescriptor(
-            A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]]
-        )
+        a_desc = TensorDescriptor(A, A.shape, A.stride(), [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_K"]])
     else:
         a_desc = None
     if b_use_tma:
@@ -571,9 +541,7 @@ def _moe_sum_reduce_kernel(
     )
 
 
-def moe_sum_reduce_triton(
-    input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float
-):
+def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor, routed_scaling_factor: float):
     assert input.is_contiguous()
     assert output.is_contiguous()
 
@@ -621,9 +589,7 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
-def moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def moe_align_block_size(topk_ids: torch.Tensor, block_size: int, num_experts: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
     size for matrix multiplication.
@@ -662,19 +628,13 @@ def moe_align_block_size(
         by block_size for proper block matrix operations.
     """
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    sorted_ids = torch.empty(
-        (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
-    )
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
-    )
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
     # In EP, expert_ids for filtered experts are -1. We have num_experts + 1 ids in total.
-    cumsum_buffer = torch.empty(
-        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
-    )
+    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device=topk_ids.device)
 
     # Threshold based on benchmark results
     fuse_sorted_ids_padding = sorted_ids.shape[0] <= 4096

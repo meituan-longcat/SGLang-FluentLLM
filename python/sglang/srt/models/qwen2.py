@@ -16,7 +16,8 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
-from typing import Any, Dict, Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -24,34 +25,34 @@ from torch import nn
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_group, get_dense_tp_group
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_group, get_dense_tp_group
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import RotaryEmbeddingCosSinCache, get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope, RotaryEmbeddingCosSinCache
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.ops.activation import SiluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
 from sglang.srt.utils import make_layers
 
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
-
 Qwen2Config = None
+
 
 class Qwen2MLP(nn.Module):
     def __init__(
@@ -68,18 +69,9 @@ class Qwen2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False
-        )
+        self.down_proj = RowParallelLinear(intermediate_size, hidden_size, bias=False, quant_config=quant_config, reduce_results=False)
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -97,7 +89,7 @@ class Qwen2Attention(nn.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 1000000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
@@ -133,11 +125,7 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
         )
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False
+            self.total_num_heads * self.head_dim, hidden_size, bias=False, quant_config=quant_config, reduce_results=False
         )
 
         self.rotary_emb = get_rope(
@@ -198,9 +186,7 @@ class Qwen2DecoderLayer(nn.Module):
             quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layer_id = layer_id
 
     def forward(
@@ -209,8 +195,8 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -231,13 +217,16 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         else:
-            hidden_states, residual, _ = self.post_attention_layernorm.forward_with_allreduce_fusion(get_attention_tp_group(), hidden_states, residual)
+            hidden_states, residual, _ = self.post_attention_layernorm.forward_with_allreduce_fusion(
+                get_attention_tp_group(), hidden_states, residual
+            )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
 class Qwen2Model(nn.Module):
-    def __init__( self,
+    def __init__(
+        self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
         decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
@@ -268,7 +257,9 @@ class Qwen2Model(nn.Module):
             max_position_embeddings = getattr(self.config, "max_position_embeddings", None)
             rope_theta = getattr(self.config, "rope_theta", None)
             self.rotary_pos_emb = RotaryEmbeddingCosSinCache(
-                head_dim, max_position_embeddings=max_position_embeddings, base=rope_theta,
+                head_dim,
+                max_position_embeddings=max_position_embeddings,
+                base=rope_theta,
                 device="npu",
             )
 
@@ -285,10 +276,7 @@ class Qwen2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         residual = None
 
         cos, sin = None, None
@@ -334,9 +322,7 @@ class Qwen2Model(nn.Module):
                 layer_self_attn.attn.k_scale = scaling_factor
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
-                raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
-                )
+                raise RuntimeError("Self attention has no KV cache scaling factor attribute!")
 
 
 class Qwen2ForCausalLM(nn.Module):
@@ -371,9 +357,7 @@ class Qwen2ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -389,11 +373,9 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

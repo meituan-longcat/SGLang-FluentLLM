@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/vllm-project/vllm-ascend.git",
+  "commit": "d543ccee0a1ff677165777e3defafd42b35e83ef",
+  "soc": "ascend910b",
+  "root_ops": [
+    "causal_conv1d"
+  ],
+  "dependencies": {
+    "causal_conv1d": []
+  },
+  "patches": [
+    {
+      "repository": "https://github.com/wangbo981016/tokenspeed_lc.git",
+      "commit": "bec7cee8e524ff1103ac6c49ef6b6c57bae4c792",
+      "scope": "decode independent read/write cache indices and padding semantics"
+    }
+  ]
+}

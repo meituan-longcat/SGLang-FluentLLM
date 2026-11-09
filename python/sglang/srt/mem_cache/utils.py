@@ -1,25 +1,16 @@
-# Copyright 2025 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Common utilities."""
+from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+import hashlib
+from typing import TYPE_CHECKING, Any
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.env import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.radix_cache import TreeNode
 
 
 @triton.jit
@@ -43,7 +34,7 @@ def set_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -107,23 +98,19 @@ def set_mla_kv_scale_buffer_kernel(
     base = pid_blk * BLOCK
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
-    mask = offs < total_dim  # Make sure don't cross the boundary
+    mask = offs < total_dim
 
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
-    # Check each offs should read 'nope' or 'rope'
     is_nope = offs < nope_dim
-    src_nope = tl.load(
-        cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask & is_nope, other=0.0
-    )
+    src_nope = tl.load(cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask & is_nope, other=0.0)
     src_rope = tl.load(
         cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
         mask=mask & ~is_nope,
         other=0.0,
     )
 
-    # Combine nope + rope
     src = src_nope + src_rope
     tl.store(dst_ptr, src, mask=mask)
 
@@ -137,7 +124,7 @@ def set_mla_kv_scale_buffer_triton(
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
     total_dim = nope_dim + rope_dim
-    BLOCK = 128  # Keep origin, works for smaller total_dim as well.
+    BLOCK = 128
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
@@ -168,7 +155,7 @@ def get_mla_kv_buffer_kernel(
     rope_dim: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
 
     nope_offs = tl.arange(0, nope_dim)
@@ -195,9 +182,8 @@ def get_mla_kv_buffer_triton(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ):
-    # The source data type will be implicitly converted to the target data type.
-    nope_dim = cache_k_nope.shape[-1]  # 512
-    rope_dim = cache_k_rope.shape[-1]  # 64
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
     n_loc = loc.numel()
     grid = (n_loc,)
 
@@ -216,24 +202,10 @@ def get_mla_kv_buffer_triton(
 
 def maybe_init_custom_mem_pool(
     device: str,
-) -> Tuple[bool, Optional[Any], Optional[str]]:
-    """
-    Initialize custom memory pool based on environment variable.
-
-    This function can be modified to support more features that require a custom memory pool.
-
-    Args:
-        device: The device to allocate memory on
-
-    Returns:
-        Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
-    """
-    enable_custom_mem_pool = (
-        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
-    )
+) -> tuple[bool, Any | None, str | None]:
+    enable_custom_mem_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None
 
     if enable_custom_mem_pool:
-        # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
         from sglang.srt.disaggregation.mooncake.utils import (
             init_mooncake_custom_mem_pool,
         )
@@ -243,11 +215,49 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
-def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
-    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
+def convert_to_bigram_key(tokens: list[int]) -> list[tuple[int, int]]:
     if len(tokens) and isinstance(tokens[0], tuple):
         return tokens
     if len(tokens) < 2:
         return []
     return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+
+
+def get_hash_str(token_ids: list[int], prior_hash: str = None) -> str:
+    hasher = hashlib.sha256()
+
+    if prior_hash:
+        hasher.update(bytes.fromhex(prior_hash))
+
+    for t in token_ids:
+        if isinstance(t, tuple):
+            for elem in t:
+                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
+        else:
+            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+
+    return hasher.hexdigest()
+
+
+def hash_str_to_int64(hash_str: str) -> int:
+    uint64_val = int(hash_str[:16], 16)
+    if uint64_val >= 2**63:
+        return uint64_val - 2**64
+    return uint64_val
+
+
+def compute_node_hash_values(node: TreeNode, page_size: int) -> list[str]:
+    hash_values = []
+
+    parent_hash = None
+    if node.parent is not None and node.parent.hash_value is not None and len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
+        parent_hash = node.parent.hash_value[-1]
+
+    for start in range(0, len(node.key)):
+        page_tokens = node.key[start]
+        assert len(page_tokens) == page_size
+        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
+        hash_values.append(hash_val)
+        parent_hash = hash_val
+
+    return hash_values

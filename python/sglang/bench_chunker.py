@@ -9,6 +9,7 @@ global_workspace_buffer = None
 
 # --- Make sure ChunkFlashAttn3 and ChunkFlashInferAttn classes are loaded in your code ---
 
+
 def benchmark_forward_only(backend, batch_size, q_len_val, kv_len_val, num_qo_heads, num_kv_heads, head_dim=128):
     device = "cuda"
     dtype = torch.bfloat16
@@ -23,7 +24,7 @@ def benchmark_forward_only(backend, batch_size, q_len_val, kv_len_val, num_qo_he
     q = torch.randn(batch_size * q_len_val, num_qo_heads, head_dim, device=device, dtype=dtype)
     k = torch.randn(batch_size * kv_len_val, num_kv_heads, head_dim, device=device, dtype=dtype)
     v = torch.randn(batch_size * kv_len_val, num_kv_heads, head_dim, device=device, dtype=dtype)
-    scaling = 1.0 / (head_dim ** 0.5)
+    scaling = 1.0 / (head_dim**0.5)
 
     if backend == "flashinfer":
         attn = ChunkFlashInferAttn(num_qo_heads, num_kv_heads, head_dim, head_dim, dtype, device, True, None)
@@ -55,6 +56,7 @@ def benchmark_forward_only(backend, batch_size, q_len_val, kv_len_val, num_qo_he
 
     return avg_forward_ms, tflops
 
+
 def run_benchmark():
     # Test configuration: (batch_size, q_len, kv_len, n_qo, n_kv)
     test_cases = [
@@ -85,18 +87,13 @@ def run_benchmark():
 
         speedup = fa3_time / fi_time if fi_time > 0 else 0
 
-        results.append([
-            f"{bs}x{ql}x{kvl}", 
-            f"{nqh}/{nkh}",
-            f"{fa3_time:.3f}", 
-            f"{fi_time:.3f}", 
-            f"{speedup:.2f}x",
-            f"{fa3_tflops:.1f}",
-            f"{fi_tflops:.1f}"
-        ])
+        results.append(
+            [f"{bs}x{ql}x{kvl}", f"{nqh}/{nkh}", f"{fa3_time:.3f}", f"{fi_time:.3f}", f"{speedup:.2f}x", f"{fa3_tflops:.1f}", f"{fi_tflops:.1f}"]
+        )
 
     headers = ["Config (BxQxKV)", "Heads(Q/K)", "FA3 (ms)", "FlashInfer (ms)", "FI Speedup", "FA3 TFLOPS", "FI TFLOPS"]
     print(tabulate(results, headers=headers, tablefmt="grid"))
+
 
 if __name__ == "__main__":
     run_benchmark()

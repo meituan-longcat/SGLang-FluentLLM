@@ -10,10 +10,11 @@ import json
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 from sglang.srt.layers.moe.config import DispatcherType
-from sglang.srt.layers.activation import SwigluArg
+from sglang.srt.ops.activation import SwigluArg
 from sglang.srt.utils import (
     get_compiler_backend,
 )
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,21 +35,22 @@ class GPTQMarlinState(Enum):
     READY = enum.auto()
 
 
-class WNA16MoEGemmWrapper():
-
+class WNA16MoEGemmWrapper:
     def __init__(self, top_k, num_experts, layer, quant_config):
-        self.top_k= top_k
-        self.num_experts= num_experts
+        self.top_k = top_k
+        self.num_experts = num_experts
         self.quant_config = quant_config
 
     @staticmethod
     def get_layout_cls():
         from sglang.srt.layers.moe.layouts.wna16 import CompressedTensorsWNA16MoELayout
+
         return CompressedTensorsWNA16MoELayout
 
-    def get_executor(self, dispatcher_type : DispatcherType, activation: str, swiglu_arg: Optional[SwigluArg] = None):
+    def get_executor(self, dispatcher_type: DispatcherType, activation: str, swiglu_arg: Optional[SwigluArg] = None):
         if dispatcher_type == DispatcherType.TP:
             from sglang.srt.layers.moe.executors.wna16_executor import WNA16MoeExecutor
+
             return WNA16MoeExecutor(self.quant_config)
         else:
             raise RuntimeError("WNA16MoEGemmWrapper only Support Moe EP")

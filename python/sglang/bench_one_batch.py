@@ -8,7 +8,8 @@ It accepts server arguments (the same as launch_server.py) and benchmark argumen
 ## with dummy weights:
 python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --load-format dummy
 ## sweep through multiple data points and store (append) the results in a jsonl file:
-python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --run-name test_run
+python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 \
+    --input-len 256 512 --output-len 32 256 --run-name test_run
 ## run with profiling:
 python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --profile
 # Usage (correctness test):
@@ -50,7 +51,6 @@ import logging
 import multiprocessing
 import os
 import time
-from typing import Tuple
 
 import numpy as np
 import torch
@@ -58,9 +58,8 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.entrypoints.engine import _set_envs_and_config
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.req import Req
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduling.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -73,14 +72,15 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 @dataclasses.dataclass
 class BenchArgs:
     run_name: str = "default"
-    batch_size: Tuple[int] = (1,)
-    input_len: Tuple[int] = (1024,)
-    output_len: Tuple[int] = (16,)
+    batch_size: tuple[int] = (1,)
+    input_len: tuple[int] = (1024,)
+    output_len: tuple[int] = (16,)
     result_filename: str = "result.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
@@ -91,23 +91,13 @@ class BenchArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
-        parser.add_argument(
-            "--batch-size", type=int, nargs="+", default=BenchArgs.batch_size
-        )
-        parser.add_argument(
-            "--input-len", type=int, nargs="+", default=BenchArgs.input_len
-        )
-        parser.add_argument(
-            "--output-len", type=int, nargs="+", default=BenchArgs.output_len
-        )
-        parser.add_argument(
-            "--result-filename", type=str, default=BenchArgs.result_filename
-        )
+        parser.add_argument("--batch-size", type=int, nargs="+", default=BenchArgs.batch_size)
+        parser.add_argument("--input-len", type=int, nargs="+", default=BenchArgs.input_len)
+        parser.add_argument("--output-len", type=int, nargs="+", default=BenchArgs.output_len)
+        parser.add_argument("--result-filename", type=str, default=BenchArgs.result_filename)
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
-        parser.add_argument(
-            "--profile", action="store_true", help="Use Torch Profiler."
-        )
+        parser.add_argument("--profile", action="store_true", help="Use Torch Profiler.")
         parser.add_argument(
             "--profile-filename-prefix",
             type=str,
@@ -120,9 +110,7 @@ class BenchArgs:
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to case the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        return cls(**{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs})
 
 
 def load_model(server_args, port_args, tp_rank):
@@ -143,8 +131,12 @@ def load_model(server_args, port_args, tp_rank):
         model_config=model_config,
         mem_fraction_static=server_args.mem_fraction_static,
         gpu_id=tp_rank,
-        tp_rank=tp_rank,
-        tp_size=server_args.tp_size,
+        attn_tp_rank=tp_rank,
+        attn_tp_size=server_args.attn_tp_size,
+        world_size=server_args.world_size,
+        moe_ep_rank=0,
+        moe_ep_size=server_args.ep_size,
+        global_rank=tp_rank,
         nccl_port=port_args.nccl_port,
         server_args=server_args,
     )
@@ -184,21 +176,18 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer):
         )
         req.prefix_indices = []
         req.fill_ids = req.origin_input_ids
+        req.draft_fill_ids = req.fill_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)
 
     return input_ids, reqs
 
 
-def prepare_extend_inputs_for_correctness_test(
-    bench_args, input_ids, reqs, model_runner
-):
+def prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, model_runner):
     for i in range(len(reqs)):
         req = reqs[i]
         req.fill_ids += input_ids[i][bench_args.cut_len :]
-        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-            i, : bench_args.cut_len
-        ]
+        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[i, : bench_args.cut_len]
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
     return reqs
 
@@ -220,6 +209,7 @@ def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
         )
         req.prefix_indices = []
         req.fill_ids = req.origin_input_ids
+        req.draft_fill_ids = req.fill_ids
         req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
         reqs.append(req)
 
@@ -231,6 +221,7 @@ def extend(reqs, model_runner):
     batch = ScheduleBatch.init_new(
         reqs=reqs,
         req_to_token_pool=model_runner.req_to_token_pool,
+        kv_allocator=model_runner.kv_allocator,
         token_to_kv_pool=model_runner.token_to_kv_pool,
         tree_cache=None,
         model_config=model_runner.model_config,
@@ -280,9 +271,7 @@ def correctness_test(
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
     # Prepare extend inputs
-    reqs = prepare_extend_inputs_for_correctness_test(
-        bench_args, input_ids, reqs, model_runner
-    )
+    reqs = prepare_extend_inputs_for_correctness_test(bench_args, input_ids, reqs, model_runner)
 
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
@@ -320,14 +309,13 @@ def latency_test_run_once(
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
-        rank_print(
-            f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit"
-        )
+        rank_print(f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit")
         return
 
     # Clear the pools.
     model_runner.req_to_token_pool.clear()
-    model_runner.token_to_kv_pool.clear()
+    if hasattr(model_runner.token_to_kv_pool, "clear"):
+        model_runner.token_to_kv_pool.clear()
 
     measurement_results = {
         "run_name": run_name,
@@ -357,9 +345,7 @@ def latency_test_run_once(
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
-    rank_print(
-        f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-    )
+    rank_print(f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s")
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
@@ -375,9 +361,7 @@ def latency_test_run_once(
         throughput = batch_size / latency
         decode_latencies.append(latency)
         if i < 5:
-            rank_print(
-                f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-            )
+            rank_print(f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s")
 
     if profile:
         profiler.stop()
@@ -391,16 +375,12 @@ def latency_test_run_once(
     if output_len > 1:
         med_decode_latency = np.median(decode_latencies)
         med_decode_throughput = batch_size / med_decode_latency
-        rank_print(
-            f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
-        )
+        rank_print(f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s")
         measurement_results["median_decode_latency"] = med_decode_latency
         measurement_results["median_decode_throughput"] = med_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
-    rank_print(
-        f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
-    )
+    rank_print(f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s")
     measurement_results["total_latency"] = tot_latency
     measurement_results["overall_throughput"] = throughput
     return measurement_results
@@ -424,9 +404,7 @@ def latency_test(
     model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
 
     # Prepare inputs for warm up
-    reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
-    )
+    reqs = prepare_synthetic_inputs_for_latency_test(bench_args.batch_size[0], bench_args.input_len[0])
 
     # Warm up
     rank_print("Warmup ...")
@@ -447,9 +425,7 @@ def latency_test(
 
     # Run the sweep
     result_list = []
-    for bs, il, ol in itertools.product(
-        bench_args.batch_size, bench_args.input_len, bench_args.output_len
-    ):
+    for bs, il, ol in itertools.product(bench_args.batch_size, bench_args.input_len, bench_args.output_len):
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
         ret = latency_test_run_once(
             bench_args.run_name,
@@ -477,15 +453,9 @@ def main(server_args, bench_args):
     _set_envs_and_config(server_args)
 
     if server_args.model_path:
-        if bench_args.correctness_test:
-            work_func = correctness_test
-        else:
-            work_func = latency_test
+        work_func = correctness_test if bench_args.correctness_test else latency_test
     else:
-        raise ValueError(
-            "Provide --model-path for running the tests or "
-            "provide --result-filename for plotting the results"
-        )
+        raise ValueError("Provide --model-path for running the tests or provide --result-filename for plotting the results")
 
     port_args = PortArgs.init_new(server_args)
 

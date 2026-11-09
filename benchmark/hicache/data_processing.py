@@ -1,12 +1,13 @@
+import hashlib
 import json
 import os
 import pickle
 import random
-import hashlib
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import Any, Union
 
 import numpy as np
+
 try:
     from nextqa import NExTQALoader
     NEXTQA_AVAILABLE = True
@@ -15,19 +16,21 @@ except ImportError:
     NExTQALoader = None
 
 # from nextqa.video import , VideoPrompt
-from tqdm.asyncio import tqdm
-from transformers import PreTrainedTokenizerBase
-
 from sglang.bench_serving import (
     SHAREGPT_URL,
     download_and_cache_file,
     gen_prompt,
     get_gen_prefix_cache_path,
 )
+from tqdm.asyncio import tqdm
+from transformers import PreTrainedTokenizerBase
 
 # Try to import chat_template functions, but make them optional
 try:
-    from sglang.lang.chat_template import get_chat_template, get_chat_template_by_model_path
+    from sglang.lang.chat_template import (
+        get_chat_template,
+        get_chat_template_by_model_path,
+    )
     CHAT_TEMPLATE_AVAILABLE = True
 except ImportError:
     # Fallback: these are only needed for video benchmarks
@@ -46,7 +49,7 @@ except ImportError:
     encode_video_base64 = None
 
 # type of content fields, can be only prompts or with images/videos
-MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
+MsgContent = Union[str, list[ChatCompletionMessageContentPart]]
 
 # A list of all the conversations. Each conversation is a list of
 # tuples. If multiturn is not enabled, the length of list is 1,
@@ -54,7 +57,7 @@ MsgContent = Union[str, List[ChatCompletionMessageContentPart]]
 # For the shared prefix workload (synthetic, loogle, nextqa), it
 # is a list of conversations sharing the same prefix (synthetic,
 # doc, video)
-SampleOutput = List[List[Tuple[MsgContent, int, int]]]
+SampleOutput = list[list[tuple[MsgContent, int, int]]]
 
 
 class FixedDatasetManager:
@@ -104,7 +107,7 @@ class FixedDatasetManager:
         }
 
     def _get_cache_path(self, scenario: str, num_requests: int, tokenizer_name: str,
-                       fixed_output_len: Optional[int] = None) -> Path:
+                       fixed_output_len: int | None = None) -> Path:
         """Generate cache file path for a specific configuration."""
         cache_key = f"{scenario}_{num_requests}_{tokenizer_name}_{fixed_output_len}_{self.dataset_version}.pkl"
         return self.cache_dir / cache_key
@@ -113,8 +116,8 @@ class FixedDatasetManager:
         """Get path for metadata file."""
         return self.cache_dir / "metadata.json"
 
-    def _classify_conversation(self, conversation: List[Tuple[str, str]],
-                              tokenizer: PreTrainedTokenizerBase) -> Dict[str, Any]:
+    def _classify_conversation(self, conversation: list[tuple[str, str]],
+                              tokenizer: PreTrainedTokenizerBase) -> dict[str, Any]:
         """Classify a conversation by its characteristics."""
         num_turns = len(conversation)
 
@@ -148,9 +151,9 @@ class FixedDatasetManager:
             'conversation_id': hashlib.md5(str(conversation).encode()).hexdigest()[:8]
         }
 
-    def _select_conversations_for_scenario(self, conversations: List[List[Tuple[str, str]]],
+    def _select_conversations_for_scenario(self, conversations: list[list[tuple[str, str]]],
                                          scenario: str, num_requests: int,
-                                         tokenizer: PreTrainedTokenizerBase) -> List[List[Tuple[str, str]]]:
+                                         tokenizer: PreTrainedTokenizerBase) -> list[list[tuple[str, str]]]:
         """Select conversations that match the scenario requirements."""
         config = self.scenario_configs[scenario]
 
@@ -254,7 +257,7 @@ class FixedDatasetManager:
     def get_fixed_dataset(self, scenario: str, num_requests: int,
                          tokenizer: PreTrainedTokenizerBase,
                          dataset_path: str,
-                         fixed_output_len: Optional[int] = None) -> SampleOutput:
+                         fixed_output_len: int | None = None) -> SampleOutput:
         """Return deterministic subset based on scenario."""
         if scenario not in self.scenario_configs:
             raise ValueError(f"Unknown scenario: {scenario}. Available: {list(self.scenario_configs.keys())}")
@@ -324,8 +327,8 @@ def sample_fixed_sharegpt_requests(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     dataset_path: str,
-    cache_dir: Optional[str] = None,
-    fixed_output_len: Optional[int] = None,
+    cache_dir: str | None = None,
+    fixed_output_len: int | None = None,
 ) -> SampleOutput:
     """Return deterministic ShareGPT subset based on scenario."""
 
@@ -342,8 +345,8 @@ def sample_fixed_sharegpt_requests(
     )
 
 
-def classify_conversations_by_length(conversations: List[List[Tuple[str, str]]],
-                                   tokenizer: PreTrainedTokenizerBase) -> Dict[str, List[List[Tuple[str, str]]]]:
+def classify_conversations_by_length(conversations: list[list[tuple[str, str]]],
+                                   tokenizer: PreTrainedTokenizerBase) -> dict[str, list[list[tuple[str, str]]]]:
     """Classify conversations as short/medium/long based on token count."""
     categories = {'short': [], 'medium': [], 'long': []}
 
@@ -363,9 +366,9 @@ def classify_conversations_by_length(conversations: List[List[Tuple[str, str]]],
     return categories
 
 
-def select_deterministic_subset(conversations: List[List[Tuple[str, str]]],
+def select_deterministic_subset(conversations: list[list[tuple[str, str]]],
                                num_requests: int,
-                               scenario: str) -> List[List[Tuple[str, str]]]:
+                               scenario: str) -> list[list[tuple[str, str]]]:
     """Select fixed subset using conversation ID hash for deterministic ordering."""
 
     # Create deterministic ordering based on conversation content hash
@@ -385,13 +388,13 @@ def select_deterministic_subset(conversations: List[List[Tuple[str, str]]],
 
 def common_filter_chat(
     num_requests: int,
-    new_dataset: List,
+    new_dataset: list,
     tokenizer: PreTrainedTokenizerBase,
-    min_prompt_len: Optional[int],
-    min_output_len: Optional[int],
-    max_prompt_len: Optional[int],
-    max_output_len: Optional[int],
-    fixed_output_len: Optional[int],
+    min_prompt_len: int | None,
+    min_output_len: int | None,
+    max_prompt_len: int | None,
+    max_output_len: int | None,
+    fixed_output_len: int | None,
     override_min_output_len: bool = False,
 ) -> SampleOutput:
     # Filter out sequences that are too long or too short
@@ -450,10 +453,10 @@ def sample_sharegpt_requests(
     tokenizer: PreTrainedTokenizerBase,
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,
-    fixed_output_len: Optional[int] = None,
+    fixed_output_len: int | None = None,
     use_fixed_data: bool = True,
     scenario: str = 'serving',
-    cache_dir: Optional[str] = None,
+    cache_dir: str | None = None,
 ) -> SampleOutput:
     # Note: Removed the fixed_output_len < 4 check to allow small output lengths
     # The filtering is now handled by override_min_output_len parameter in common_filter_chat
@@ -522,7 +525,7 @@ def sample_ultrachat_requests(
     tokenizer: PreTrainedTokenizerBase,
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,
-    fixed_output_len: Optional[int] = None,
+    fixed_output_len: int | None = None,
 ) -> SampleOutput:
     # Note: Removed the fixed_output_len < 4 check to allow small output lengths
     # The filtering is now handled by override_min_output_len parameter in common_filter_chat
@@ -573,7 +576,7 @@ def sample_loogle_requests(
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,
     enable_shared_prefix: bool = False,
-    fixed_output_len: Optional[int] = None,
+    fixed_output_len: int | None = None,
 ) -> SampleOutput:
     # Note: Removed the fixed_output_len < 4 check to allow small output lengths
     # The filtering is now handled by override_min_output_len parameter in common_filter_chat
@@ -645,8 +648,8 @@ def sample_nextqa_requests(
     disable_shuffle: bool = False,
     enable_multiturn: bool = True,  # No multiturn support for now
     backend: str = "sglang-oai",
-    chat_template_name: Optional[str] = None,
-    fixed_output_len: Optional[int] = None,
+    chat_template_name: str | None = None,
+    fixed_output_len: int | None = None,
 ) -> SampleOutput:
     """
     Example of messages:
@@ -870,7 +873,7 @@ def sample_generated_shared_prefix_requests(
         random.shuffle(input_requests)
 
     # Print statistics
-    print(f"\nGenerated shared prefix dataset statistics:")
+    print("\nGenerated shared prefix dataset statistics:")
     print(f"Number of groups: {num_groups}")
     print(f"Prompts per group: {prompts_per_group}")
     print(f"Total prompts: {len(input_requests) * prompts_per_group}")

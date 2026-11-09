@@ -15,30 +15,31 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 
-from typing import Iterable, Optional, Set, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.ops.activation import GeluAndMul
+from sglang.srt.ops.layernorm import GemmaRMSNorm
 from sglang.srt.utils import make_layers
 
 
@@ -58,12 +59,8 @@ class Gemma2MLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, quant_config=quant_config
-        )
+        self.gate_up_proj = MergedColumnParallelLinear(hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config)
+        self.down_proj = RowParallelLinear(intermediate_size, hidden_size, bias=False, quant_config=quant_config)
         if not (hidden_act == hidden_activation == "gelu_pytorch_tanh"):
             raise ValueError(
                 "Gemma2 uses `gelu_pytorch_tanh` as the hidden activation "
@@ -146,11 +143,7 @@ class Gemma2Attention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             logit_cap=self.config.attn_logit_softcapping,
-            sliding_window_size=(
-                get_attention_sliding_window_size(config)
-                if use_sliding_window
-                else None
-            ),
+            sliding_window_size=(get_attention_sliding_window_size(config) if use_sliding_window else None),
         )
 
     def forward(
@@ -196,15 +189,9 @@ class Gemma2DecoderLayer(nn.Module):
             quant_config=quant_config,
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_feedforward_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -212,7 +199,7 @@ class Gemma2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -225,9 +212,7 @@ class Gemma2DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states, residual = self.pre_feedforward_layernorm(
-            hidden_states, residual
-        )
+        hidden_states, residual = self.pre_feedforward_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         return hidden_states, residual
@@ -271,10 +256,7 @@ class Gemma2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
         hidden_states *= normalizer
 
@@ -355,9 +337,7 @@ class Gemma2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.model.embed_tokens, forward_batch)
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
@@ -396,7 +376,7 @@ class Gemma2ForCausalLM(nn.Module):
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -406,7 +386,7 @@ class Gemma2ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:

@@ -10,6 +10,7 @@ Our inference engine is built on top of the [SGLang](https://github.com/sgl-proj
 - Support for Eagle, MTP, and PLD style speculative decoding
 - Layer-wise KVCache transfer, overlapping prefill computation with KVCache communication
 - Decode Radix Tree Cache to reduce KVCache transfer volume between PDs
+- LongCat 2.5 W4A4 multimodal inference on Ascend A2. See the [NPU deployment guide](npu_test/ReadMe.md).
 
 
 We sincerely appreciate the solid work and inspiration brought by the SGLang community.
@@ -26,6 +27,6 @@ We would also like to thank the broader LLM inference community. It is an honor 
 
 ## Note
 - We use [Dynamo](https://github.com/ai-dynamo/dynamo) for KVCache-aware request scheduling. As a result, in SGLang-FluentLLM we have removed SGLang’s sgl-model-gateway.
-- For multimodal models, we adopt a decoupled architecture that differs from the one used in the SGLang community. Therefore, multimodal support has also been removed from SGLang-FluentLLM itself (even in our internal setup, SGLang-FluentLLM is still used as the LLM backbone for multimodal inference).
+- LongCat 2.5 W4A4 multimodal inference uses an Encoder–Prefill–Decode (EPD) architecture: a standalone Encoder service handles visual encoding, while SGLang-FluentLLM runs the language model on Prefill/Decode nodes.
 - Tested on Nvidia GPUs H800/H20.
-- Tested on the Ascend A2; detailed operating steps can be found in npu_test/ReadMe.md
+- Tested on the Ascend A2.

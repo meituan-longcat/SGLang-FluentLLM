@@ -43,25 +43,15 @@ def _quantize_k_cache_slow(
 
     for tile_idx in range(0, num_tiles):
         cur_scale_factors_inv = (
-            torch.abs(
-                input_k_cache[..., tile_idx * tile_size : (tile_idx + 1) * tile_size]
-            )
-            .max(dim=-1)
-            .values
-            / 448.0
+            torch.abs(input_k_cache[..., tile_idx * tile_size : (tile_idx + 1) * tile_size]).max(dim=-1).values / 448.0
         )  # [num_blocks, block_size]
         result_k_scale_factor[:, :, tile_idx] = cur_scale_factors_inv
 
         cur_scale_factors_inv.unsqueeze_(-1)  # [num_blocks, block_size, 1]
-        cur_quantized_nope = (
-            input_k_cache[
-                ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
-            ].float()
-            / cur_scale_factors_inv.float()
-        ).to(torch.float8_e4m3fn)
-        result_k_nope_part[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
-            cur_quantized_nope
+        cur_quantized_nope = (input_k_cache[..., tile_idx * tile_size : (tile_idx + 1) * tile_size].float() / cur_scale_factors_inv.float()).to(
+            torch.float8_e4m3fn
         )
+        result_k_nope_part[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = cur_quantized_nope
 
     result = result.view(num_blocks, block_size, 1, -1)
     return result
@@ -180,14 +170,10 @@ def _quantize_k_cache_fast_kernel(
         # the ref impl do not have a `tl.maximum(... eps)`, so we remove it here
         y_s = tl.max(tl.abs(y)) / FP8_MAX
         y_s_inv = 1.0 / y_s
-        y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX).to(
-            output_nope_q_ptr.dtype.element_ty
-        )
+        y_q = tl.clamp(y * y_s_inv, FP8_MIN, FP8_MAX).to(output_nope_q_ptr.dtype.element_ty)
 
         dst_q_ptr = output_nope_q_ptr + token_id * output_nope_q_stride_0 + offs
-        dst_s_ptr = (
-            output_nope_s_ptr + token_id * output_nope_s_stride_0 + effective_block_id
-        )
+        dst_s_ptr = output_nope_s_ptr + token_id * output_nope_s_stride_0 + effective_block_id
 
         tl.store(dst_q_ptr, y_q, mask=mask)
         tl.store(dst_s_ptr, y_s)
@@ -218,26 +204,18 @@ if __name__ == "__main__":
             device="cuda",
         )
         # temp debug
-        # input_k_cache = (576 - torch.arange(num_blocks * block_size * 1 * dim_nope_and_rope, device="cuda")).to(torch.bfloat16).reshape(num_blocks, block_size, 1, dim_nope_and_rope)
+        # input_k_cache = (576 - torch.arange(
+        #     num_blocks * block_size * 1 * dim_nope_and_rope, device="cuda"
+        # )).to(torch.bfloat16).reshape(num_blocks, block_size, 1, dim_nope_and_rope)
 
         ref_quant = _quantize_k_cache_slow(input_k_cache)
         actual_quant = _quantize_k_cache_fast_wrapped(input_k_cache)
-        # print(f"{input_k_cache=}")
-        # print(f"{ref_quant=}")
-        # print(f"{actual_quant=}")
-        # print(f"{ref_quant == actual_quant=}")
-        # print(f"{actual_quant.to(torch.float32) - ref_quant.to(torch.float32)=}")
-        # print(f"{ref_quant.view(torch.bfloat16)=}")
-        # print(f"{actual_quant.view(torch.bfloat16)=}")
-        # assert torch.all(ref_quant == actual_quant)
 
         import dequant_k_cache
 
         ref_ref_dequant = dequant_k_cache._dequantize_k_cache_slow(ref_quant)
         ref_actual_dequant = dequant_k_cache._dequantize_k_cache_fast_wrapped(ref_quant)
-        actual_actual_dequant = dequant_k_cache._dequantize_k_cache_fast_wrapped(
-            actual_quant
-        )
+        actual_actual_dequant = dequant_k_cache._dequantize_k_cache_fast_wrapped(actual_quant)
 
         print(f"{ref_ref_dequant=}")
         print(f"{actual_actual_dequant=}")
@@ -245,11 +223,7 @@ if __name__ == "__main__":
         print(f"{torch.mean(ref_ref_dequant - actual_actual_dequant)=}")
 
         # TODO too different?
-        torch.testing.assert_close(
-            ref_ref_dequant, ref_actual_dequant, atol=0.2, rtol=0.2
-        )
-        torch.testing.assert_close(
-            ref_ref_dequant, actual_actual_dequant, atol=0.2, rtol=0.2
-        )
+        torch.testing.assert_close(ref_ref_dequant, ref_actual_dequant, atol=0.2, rtol=0.2)
+        torch.testing.assert_close(ref_ref_dequant, actual_actual_dequant, atol=0.2, rtol=0.2)
 
     print("Passed")

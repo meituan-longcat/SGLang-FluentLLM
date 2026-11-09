@@ -21,11 +21,10 @@ from eval_utils import (
     parse_multi_choice_response,
     prepare_samples,
 )
-from tqdm import tqdm
-
 from sglang import Engine
 from sglang.srt.conversation import chat_templates
 from sglang.srt.server_args import ServerArgs
+from tqdm import tqdm
 
 
 def eval_mmmu(args):

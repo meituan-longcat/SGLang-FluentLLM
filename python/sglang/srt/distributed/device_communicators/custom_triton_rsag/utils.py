@@ -119,9 +119,7 @@ def benchmark_with_event(
         dist.barrier(device_ids=[torch.cuda.current_device()])
     torch.cuda.synchronize()
 
-    begin_events = [
-        torch.cuda.Event(enable_timing=True) for _ in range(benchmark_iters)
-    ]
+    begin_events = [torch.cuda.Event(enable_timing=True) for _ in range(benchmark_iters)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(benchmark_iters)]
 
     if rank in profile_ranks:

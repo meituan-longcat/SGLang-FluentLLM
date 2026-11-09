@@ -34,13 +34,14 @@ PREFETCH_THRESHOLD="${5:-1}"
 IO_BACKEND="${6:-kernel}"
 PREFETCH_TIMEOUT_BASE="${7:-1}"
 
+# MODEL_PATH 可指定本地模型目录或 Hugging Face 模型 ID。
 case "$MODEL_NAME" in
     deepseek)
-        MODEL_PATH="/mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite"
+        MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V2-Lite}"
         log_info "使用模型: DeepSeek-V2-Lite"
         ;;
     qwen3)
-        MODEL_PATH="/mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/Qwen/Qwen3-4B-Instruct-2507/main"
+        MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B-Instruct-2507}"
         log_info "使用模型: Qwen3-4B-Instruct-2507"
         ;;
     *)

@@ -1,14 +1,12 @@
 import argparse
 import json
 import time
-from typing import List, Tuple
 
 import jsonschema
-from datasets import load_dataset
-
 import sglang as sgl
+from datasets import load_dataset
 from sglang.global_config import global_config
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -17,7 +15,7 @@ from sglang.utils import dump_state_text
 
 
 @sgl.function
-def schema_gen(s, message: Tuple[str, str], json_schema: str):
+def schema_gen(s, message: tuple[str, str], json_schema: str):
     system, user = message
     s += sgl.system(system)
     s += sgl.user(user)
@@ -26,7 +24,7 @@ def schema_gen(s, message: Tuple[str, str], json_schema: str):
     )
 
 
-def contains_formats(schema, formats: List[str]):
+def contains_formats(schema, formats: list[str]):
     if isinstance(schema, dict):
         if schema.get("format", None) in formats:
             return True
@@ -124,8 +122,7 @@ def main(args):
     # Write results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
     with open(f"{args.backend}.jsonl", "w") as fout:
-        for state in states:
-            fout.write(state["json_output"] + "\n")
+        fout.writelines(state["json_output"] + "\n" for state in states)
 
     with open(args.result_file, "a") as fout:
         value = {

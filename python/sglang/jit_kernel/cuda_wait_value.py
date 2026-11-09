@@ -54,14 +54,10 @@ def main():
     import threading
     import time
 
-    block_thead = threading.Thread(
-        target=test_wait_before_record, args=(Event(),), daemon=True
-    )
+    block_thead = threading.Thread(target=test_wait_before_record, args=(Event(),), daemon=True)
     block_thead.start()
 
-    non_block_thread = threading.Thread(
-        target=test_wait_before_record, args=(torch.cuda.Event(),)
-    )
+    non_block_thread = threading.Thread(target=test_wait_before_record, args=(torch.cuda.Event(),))
     non_block_thread.start()
 
     print("Checking if custom Event blocks the stream...", flush=True)

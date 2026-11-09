@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Dict, Optional
+from typing import Optional
+
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 
 ALLOWED_ATTENTION_LAYER_TYPES = (
     "full_attention",
@@ -28,16 +28,15 @@ ALLOWED_MLP_LAYER_TYPES = (
     "dense",
 )
 
+
 def layer_type_validation(layer_types: list[str], num_hidden_layers: int | None = None, attention: bool = True):
     """Check that `layer_types` is correctly defined."""
     allowed_layer_types = ALLOWED_ATTENTION_LAYER_TYPES if attention else ALLOWED_MLP_LAYER_TYPES
     if not all(layer_type in allowed_layer_types for layer_type in layer_types):
         raise ValueError(f"The `layer_types` entries must be in {allowed_layer_types}")
     if num_hidden_layers is not None and num_hidden_layers != len(layer_types):
-        raise ValueError(
-            f"`num_hidden_layers` ({num_hidden_layers}) must be equal to the number of layer types "
-            f"({len(layer_types)})"
-        )
+        raise ValueError(f"`num_hidden_layers` ({num_hidden_layers}) must be equal to the number of layer types ({len(layer_types)})")
+
 
 class GlmMoeDsaConfig(PretrainedConfig):
     r"""
@@ -190,13 +189,26 @@ class GlmMoeDsaConfig(PretrainedConfig):
         bos_token_id: int | None = 0,
         eos_token_id: int | None = 1,
         tie_word_embeddings: bool | None = False,
-        rope_parameters: Optional[Dict] = None,
+        rope_parameters: Optional[dict] = None,
         mlp_layer_types=None,
         attention_bias: bool | None = False,
         attention_dropout: float | None = 0.0,
         index_topk: int | None = 2048,
         index_head_dim: int | None = 128,
         index_n_heads: int | None = 32,
+        first_k_dense_replace: int = 3,
+        moe_layer_freq: int = 1,
+        num_nextn_predict_layers: int = 1,
+        topk_method: str = "noaux_tc",
+        scoring_func: str = "sigmoid",
+        indexer_types=None,
+        index_topk_pattern=None,
+        index_topk_freq: int | None = None,
+        index_skip_topk_offset: int | None = None,
+        index_share_for_mtp_iteration: bool = False,
+        rope_interleave: bool = True,
+        indexer_rope_interleave: bool = True,
+        mla_scale_q_lora: bool = False,
         **kwargs,
     ):
         # Model dimensions
@@ -233,10 +245,27 @@ class GlmMoeDsaConfig(PretrainedConfig):
             self.mlp_layer_types = ["dense"] * min(3, num_hidden_layers) + ["sparse"] * (num_hidden_layers - 3)
         layer_type_validation(self.mlp_layer_types, self.num_hidden_layers, attention=False)
 
+        # MoE layer schedule / routing
+        self.first_k_dense_replace = first_k_dense_replace
+        self.moe_layer_freq = moe_layer_freq
+        self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.topk_method = topk_method
+        self.scoring_func = scoring_func
+
         # Indexer (DSA) parameters
         self.index_topk = index_topk
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
+        # Per-layer indexer schedule: "full" layers own an indexer, "shared"
+        # layers reuse the previous full layer's topk indices (no weights).
+        self.indexer_types = indexer_types
+        self.index_topk_pattern = index_topk_pattern
+        self.index_topk_freq = index_topk_freq
+        self.index_skip_topk_offset = index_skip_topk_offset
+        self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
+        self.rope_interleave = rope_interleave
+        self.indexer_rope_interleave = indexer_rope_interleave
+        self.mla_scale_q_lora = mla_scale_q_lora
 
         # General config
         self.hidden_act = hidden_act
@@ -257,5 +286,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
 
 __all__ = ["GlmMoeDsaConfig"]

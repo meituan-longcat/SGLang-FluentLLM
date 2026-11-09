@@ -1,6 +1,6 @@
 import multiprocessing
 import time
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import requests
 import torch
@@ -51,9 +51,7 @@ class HttpServerEngineAdapter(EngineBase):
 
     def __init__(self, **kwargs):
         self.server_args = ServerArgs(**kwargs)
-        print(
-            f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}"
-        )
+        print(f"Launch HttpServerEngineAdapter at: {self.server_args.host}:{self.server_args.port}")
         time.sleep(10)
         self.process = launch_server_process(self.server_args)
 
@@ -66,13 +64,13 @@ class HttpServerEngineAdapter(EngineBase):
             The JSON response from the server
         """
         url = f"http://{self.server_args.host}:{self.server_args.port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        response = requests.post(url, json=payload or {}, timeout=3600)
         response.raise_for_status()
         return response.json()
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: list[tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = False,
     ):
@@ -86,8 +84,7 @@ class HttpServerEngineAdapter(EngineBase):
             "update_weights_from_tensor",
             {
                 "serialized_named_tensors": [
-                    MultiprocessingSerializer.serialize(named_tensors, output_str=True)
-                    for _ in range(self.server_args.world_size)
+                    MultiprocessingSerializer.serialize(named_tensors, output_str=True) for _ in range(self.server_args.world_size)
                 ],
                 "load_format": load_format,
                 "flush_cache": flush_cache,

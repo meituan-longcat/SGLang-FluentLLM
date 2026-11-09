@@ -50,11 +50,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return
 
     def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-        enable_weight_transpsoe: bool = False
+        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor] = None, enable_weight_transpsoe: bool = False
     ) -> torch.Tensor:
         cur_weight = layer.weight
         if not enable_weight_transpsoe:

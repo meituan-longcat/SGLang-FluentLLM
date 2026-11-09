@@ -1,44 +1,50 @@
-import json
+# ruff: noqa: S105
 import ast
+import json
 import logging
 import re
-from typing import List, Union, Literal
-
+from typing import Literal, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 
 logger = logging.getLogger(__name__)
 
 
-def get_argument_type(func_name: str, arg_key: str, defined_tools: list):
+def get_argument_type(
+    func_name: str,
+    arg_key: str,
+    defined_tools: list[Tool],
+) -> Optional[str]:
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
         return None
     tool = name2tool[func_name]
-    if arg_key not in tool.function.parameters["properties"]:
+    # tool.function.parameters is Optional[object]; guard against None / missing
+    # "properties" (e.g. tools declared with no parameter schema).
+    properties = (tool.function.parameters or {}).get("properties", {}) or {}
+    if arg_key not in properties:
         return None
-    return tool.function.parameters["properties"][arg_key].get("type", None)
+    return properties[arg_key].get("type", None)
 
 
 def parse_arguments(json_value):
     try:
         try:
             parsed_value = json.loads(json_value)
-        except:
+        except Exception:
             parsed_value = ast.literal_eval(json_value)
         return parsed_value, True
-    except:
+    except Exception:
         return json_value, False
 
 
 class LongCatXMLDetector(BaseFormatDetector):
-
     _ST_IDLE = 0
     _ST_FUNC_NAME = 1
     _ST_BODY = 2
@@ -74,18 +80,14 @@ class LongCatXMLDetector(BaseFormatDetector):
         return self.bot_token in text
 
     def _extract_pairs(self, func_args: str) -> list:
-        for regex in (self.func_arg_regex, self.func_arg_regex_fix_1,
-                      self.func_arg_regex_fix_2, self.func_arg_regex_fix_3):
+        for regex in (self.func_arg_regex, self.func_arg_regex_fix_1, self.func_arg_regex_fix_2, self.func_arg_regex_fix_3):
             pairs = re.findall(regex, func_args, re.DOTALL)
             if pairs:
                 return pairs
         return []
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         idx = text.find(self.bot_token)
         normal_text = text[:idx] if idx != -1 else text
@@ -101,7 +103,8 @@ class LongCatXMLDetector(BaseFormatDetector):
                 if not func_detail:
                     func_detail = re.search(
                         self.func_detail_regex_fix,
-                        match_result, re.DOTALL,
+                        match_result,
+                        re.DOTALL,
                     )
                 if not func_detail:
                     continue
@@ -131,7 +134,7 @@ class LongCatXMLDetector(BaseFormatDetector):
 
     def _try_consume_tag(self, tag: str) -> bool:
         if self._buffer.startswith(tag):
-            self._buffer = self._buffer[len(tag):]
+            self._buffer = self._buffer[len(tag) :]
             return True
         return False
 
@@ -140,11 +143,16 @@ class LongCatXMLDetector(BaseFormatDetector):
         check_len = min(len(buf), len(tag))
         return check_len > 0 and tag[:check_len] == buf[:check_len]
 
+    def _ensure_current_tool_state(self) -> None:
+        if self.current_tool_id < 0:
+            return
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
 
         self._buffer += new_text
@@ -158,13 +166,15 @@ class LongCatXMLDetector(BaseFormatDetector):
             if self._state == self._ST_IDLE:
                 bot_pos = self._buffer.find(self.bot_token)
                 if bot_pos != -1:
-                    normal_text += self._buffer[:bot_pos]
-                    self._buffer = self._buffer[bot_pos + len(self.bot_token):]
+                    if self.current_tool_id < 0:
+                        normal_text += self._buffer[:bot_pos]
+                    self._buffer = self._buffer[bot_pos + len(self.bot_token) :]
                     self._state = self._ST_FUNC_NAME
                     continue
                 partial = self._ends_with_partial_token(self._buffer, self.bot_token)
                 if partial:
-                    normal_text += self._buffer[:-partial]
+                    if self.current_tool_id < 0:
+                        normal_text += self._buffer[:-partial]
                     self._buffer = self._buffer[-partial:]
                     break
                 if self.current_tool_id > 0:
@@ -179,7 +189,7 @@ class LongCatXMLDetector(BaseFormatDetector):
                 if nl_pos == -1:
                     break
                 func_name = self._buffer[:nl_pos].strip()
-                self._buffer = self._buffer[nl_pos + 1:]
+                self._buffer = self._buffer[nl_pos + 1 :]
                 if not func_name:
                     self._state = self._ST_IDLE
                     continue
@@ -190,10 +200,7 @@ class LongCatXMLDetector(BaseFormatDetector):
 
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+                self._ensure_current_tool_state()
 
                 self.current_tool_name_sent = True
                 self._current_func_name = func_name
@@ -202,11 +209,13 @@ class LongCatXMLDetector(BaseFormatDetector):
 
                 result = StreamingParseResult(
                     normal_text=normal_text,
-                    calls=[ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=func_name,
-                        parameters="",
-                    )],
+                    calls=[
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
+                        )
+                    ],
                 )
                 return result
 
@@ -218,16 +227,15 @@ class LongCatXMLDetector(BaseFormatDetector):
                     self._current_arg_key = ""
                     self._state = self._ST_ARG_KEY
                     continue
-                elif self._try_consume_tag(self.eot_token) or \
-                     self._buffer.startswith(self.bot_token):
-                    # Normal close, or fallback: next <longcat_tool_call> without </longcat_tool_call>
-                    if self._buffer.startswith(self.bot_token):
-                        pass  # don't consume bot_token, let _ST_IDLE handle it
+                elif self._try_consume_tag(self.eot_token) or self._buffer.startswith(self.bot_token):
+                    if not self._buffer.startswith(self.bot_token) and self._buffer.startswith("\n"):
+                        self._buffer = self._buffer[1:]
                     if self._kv_count == 0:
                         argument_diff += "{}"
                     else:
                         argument_diff += "}"
 
+                    self._ensure_current_tool_state()
                     full_args = self.streamed_args_for_tool[self.current_tool_id] + argument_diff
                     try:
                         parsed_args = json.loads(full_args)
@@ -248,14 +256,18 @@ class LongCatXMLDetector(BaseFormatDetector):
 
                     calls = []
                     if argument_diff:
-                        calls.append(ToolCallItem(
-                            tool_index=completing_id,
-                            parameters=argument_diff,
-                        ))
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=completing_id,
+                                parameters=argument_diff,
+                            )
+                        )
                     return StreamingParseResult(normal_text=normal_text, calls=calls)
-                elif self._buffer_might_start_with(self._TAG_ARG_KEY_OPEN) or \
-                     self._buffer_might_start_with(self.eot_token) or \
-                     self._buffer_might_start_with(self.bot_token):
+                elif (
+                    self._buffer_might_start_with(self._TAG_ARG_KEY_OPEN)
+                    or self._buffer_might_start_with(self.eot_token)
+                    or self._buffer_might_start_with(self.bot_token)
+                ):
                     break
                 else:
                     self._buffer = self._buffer[1:]
@@ -265,7 +277,9 @@ class LongCatXMLDetector(BaseFormatDetector):
                 close_pos = self._buffer.find(self._TAG_ARG_KEY_CLOSE)
                 if close_pos != -1:
                     self._current_arg_key += self._buffer[:close_pos]
-                    self._buffer = self._buffer[close_pos + len(self._TAG_ARG_KEY_CLOSE):]
+                    self._buffer = self._buffer[close_pos + len(self._TAG_ARG_KEY_CLOSE) :]
+                    if self._buffer.startswith("\n"):
+                        self._buffer = self._buffer[1:]
                     self._current_arg_key = self._current_arg_key.strip()
                     self._state = self._ST_ARG_GAP
                     continue
@@ -277,7 +291,7 @@ class LongCatXMLDetector(BaseFormatDetector):
                     self._current_arg_key = self._current_arg_key.strip()
                     self._state = self._ST_ARG_GAP
                     continue
- 
+
                 partial = self._ends_with_partial_token(self._buffer, self._TAG_ARG_KEY_CLOSE)
                 if not partial:
                     partial = self._ends_with_partial_token(self._buffer, self._TAG_ARG_VALUE_OPEN)
@@ -336,15 +350,20 @@ class LongCatXMLDetector(BaseFormatDetector):
                     if is_fallback:
                         self._buffer = self._buffer[effective_close:]
                     else:
-                        self._buffer = self._buffer[effective_close + len(self._TAG_ARG_VALUE_CLOSE):]
+                        self._buffer = self._buffer[effective_close + len(self._TAG_ARG_VALUE_CLOSE) :]
+                        if self._buffer.startswith("\n"):
+                            self._buffer = self._buffer[1:]
                     self._current_arg_value_buf += last_chunk
 
                     full_value = self._current_arg_value_buf
                     arg_type = get_argument_type(self._current_func_name, self._current_arg_key, tools)
 
                     if arg_type == "string":
-                        unsent = full_value[len(self._value_sent):]
+                        unsent = full_value[len(self._value_sent) :]
                         argument_diff += self._escape_json_str_content(unsent) + '"'
+                    elif self._value_sent:
+                        remaining_raw = full_value[len(self._value_sent) :]
+                        argument_diff += remaining_raw
                     else:
                         parsed_val, _ = parse_arguments(full_value)
                         val_json = json.dumps(parsed_val, ensure_ascii=False)
@@ -370,27 +389,34 @@ class LongCatXMLDetector(BaseFormatDetector):
                     self._buffer = ""
 
                 arg_type = get_argument_type(self._current_func_name, self._current_arg_key, tools)
-                if arg_type == "string" and streamable:
+                if streamable:
                     current_full = self._current_arg_value_buf
-                    unsent = current_full[len(self._value_sent):]
+                    unsent = current_full[len(self._value_sent) :]
                     if unsent:
-                        argument_diff += self._escape_json_str_content(unsent)
-                        self._value_sent = current_full
+                        if arg_type == "string":
+                            argument_diff += self._escape_json_str_content(unsent)
+                            self._value_sent = current_full
+                        elif arg_type is not None:
+                            argument_diff += unsent
+                            self._value_sent = current_full
                 break
 
         if argument_diff:
+            self._ensure_current_tool_state()
             self.streamed_args_for_tool[self.current_tool_id] += argument_diff
             return StreamingParseResult(
                 normal_text=normal_text,
-                calls=[ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    parameters=argument_diff,
-                )],
+                calls=[
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        parameters=argument_diff,
+                    )
+                ],
             )
 
         return StreamingParseResult(normal_text=normal_text)
 
-    def flush(self, tools: List[Tool]) -> StreamingParseResult:
+    def flush(self, tools: list[Tool]) -> StreamingParseResult:
         """Finalize any incomplete tool call at end-of-stream.
 
         Handles three cases where the model stopped without emitting a closing tag:
@@ -403,6 +429,7 @@ class LongCatXMLDetector(BaseFormatDetector):
             return StreamingParseResult()
 
         argument_diff = ""
+        self._ensure_current_tool_state()
 
         if self._state == self._ST_ARG_VALUE:
             remaining = self._buffer
@@ -413,8 +440,11 @@ class LongCatXMLDetector(BaseFormatDetector):
             arg_type = get_argument_type(self._current_func_name, self._current_arg_key, tools)
 
             if arg_type == "string":
-                unsent = full_value[len(self._value_sent):]
+                unsent = full_value[len(self._value_sent) :]
                 argument_diff += self._escape_json_str_content(unsent) + '"'
+            elif self._value_sent:
+                remaining_raw = full_value[len(self._value_sent) :]
+                argument_diff += remaining_raw
             else:
                 parsed_val, _ = parse_arguments(full_value)
                 val_json = json.dumps(parsed_val, ensure_ascii=False)
@@ -448,10 +478,12 @@ class LongCatXMLDetector(BaseFormatDetector):
 
         calls = []
         if argument_diff:
-            calls.append(ToolCallItem(
-                tool_index=completing_id,
-                parameters=argument_diff,
-            ))
+            calls.append(
+                ToolCallItem(
+                    tool_index=completing_id,
+                    parameters=argument_diff,
+                )
+            )
         return StreamingParseResult(calls=calls)
 
     def supports_structural_tag(self) -> bool:

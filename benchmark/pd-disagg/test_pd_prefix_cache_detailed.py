@@ -13,32 +13,23 @@ python test_pd_prefix_cache_detailed.py --test_case full_reuse
 """
 
 import argparse
-import dataclasses
 import os
-import sys
 import random
-import string
 import subprocess
-import tempfile
+import sys
 import time
 import unittest
 from functools import cache
-from multiprocessing import Process
-from types import SimpleNamespace
-from typing import Callable, List, Dict, Tuple
-from urllib.parse import urlparse
 
 import numpy as np
 import requests
-import orjson
-
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import kill_process_tree, popen_launch_pd_server
 
 # 测试配置
 DEFAULT_LB_URL: str = "http://0.0.0.0:8192"
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
-DEFAULT_MODEL_PATH: str = "/mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite"
+DEFAULT_MODEL_PATH: str = os.environ.get("MODEL_PATH") or "deepseek-ai/DeepSeek-V2-Lite"
 
 # 设置随机种子确保结果可重现
 np.random.seed(1234)
@@ -46,7 +37,6 @@ random.seed(1234)
 
 def _get_user_python():
     """获取用户的Python解释器路径"""
-    import shutil
     
     # 首先检查当前使用的Python
     current_python = sys.executable
@@ -90,7 +80,7 @@ def get_user_name():
 
 def kill_all_sglang(kill_lb: bool = False):
     """清理所有sglang进程"""
-    kill_lb_pat = f"| grep -v mini_lb" if not kill_lb else ""
+    kill_lb_pat = "| grep -v mini_lb" if not kill_lb else ""
     kill_cmds = (
         f"ps aux | grep sglang {kill_lb_pat} | awk '{{print $2}}' | xargs kill -9"
     )
@@ -119,7 +109,7 @@ class TestDataGenerator:
         else:
             self.tokenizer = None
     
-    def generate_prefix_ids(self, length: int) -> List[int]:
+    def generate_prefix_ids(self, length: int) -> list[int]:
         """生成指定长度的前缀token IDs"""
         if self.tokenizer:
             # 生成有意义的文本前缀
@@ -135,7 +125,7 @@ class TestDataGenerator:
             token_ids = np.random.randint(low=0, high=102400, size=(length,), dtype=np.int64).tolist()
         return token_ids
     
-    def generate_different_suffix(self, base_length: int, suffix_length: int) -> List[List[int]]:
+    def generate_different_suffix(self, base_length: int, suffix_length: int) -> list[list[int]]:
         """生成不同后缀的测试用例"""
         base_prefix = self.generate_prefix_ids(base_length)
         
@@ -166,7 +156,7 @@ class PrefixCacheTestCase:
         max_new_tokens: int = 64,
         input_type: str = "input_ids",
         stream: bool = False
-    ) -> Tuple[any, Dict]:
+    ) -> tuple[any, dict]:
         """
         发送请求并获取响应
         
@@ -230,7 +220,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
         
-        print(f"📍 服务地址配置:")
+        print("📍 服务地址配置:")
         print(f"   - Load Balancer: {cls.lb_url}")
         print(f"   - Prefill Server: {cls.prefill_url}")
         print(f"   - Decode Server: {cls.decode_url}")
@@ -247,7 +237,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         # Decode Server 日志 
         cls.decode_log_file = f"/tmp/pd_decode_log_{timestamp}.log"
         
-        print(f"📝 日志文件:")
+        print("📝 日志文件:")
         print(f"   - Load Balancer: {cls.lb_log_file}")
         print(f"   - Prefill Server: {cls.prefill_log_file}")
         print(f"   - Decode Server: {cls.decode_log_file}")
@@ -312,7 +302,6 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         # cls._wait_services_ready()
 
         # 虚拟环境下存在问题，需手动拉起服务， 待后续修正
-        pass 
     
     @classmethod
     def _start_load_balancer(cls):
@@ -349,7 +338,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
                 )
         else:
             # 没找到虚拟环境Python，使用shell方式来激活环境
-            print(f"🔧 未找到虚拟环境Python，使用shell方式启动")
+            print("🔧 未找到虚拟环境Python，使用shell方式启动")
             
             # 构造通过bash激活环境的命令
             bash_command = f"""
@@ -404,7 +393,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
             print(f"🐍 使用用户Python环境: {user_python}")
             prefill_env["PYTHON"] = user_python
             
-            print(f"🚀 启动Prefill服务器，GPU: 0,1,2,3")
+            print("🚀 启动Prefill服务器，GPU: 0,1,2,3")
             with open(cls.prefill_log_file, 'w') as prefill_log:
                 cls.process_prefill = popen_launch_pd_server(
                     DEFAULT_MODEL_PATH,
@@ -417,7 +406,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
                 )
         else:
             # 没找到虚拟环境Python，使用shell方式来激活环境
-            print(f"🔧 未找到虚拟环境Python，使用shell方式启动Prefill")
+            print("🔧 未找到虚拟环境Python，使用shell方式启动Prefill")
             
             # 构造通过bash激活环境的命令
             bash_command = f"""
@@ -491,7 +480,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
             print(f"🐍 使用用户Python环境: {user_python}")
             decode_env["PYTHON"] = user_python
             
-            print(f"🚀 启动Decode服务器，GPU: 4,5,6,7")
+            print("🚀 启动Decode服务器，GPU: 4,5,6,7")
             with open(cls.decode_log_file, 'w') as decode_log:
                 cls.process_decode = popen_launch_pd_server(
                     DEFAULT_MODEL_PATH,
@@ -504,7 +493,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
                 )
         else:
             # 没找到虚拟环境Python，使用shell方式来激活环境
-            print(f"🔧 未找到虚拟环境Python，使用shell方式启动Decode")
+            print("🔧 未找到虚拟环境Python，使用shell方式启动Decode")
             
             # 构造通过bash激活环境的命令
             bash_command = f"""
@@ -577,7 +566,6 @@ class DetailedPrefixCacheTest(unittest.TestCase):
                         print(f"{name} {endpoint}  : response {response}")
                 except Exception as e:
                     print(f"{name} {endpoint} error {e}")
-                    pass
                 time.sleep(2)
             else:
                 raise RuntimeError(f"❌ {name} 启动超时")
@@ -599,7 +587,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         max_new_tokens: int = 64,
         input_type: str = "input_ids",
         stream: bool = False
-    ) -> Tuple[any, Dict]:
+    ) -> tuple[any, dict]:
         """
         发送请求并获取响应
         
@@ -699,7 +687,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         expected_cached = prefix_length  # 应该匹配完整前缀
         successful_reuse = sum(1 for cached in cache_results if cached >= expected_cached * 0.9)  # 允许10%误差
         
-        print(f"📈 缓存复用分析:")
+        print("📈 缓存复用分析:")
         print(f"   - 预期缓存匹配: {expected_cached}")
         print(f"   - 实际平均缓存: {np.mean(cache_results):.1f}")
         print(f"   - 成功复用率: {successful_reuse}/{len(cache_results)} = {successful_reuse/len(cache_results)*100:.1f}%")
@@ -761,7 +749,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         avg_cached = np.mean(cache_results)
         max_cached = max(cache_results)
         
-        print(f"📈 无缓存复用分析:")
+        print("📈 无缓存复用分析:")
         print(f"   - 平均缓存匹配: {avg_cached:.1f}")
         print(f"   - 最大缓存匹配: {max_cached}")
         
@@ -845,7 +833,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         # 验证部分前缀复用效果
         avg_reuse_ratio = np.mean([r['reuse_ratio'] for r in cache_results])
         
-        print(f"📈 部分前缀复用分析:")
+        print("📈 部分前缀复用分析:")
         for result in cache_results:
             print(f"   - {result['name']}: {result['cached']}/{result['expected']} = {result['reuse_ratio']:.2%}")
         print(f"   - 平均复用率: {avg_reuse_ratio:.2%}")
@@ -918,9 +906,9 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         random.shuffle(test_cases)
         
         print(f"📊 测试用例：{len(test_cases)}个混合请求")
-        print(f"   - 完全复用: 3个")
-        print(f"   - 部分复用: 3个") 
-        print(f"   - 无复用: 2个")
+        print("   - 完全复用: 3个")
+        print("   - 部分复用: 3个") 
+        print("   - 无复用: 2个")
         
         # 发送请求
         results_by_type = {'full_reuse': [], 'partial_reuse': [], 'no_reuse': []}
@@ -940,7 +928,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
             print(f"   结果: 缓存={cached_tokens}, 期望={case['expected_cache']}, 效率={cache_efficiency:.2%}")
         
         # 分析结果
-        print(f"📈 混合场景分析:")
+        print("📈 混合场景分析:")
         for req_type, results in results_by_type.items():
             if results:
                 avg_efficiency = np.mean([r['cached'] / r['expected'] if r['expected'] > 0 else 0 for r in results])
@@ -993,8 +981,8 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         """
         print("🧪 测试场景：并发请求压力测试")
         
-        import threading
         import queue
+        import threading
         
         # 构造大量相似请求
         base_prefix_length = 128
@@ -1078,7 +1066,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
             failed_results.append(errors.get())
         
         # 分析结果
-        print(f"📈 并发测试结果:")
+        print("📈 并发测试结果:")
         print(f"   - 总请求数: {num_requests}")
         print(f"   - 成功请求: {len(successful_results)}")
         print(f"   - 失败请求: {len(failed_results)}")
@@ -1192,7 +1180,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
             
             # 分析结果
             avg_match = np.mean(match_lengths) if match_lengths else 0
-            print(f"📈 Retract测试分析:")
+            print("📈 Retract测试分析:")
             print(f"   - 平均缓存匹配: {avg_match:.1f}")
             print(f"   - Retract检测: {'✅ 检测到' if retract_detected else '❌ 未检测到'}")
             
@@ -1239,7 +1227,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         test_rounds = 2
         requests_per_round = 5
         
-        print(f"📊 重复请求测试配置:")
+        print("📊 重复请求测试配置:")
         print(f"   - 输入长度: {input_length}")
         print(f"   - 测试轮次: {test_rounds}")
         print(f"   - 每轮请求数: {requests_per_round}")
@@ -1308,7 +1296,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
             print(f"      QPS: {round_summary['qps']:.2f}")
         
         # 整体分析
-        print(f"\n📊 重复请求测试整体分析:")
+        print("\n📊 重复请求测试整体分析:")
         
         # 缓存效率分析
         all_cached = [r['cached_tokens'] for r in all_results]
@@ -1322,12 +1310,12 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         overall_avg_latency = float(np.mean(all_latencies))
         overall_p95_latency = float(np.percentile(all_latencies, 95))
         
-        print(f"   - 总体缓存效率:")
+        print("   - 总体缓存效率:")
         print(f"     * 平均缓存匹配: {overall_avg_cached:.1f}/{input_length} ({overall_avg_efficiency:.2%})")
         print(f"     * 最低缓存匹配: {overall_min_cached}/{input_length}")
         print(f"     * 最高缓存匹配: {overall_max_cached}/{input_length}")
         
-        print(f"   - 总体性能:")
+        print("   - 总体性能:")
         print(f"     * 平均延迟: {overall_avg_latency:.3f}秒")
         print(f"     * P95延迟: {overall_p95_latency:.3f}秒")
         print(f"     * 总QPS: {len(all_results) / sum(r['duration'] for r in round_summaries):.2f}")
@@ -1336,12 +1324,12 @@ class DetailedPrefixCacheTest(unittest.TestCase):
         cache_stability = np.std(all_cached) / np.mean(all_cached) if np.mean(all_cached) > 0 else 0
         latency_stability = np.std(all_latencies) / np.mean(all_latencies) if np.mean(all_latencies) > 0 else 0
         
-        print(f"   - 稳定性分析:")
+        print("   - 稳定性分析:")
         print(f"     * 缓存匹配变异系数: {cache_stability:.3f} (越小越稳定)")
         print(f"     * 延迟变异系数: {latency_stability:.3f} (越小越稳定)")
         
         # 轮次间比较
-        print(f"   - 轮次间比较:")
+        print("   - 轮次间比较:")
         for summary in round_summaries:
             print(f"     * 第{summary['round']}轮: {summary['avg_efficiency']:.2%}效率, {summary['qps']:.2f} QPS")
         
@@ -1427,7 +1415,7 @@ class DetailedPrefixCacheTest(unittest.TestCase):
             min_match = min(match_lengths) if match_lengths else 0
             max_match = max(match_lengths) if match_lengths else 0
             
-            print(f"📈 Evict测试分析:")
+            print("📈 Evict测试分析:")
             print(f"   - 平均缓存匹配: {avg_match:.1f}")
             print(f"   - 最小缓存匹配: {min_match}")
             print(f"   - 最大缓存匹配: {max_match}")
@@ -1771,10 +1759,7 @@ if __name__ == "__main__":
     print("🔥 PD分离前缀缓存详细测试")
     print(f"🎯 运行测试: {args.test_case}")
     print("=" * 80)
-    
-    # 在开始测试前先清理所有进程
-    # print("🧹 清理现有sglang进程...")
-    # kill_all_sglang(kill_lb=True)
+
     time.sleep(2)
     
     try:

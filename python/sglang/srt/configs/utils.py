@@ -17,8 +17,7 @@ from functools import wraps
 from typing import Optional
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging, is_torch_available
-
+from transformers.utils import is_torch_available, logging
 
 logger = logging.get_logger(__name__)
 
@@ -49,9 +48,7 @@ def dynamic_rope_update(rope_forward):
             original_max_position_embeddings = self.config.max_position_embeddings
         if seq_len > original_max_position_embeddings:
             if not hasattr(self, "long_inv_freq"):
-                self.long_inv_freq, _ = self.rope_init_fn(
-                    self.config, device, seq_len=original_max_position_embeddings + 1
-                )
+                self.long_inv_freq, _ = self.rope_init_fn(self.config, device, seq_len=original_max_position_embeddings + 1)
             self.register_buffer("inv_freq", self.long_inv_freq, persistent=False)
         else:
             # This .to() is needed if the model has been moved to a device after being initialized (because
@@ -244,9 +241,7 @@ def _compute_yarn_parameters(
     """
     # No need to keep BC with yarn, unreleased when this new pattern was created.
     if len(rope_kwargs) > 0:
-        raise ValueError(
-            f"Unexpected arguments: `**rope_kwargs` should be unset in `_compute_yarn_parameters`, got {rope_kwargs}"
-        )
+        raise ValueError(f"Unexpected arguments: `**rope_kwargs` should be unset in `_compute_yarn_parameters`, got {rope_kwargs}")
 
     base = config.rope_theta
     partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
@@ -273,10 +268,7 @@ def _compute_yarn_parameters(
 
     # Sets the attention factor as suggested in the paper
     if attention_factor is None:
-        if mscale and mscale_all_dim:
-            attention_factor = float(get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim))
-        else:
-            attention_factor = get_mscale(factor)
+        attention_factor = float(get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)) if mscale and mscale_all_dim else get_mscale(factor)
 
     # Optional config options
     # beta_fast/beta_slow: as suggested in the paper, default to 32/1 (correspondingly)
@@ -312,10 +304,7 @@ def _compute_yarn_parameters(
 
     # Get n-dimensional rotational scaling corrected for extrapolation
     inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).to(device=device, dtype=torch.float)
-    inv_freq = (
-        inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
-        + inv_freq_extrapolation * inv_freq_extrapolation_factor
-    )
+    inv_freq = inv_freq_interpolation * (1 - inv_freq_extrapolation_factor) + inv_freq_extrapolation * inv_freq_extrapolation_factor
     return inv_freq, attention_factor
 
 
@@ -341,10 +330,7 @@ def _compute_longrope_parameters(
     # TODO (joao): use the new `original_max_position_embeddings` from rope_scaling
     # No need to keep BC with longrope, unreleased when this new pattern was created.
     if len(rope_kwargs) > 0:
-        raise ValueError(
-            "Unexpected arguments: `**rope_kwargs` should be unset in `_compute_longrope_parameters`, got "
-            f"{rope_kwargs}"
-        )
+        raise ValueError(f"Unexpected arguments: `**rope_kwargs` should be unset in `_compute_longrope_parameters`, got {rope_kwargs}")
 
     base = config.rope_theta
     partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
@@ -366,10 +352,7 @@ def _compute_longrope_parameters(
 
     # Sets the attention factor as suggested in the paper
     if attention_factor is None:
-        if factor <= 1.0:
-            attention_factor = 1.0
-        else:
-            attention_factor = math.sqrt(1 + math.log(factor) / math.log(original_max_position_embeddings))
+        attention_factor = 1.0 if factor <= 1.0 else math.sqrt(1 + math.log(factor) / math.log(original_max_position_embeddings))
 
     # Compute the inverse frequencies -- scaled based on the target sequence length
     if seq_len and seq_len > original_max_position_embeddings:
@@ -459,10 +442,7 @@ def _check_received_keys(
     if missing_keys:
         raise KeyError(f"Missing required keys in `rope_scaling` for 'rope_type'='{rope_type}': {missing_keys}")
 
-    if optional_keys is not None:
-        unused_keys = received_keys - required_keys - optional_keys
-    else:
-        unused_keys = received_keys - required_keys
+    unused_keys = received_keys - required_keys - optional_keys if optional_keys is not None else received_keys - required_keys
     if unused_keys:
         logger.warning(f"Unrecognized keys in `rope_scaling` for 'rope_type'='{rope_type}': {unused_keys}")
 
@@ -522,9 +502,7 @@ def _validate_yarn_parameters(config: PretrainedConfig, ignore_keys: Optional[se
 
     attention_factor = rope_scaling.get("attention_factor")
     if attention_factor is not None and (not isinstance(attention_factor, float) or attention_factor < 0):
-        logger.warning(
-            f"`rope_scaling`'s attention_factor field must be a float greater than 0, got {attention_factor}"
-        )
+        logger.warning(f"`rope_scaling`'s attention_factor field must be a float greater than 0, got {attention_factor}")
     beta_fast = rope_scaling.get("beta_fast")
     if beta_fast is not None and not isinstance(beta_fast, float):
         logger.warning(f"`rope_scaling`'s beta_fast field must be a float, got {beta_fast}")
@@ -555,13 +533,13 @@ def _validate_longrope_parameters(config: PretrainedConfig, ignore_keys: Optiona
     short_factor = rope_scaling.get("short_factor")
     if not isinstance(short_factor, list) and all(isinstance(x, (int, float)) for x in short_factor):
         logger.warning(f"`rope_scaling`'s short_factor field must be a list of numbers, got {short_factor}")
-    if not len(short_factor) == dim // 2:
+    if len(short_factor) != dim // 2:
         logger.warning(f"`rope_scaling`'s short_factor field must have length {dim // 2}, got {len(short_factor)}")
 
     long_factor = rope_scaling.get("long_factor")
     if not isinstance(long_factor, list) and all(isinstance(x, (int, float)) for x in long_factor):
         logger.warning(f"`rope_scaling`'s long_factor field must be a list of numbers, got {long_factor}")
-    if not len(long_factor) == dim // 2:
+    if len(long_factor) != dim // 2:
         logger.warning(f"`rope_scaling`'s long_factor field must have length {dim // 2}, got {len(long_factor)}")
 
     # Handle Phi3 divergence: prefer the use of `attention_factor` and/or `factor` over
@@ -582,11 +560,8 @@ def _validate_longrope_parameters(config: PretrainedConfig, ignore_keys: Optiona
             logger.warning(f"`rope_scaling`'s factor field must be a float >= 1, got {factor}")
 
         attention_factor = rope_scaling.get("attention_factor")
-        if attention_factor is not None:
-            if not isinstance(attention_factor, float) or attention_factor < 0.0:
-                logger.warning(
-                    f"`rope_scaling`'s attention_factor field must be a float greater than 0, got {attention_factor}"
-                )
+        if attention_factor is not None and (not isinstance(attention_factor, float) or attention_factor < 0.0):
+            logger.warning(f"`rope_scaling`'s attention_factor field must be a float greater than 0, got {attention_factor}")
 
 
 def _validate_llama3_parameters(config: PretrainedConfig, ignore_keys: Optional[set] = None):
@@ -614,10 +589,7 @@ def _validate_llama3_parameters(config: PretrainedConfig, ignore_keys: Optional[
 
     original_max_position_embeddings = rope_scaling["original_max_position_embeddings"]
     if original_max_position_embeddings is None or not isinstance(original_max_position_embeddings, int):
-        logger.warning(
-            "`rope_scaling`'s original_max_position_embeddings field must be an integer, got "
-            f"{original_max_position_embeddings}"
-        )
+        logger.warning(f"`rope_scaling`'s original_max_position_embeddings field must be an integer, got {original_max_position_embeddings}")
     if original_max_position_embeddings >= config.max_position_embeddings:
         logger.warning(
             "`rope_scaling`'s original_max_position_embeddings field must be less than max_position_embeddings, got "
@@ -650,6 +622,4 @@ def rope_config_validation(config: PretrainedConfig, ignore_keys: Optional[set] 
     if validation_fn is not None:
         validation_fn(config, ignore_keys=ignore_keys)
     else:
-        logger.warning(
-            f"Missing validation function mapping in `ROPE_VALIDATION_FUNCTIONS` for 'rope_type'='{rope_type}'"
-        )
+        logger.warning(f"Missing validation function mapping in `ROPE_VALIDATION_FUNCTIONS` for 'rope_type'='{rope_type}'")

@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The Qwen team, Alibaba Group and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +15,7 @@
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
+
 from .utils import rope_config_validation
 
 logger = logging.get_logger(__name__)

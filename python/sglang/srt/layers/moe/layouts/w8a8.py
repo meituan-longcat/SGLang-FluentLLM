@@ -51,9 +51,7 @@ class PerChannelQuantLayout(MoELayout):
         **extra_weight_attrs,
     ):
         w13_weight_scale = torch.nn.Parameter(
-            torch.ones(
-                num_local_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
-            ),
+            torch.ones(num_local_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32),
             requires_grad=False,
         )
         w2_weight_scale = torch.nn.Parameter(
@@ -65,11 +63,7 @@ class PerChannelQuantLayout(MoELayout):
 
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
-        weight_loader = partial(
-            load_per_channel_weight_scale,
-            tp_rank=get_moe_tensor_parallel_rank(),
-            do_transpose=False
-        )  # FIXME
+        weight_loader = partial(load_per_channel_weight_scale, tp_rank=get_moe_tensor_parallel_rank(), do_transpose=False)  # FIXME
         set_weight_attrs(w13_weight_scale, {"weight_loader": weight_loader})
         set_weight_attrs(w2_weight_scale, {"weight_loader": weight_loader})
 

@@ -24,29 +24,29 @@ import multiprocessing as mp
 import os
 import signal
 import threading
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from collections.abc import AsyncIterator, Iterator
+from typing import Optional, Union
 
 import zmq
 import zmq.asyncio
 
 # noinspection PyUnusedImports
-import sglang.srt.npu.utils  # 保证在加载sglang.srt.layers.moe.topk之前设置USE_EPS_TOPK_SIGMOID
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, CompletionRequest
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 
 # Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
+threading._register_atexit = lambda *args, **kwargs: None
 
-import torch
-import uvloop
+import torch  # noqa: E402
+import uvloop  # noqa: E402
 
-from sglang.srt.entrypoints.EngineBase import EngineBase
-from sglang.srt.managers.data_parallel_controller import (
+from sglang.srt.entrypoints.EngineBase import EngineBase  # noqa: E402
+from sglang.srt.managers.data_parallel_controller import (  # noqa: E402
     run_data_parallel_controller_process,
 )
-from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
-from sglang.srt.managers.io_struct import (
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process  # noqa: E402
+from sglang.srt.managers.io_struct import (  # noqa: E402
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
@@ -60,28 +60,28 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import (
+from sglang.srt.managers.scheduling.scheduler import run_scheduler_process  # noqa: E402
+from sglang.srt.managers.template_manager import TemplateManager  # noqa: E402
+from sglang.srt.managers.tokenizer_manager import TokenizerManager  # noqa: E402
+from sglang.srt.server_args import PortArgs, ServerArgs  # noqa: E402
+from sglang.srt.utils import (  # noqa: E402
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
+    get_colorful_logger,
     is_cuda,
     kill_process_tree,
     launch_dummy_health_check_server,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
-    get_colorful_logger,
 )
-from sglang.version import __version__
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter  # noqa: E402
+from sglang.version import __version__  # noqa: E402
 
 # Optional tracing import for Dynamo compatibility
 try:
-    from sglang.srt.tracing.trace import process_tracing_init
+    from sglang.srt.observability.tracing.trace import process_tracing_init
 except ImportError:
     process_tracing_init = None
 
@@ -97,8 +97,10 @@ class Engine(EngineBase):
 
     - The engine consists of three components:
         1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
-        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches, forwards them, and sends the output tokens to the Detokenizer Manager.
-        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result back to the Tokenizer Manager.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager, schedules batches,
+           forwards them, and sends the output tokens to the Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and sends the result
+           back to the Tokenizer Manager.
 
     Note:
     1. The HTTP server, Engine, and TokenizerManager both run in the main process.
@@ -146,18 +148,20 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
 
-        self.openai_serving_completion = OpenAIServingCompletion(
-            self.tokenizer_manager, self.template_manager
-        )
+        if self.tokenizer_manager is not None:
+            self.openai_serving_completion = OpenAIServingCompletion(self.tokenizer_manager, self.template_manager)
+            self.openai_serving_chat = OpenAIServingChat(self.tokenizer_manager, self.template_manager)
+        else:
+            self.openai_serving_completion = None
+            self.openai_serving_chat = None
+            logger.info(
+                "Multi-node worker (node_rank=%s): skipping tokenizer and OpenAI serving initialization on this process.",
+                server_args.node_rank,
+            )
 
-        self.openai_serving_chat = OpenAIServingChat(
-            self.tokenizer_manager, self.template_manager
-        )
-
-    async def openai_v1_chat_completions(self, request_dict: dict,
-                                         bootstrap_host : Optional[str] = None,
-                                         bootstrap_port : Optional[int] = None,
-                                         bootstrap_room : Optional[int] = None):
+    async def openai_v1_chat_completions(
+        self, request_dict: dict, bootstrap_host: Optional[str] = None, bootstrap_port: Optional[int] = None, bootstrap_room: Optional[int] = None
+    ):
         request = ChatCompletionRequest(**request_dict)
         if bootstrap_host is not None:
             request.bootstrap_host = bootstrap_host
@@ -171,10 +175,9 @@ class Engine(EngineBase):
             response = await generator.__anext__()
             return response
 
-    async def openai_v1_completions(self, request_dict: dict,
-                                         bootstrap_host : Optional[str] = None,
-                                         bootstrap_port : Optional[int] = None,
-                                         bootstrap_room : Optional[int] = None):
+    async def openai_v1_completions(
+        self, request_dict: dict, bootstrap_host: Optional[str] = None, bootstrap_port: Optional[int] = None, bootstrap_room: Optional[int] = None
+    ):
         request = CompletionRequest(**request_dict)
         if bootstrap_host is not None:
             request.bootstrap_host = bootstrap_host
@@ -191,10 +194,10 @@ class Engine(EngineBase):
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        prompt: Optional[Union[list[str], str]] = None,
+        sampling_params: Optional[Union[list[dict], dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        input_ids: Optional[Union[list[list[int]], list[int]]] = None,
         # The image input. It can be an image instance, file name, URL, or base64 encoded string.
         # Can be formatted as:
         # - Single image for a single request
@@ -204,18 +207,18 @@ class Engine(EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_logprob: Optional[Union[list[bool], bool]] = False,
+        logprob_start_len: Optional[Union[list[int], int]] = None,
+        top_logprobs_num: Optional[Union[list[int], int]] = None,
+        token_ids_logprob: Optional[Union[list[list[int]], list[int]]] = None,
+        custom_logit_processor: Optional[Union[list[str], str]] = None,
         return_hidden_states: bool = False,
         stream: bool = False,
-        bootstrap_host: Optional[Union[List[str], str]] = None,
-        bootstrap_port: Optional[Union[List[int], int]] = None,
-        bootstrap_room: Optional[Union[List[int], int]] = None,
+        bootstrap_host: Optional[Union[list[str], str]] = None,
+        bootstrap_port: Optional[Union[list[int], int]] = None,
+        bootstrap_room: Optional[Union[list[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
-    ) -> Union[Dict, Iterator[Dict]]:
+    ) -> Union[dict, Iterator[dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
@@ -226,15 +229,7 @@ class Engine(EngineBase):
             elif data_parallel_rank < 0:
                 raise ValueError("data_parallel_rank must be non-negative")
             elif data_parallel_rank >= self.server_args.dp_size:
-                raise ValueError(
-                    f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}"
-                )
-
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
-            return_logprob = False
-            logprob_start_len = None
-            top_logprobs_num = None
-            token_ids_logprob = None
+                raise ValueError(f"data_parallel_rank must be less than dp_size: {self.server_args.dp_size}")
 
         obj = GenerateReqInput(
             text=prompt,
@@ -252,7 +247,7 @@ class Engine(EngineBase):
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
-            bootstrap_room=bootstrap_room
+            bootstrap_room=bootstrap_room,
         )
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -272,16 +267,43 @@ class Engine(EngineBase):
             ret = loop.run_until_complete(generator.__anext__())
             return ret
 
+    def _resolve_routed_dp_rank(
+        self,
+        routed_dp_rank: Optional[int],
+        data_parallel_rank: Optional[int],
+    ) -> Optional[int]:
+        if data_parallel_rank is not None:
+            import warnings
+
+            warnings.warn(
+                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if routed_dp_rank is None:
+                routed_dp_rank = data_parallel_rank
+
+        if routed_dp_rank is not None:
+            dp_size = self.server_args.dp_size
+            if dp_size <= 1 and routed_dp_rank == 0:
+                logger.warning(f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}")
+                return None
+            if routed_dp_rank < 0 or routed_dp_rank >= dp_size:
+                raise ValueError(f"routed_dp_rank={routed_dp_rank} out of range [0, {dp_size})")
+
+        logger.debug(f"routed_dp_rank: {routed_dp_rank}")
+        return routed_dp_rank
+
     async def async_generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
-        prompt: Optional[Union[List[str], str]] = None,
-        sampling_params: Optional[Union[List[Dict], Dict]] = None,
+        prompt: Optional[Union[list[str], str]] = None,
+        sampling_params: Optional[Union[list[dict], dict]] = None,
         # The token ids for text; one can either specify text or input_ids.
-        input_ids: Optional[Union[List[List[int]], List[int]]] = None,
+        input_ids: Optional[Union[list[list[int]], list[int]]] = None,
         input_embeds: torch.Tensor = None,
-        input_multi_ids: List[List[int]] = None,
-        input_extra_infos: List[Dict] = None,
+        input_multi_ids: list[list[int]] = None,
+        input_extra_infos: list[dict] = None,
         # The image input. It can be an image instance, file name, URL, or base64 encoded string.
         # Can be formatted as:
         # - Single image for a single request
@@ -291,28 +313,32 @@ class Engine(EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-        return_logprob: Optional[Union[List[bool], bool]] = False,
-        logprob_start_len: Optional[Union[List[int], int]] = None,
-        top_logprobs_num: Optional[Union[List[int], int]] = None,
-        token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None,
-        custom_logit_processor: Optional[Union[List[str], str]] = None,
+        return_logprob: Optional[Union[list[bool], bool]] = False,
+        logprob_start_len: Optional[Union[list[int], int]] = None,
+        top_logprobs_num: Optional[Union[list[int], int]] = None,
+        token_ids_logprob: Optional[Union[list[list[int]], list[int]]] = None,
+        lora_path: Optional[list[Optional[str]]] = None,
+        custom_logit_processor: Optional[Union[list[str], str]] = None,
         return_hidden_states: bool = False,
+        return_routed_experts: bool = False,
         stream: bool = False,
-        bootstrap_host: Optional[Union[List[str], str]] = None,
-        bootstrap_port: Optional[Union[List[int], int]] = None,
-        bootstrap_room: Optional[Union[List[int], int]] = None,
-        rid: Optional[Union[List[str], str]] = None,
-    ) -> Union[Dict, AsyncIterator[Dict]]:
+        bootstrap_host: Optional[Union[list[str], str]] = None,
+        bootstrap_port: Optional[Union[list[int], int]] = None,
+        bootstrap_room: Optional[Union[list[int], int]] = None,
+        routed_dp_rank: Optional[int] = None,
+        disagg_prefill_dp_rank: Optional[int] = None,
+        # Deprecated: use routed_dp_rank instead
+        data_parallel_rank: Optional[int] = None,
+        external_trace_header: Optional[dict] = None,
+        rid: Optional[Union[list[str], str]] = None,
+        session_params: Optional[dict] = None,
+        priority: Optional[int] = None,
+    ) -> Union[dict, AsyncIterator[dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
-            return_logprob = False
-            logprob_start_len = None
-            top_logprobs_num = None
-            token_ids_logprob = None
+        routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank, data_parallel_rank)
 
         obj = GenerateReqInput(
             text=prompt,
@@ -328,13 +354,20 @@ class Engine(EngineBase):
             logprob_start_len=logprob_start_len,
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
+            lora_path=lora_path,
             return_hidden_states=return_hidden_states,
+            return_routed_experts=return_routed_experts,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
+            routed_dp_rank=routed_dp_rank,
+            disagg_prefill_dp_rank=disagg_prefill_dp_rank,
+            external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
+            priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -343,7 +376,7 @@ class Engine(EngineBase):
                 yield item
 
             await asyncio.sleep(1)
-            self.tokenizer_manager.abort_request(obj.rid[0])
+            await self.tokenizer_manager.abort_request(obj.rid[0])
 
         if stream is True:
             return wrapped_output_generator(generator)
@@ -352,11 +385,11 @@ class Engine(EngineBase):
 
     def encode(
         self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        prompt: Union[str, list[str], list[dict], list[list[dict]]],
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-    ) -> Dict:
+    ) -> dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
@@ -374,11 +407,11 @@ class Engine(EngineBase):
 
     async def async_encode(
         self,
-        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        prompt: Union[str, list[str], list[dict], list[list[dict]]],
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-    ) -> Dict:
+    ) -> dict:
         """
         Asynchronous version of encode method.
 
@@ -396,8 +429,8 @@ class Engine(EngineBase):
 
     def rerank(
         self,
-        prompt: Union[List[List[str]]],
-    ) -> Dict:
+        prompt: Union[list[list[str]]],
+    ) -> dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
         Please refer to `EmbeddingReqInput` for the documentation.
@@ -410,8 +443,8 @@ class Engine(EngineBase):
 
     def classify(
         self,
-        input_ids: List[List[int]],
-    ) -> Dict:
+        input_ids: list[list[int]],
+    ) -> dict:
         obj = EmbeddingReqInput(input_ids=input_ids)
         loop = asyncio.get_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -443,27 +476,19 @@ class Engine(EngineBase):
 
     def start_expert_distribution_record(self):
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(
-            self.tokenizer_manager.start_expert_distribution_record()
-        )
+        loop.run_until_complete(self.tokenizer_manager.start_expert_distribution_record())
 
     def stop_expert_distribution_record(self):
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(
-            self.tokenizer_manager.stop_expert_distribution_record()
-        )
+        loop.run_until_complete(self.tokenizer_manager.stop_expert_distribution_record())
 
     def dump_expert_distribution_record(self):
         loop = asyncio.get_event_loop()
-        loop.run_until_complete(
-            self.tokenizer_manager.dump_expert_distribution_record()
-        )
+        loop.run_until_complete(self.tokenizer_manager.dump_expert_distribution_record())
 
     def get_server_info(self):
         loop = asyncio.get_event_loop()
-        internal_states = loop.run_until_complete(
-            self.tokenizer_manager.get_internal_state()
-        )
+        internal_states = loop.run_until_complete(self.tokenizer_manager.get_internal_state())
         return {
             **dataclasses.asdict(self.tokenizer_manager.server_args),
             **self.scheduler_info,
@@ -490,9 +515,7 @@ class Engine(EngineBase):
             backend=backend,
         )
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.init_weights_update_group(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.init_weights_update_group(obj, None))
 
     def update_weights_from_distributed(
         self,
@@ -511,30 +534,23 @@ class Engine(EngineBase):
             flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_distributed(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.update_weights_from_distributed(obj, None))
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: list[tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
-                MultiprocessingSerializer.serialize(named_tensors)
-                for _ in range(self.server_args.world_size)
-            ],
+            serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(self.server_args.world_size)],
             load_format=load_format,
             flush_cache=flush_cache,
         )
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_tensor(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.update_weights_from_tensor(obj, None))
 
     def update_weights_from_disk(
         self,
@@ -553,31 +569,23 @@ class Engine(EngineBase):
         )
 
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_disk(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.update_weights_from_disk(obj, None))
 
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.get_weights_by_name(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.get_weights_by_name(obj, None))
 
-    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+    def release_memory_occupation(self, tags: Optional[list[str]] = None):
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.release_memory_occupation(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.release_memory_occupation(obj, None))
 
-    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+    def resume_memory_occupation(self, tags: Optional[list[str]] = None):
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
-            self.tokenizer_manager.resume_memory_occupation(obj, None)
-        )
+        return loop.run_until_complete(self.tokenizer_manager.resume_memory_occupation(obj, None))
 
     """
     Execute an RPC call on all scheduler processes.
@@ -598,12 +606,12 @@ class Engine(EngineBase):
 
     def score(
         self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
+        query: Optional[Union[str, list[int]]] = None,
+        items: Optional[Union[str, list[str], list[list[int]]]] = None,
+        label_token_ids: Optional[list[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> list[list[float]]:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
         query = "<|user|>Is the following city the capital of France? "
@@ -649,12 +657,12 @@ class Engine(EngineBase):
 
     async def async_score(
         self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
+        query: Optional[Union[str, list[int]]] = None,
+        items: Optional[Union[str, list[str], list[list[int]]]] = None,
+        label_token_ids: Optional[list[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> list[list[float]]:
         """
         Asynchronous version of score method.
 
@@ -710,9 +718,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         # Note: This sigquit handler is used in the launch phase, and may be replaced by
         # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
         def launch_phase_sigquit_handler(signum, frame):
-            logger.error(
-                "Received sigquit from a child process. It usually means the child failed."
-            )
+            logger.error("Received sigquit from a child process. It usually means the child failed.")
             kill_process_tree(os.getpid())
 
         signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
@@ -720,9 +726,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
-def _calculate_rank_ranges(
-    nnodes: int, pp_size: int, tp_size: int, node_rank: int
-) -> Tuple[range, range, int, int]:
+
+def _calculate_rank_ranges(nnodes: int, pp_size: int, tp_size: int, node_rank: int) -> tuple[range, range, int, int]:
     """Calculate pp_rank_range and tp_rank_range for a given node.
 
     Args:
@@ -754,9 +759,8 @@ def _calculate_rank_ranges(
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 
-def _launch_subprocesses(
-    server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+
+def _launch_subprocesses(server_args: ServerArgs, port_args: Optional[PortArgs] = None) -> tuple[TokenizerManager, TemplateManager, dict]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
@@ -769,6 +773,7 @@ def _launch_subprocesses(
     # running here (e.g. TokenizerManager → SamplingParams) can read the real
     # server configuration instead of the None defaults.
     from sglang.srt.env import global_server_args_dict_update
+
     global_server_args_dict_update(server_args)
 
     # Allocate ports for inter-process communications
@@ -777,38 +782,32 @@ def _launch_subprocesses(
         logger.info(f"{server_args=}")
 
     # If using model from www.modelscope.cn, first download the model.
-    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
-        server_args.model_path, server_args.tokenizer_path
-    )
+    server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(server_args.model_path, server_args.tokenizer_path)
 
     scheduler_procs = []
     if server_args.dp_size == 1:
         # Launch tensor parallel scheduler processes
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
+        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=server_args.enable_memory_saver)
 
         scheduler_pipe_readers = []
-        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node=(
-            _calculate_rank_ranges(
-                server_args.nnodes,
-                server_args.pp_size,
-                server_args.tp_size,
-                server_args.node_rank,
-            )
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = _calculate_rank_ranges(
+            server_args.nnodes,
+            server_args.pp_size,
+            server_args.tp_size,
+            server_args.node_rank,
         )
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
-                reader, writer=mp.Pipe(duplex=False)
-                gpu_id=(
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
                     server_args.base_gpu_id
-                    +((pp_rank%pp_size_per_node)*tp_size_per_node)
-                    +(tp_rank%tp_size_per_node)*server_args.gpu_id_step
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                global_rank=pp_rank*server_args.tp_size + tp_rank
-                proc=mp.Process(
+                global_rank = pp_rank * server_args.tp_size + tp_rank
+                proc = mp.Process(
                     target=run_scheduler_process,
                     args=(server_args, port_args, gpu_id, pp_rank, tp_rank, moe_ep_rank, None, global_rank, writer),
                 )
@@ -839,15 +838,11 @@ def _launch_subprocesses(
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 
-        launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
-        )
+        launch_dummy_health_check_server(server_args.host, server_args.port, server_args.enable_metrics)
 
         for proc in scheduler_procs:
             proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
+            logger.error(f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}")
         return None, None, None
 
     # Launch detokenizer process
@@ -870,17 +865,13 @@ def _launch_subprocesses(
         try:
             data = scheduler_pipe_readers[i].recv()
         except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
+            logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
             scheduler_procs[i].join()
             logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
             raise
 
         if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
+            raise RuntimeError("Initialization failed. Please see the error messages above.")
         scheduler_infos.append(data)
 
     # Assume all schedulers have the same scheduler_info

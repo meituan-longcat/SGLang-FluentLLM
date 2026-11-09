@@ -4,7 +4,7 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, TypedDict
+from typing import Any, TypedDict
 
 import ray
 import torch
@@ -12,13 +12,17 @@ import triton
 import triton.language as tl
 from ray.experimental.tqdm_ray import tqdm
 from sgl_kernel import silu_and_mul
+from sglang.srt.layers.moe.gemms.triton_common import (
+    invoke_fused_moe_kernel,
+    moe_align_block_size,
+)
+from sglang.srt.layers.moe.gemms.triton_config import (
+    get_config_dtype_str,
+    get_config_file_path,
+    override_config,
+)
+from sglang.srt.ops.topk import TopKConfig, select_experts
 from transformers import AutoConfig
-
-
-from sglang.srt.layers.moe.gemms.triton_config import get_config_file_path
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.layers.moe.gemms.triton_config import override_config, get_config_file_name, get_config_dtype_str
-from sglang.srt.layers.moe.gemms.triton_common import invoke_fused_moe_kernel, moe_align_block_size
 
 
 class BenchmarkConfig(TypedDict):
@@ -42,7 +46,7 @@ def benchmark_config(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     topk_ids_dir: str,
-    block_shape: List[int] = None,
+    block_shape: list[int] = None,
     num_iters: int = 100,
 ) -> float:
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
@@ -255,10 +259,10 @@ def benchmark_config(
         run()
         moe_use_tma = True
         run()
-    latencies: List[float] = []
-    latencies1: List[float] = []
-    latencies_tma: List[float] = []
-    latencies1_tma: List[float] = []
+    latencies: list[float] = []
+    latencies1: list[float] = []
+    latencies_tma: list[float] = []
+    latencies1_tma: list[float] = []
 
     for i in range(num_iters):
         prepare(i)
@@ -283,11 +287,11 @@ def benchmark_config(
     return avg, avg_tma, avg1, avg1_tma
 
 
-def get_configs_compute_bound() -> List[Dict[str, int]]:
+def get_configs_compute_bound() -> list[dict[str, int]]:
     # Reduced search space for faster tuning.
     # TODO(woosuk): Increase the search space and use a performance model to
     # prune the search space.
-    configs: List[BenchmarkConfig] = []
+    configs: list[BenchmarkConfig] = []
     for block_m in [16, 32, 64, 128, 256]:
         for block_k in [32, 64, 128, 256]:
             for block_n in [32, 64, 128, 256]:
@@ -359,10 +363,10 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
-        block_shape: List[int],
-        cfg: Dict[str, int],
+        block_shape: list[int],
+        cfg: dict[str, int],
         topk_ids_dir: str,
-    ) -> Tuple[Dict[str, int], float]:
+    ) -> tuple[dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
         dtype_str = get_config_dtype_str(
             dtype, use_int8_w8a16=use_int8_w8a16, use_fp8_w8a8=use_fp8_w8a8
@@ -399,10 +403,10 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
-        block_shape: List[int],
-        search_space: List[Dict[str, int]],
+        block_shape: list[int],
+        search_space: list[dict[str, int]],
         topk_ids_dir: str,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         trace0 = BestConfigTrace("kernel0")
         trace1 = BestConfigTrace("kernel1")
         trace2 = BestConfigTrace("kernel all")
@@ -488,7 +492,7 @@ def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
 
 
 def save_configs(
-    configs: Dict[int, BenchmarkConfig],
+    configs: dict[int, BenchmarkConfig],
     num_experts: int,
     shard_intermediate_size: int,
     hidden_size: int,
@@ -497,7 +501,7 @@ def save_configs(
     use_fp8_w8a8: bool,
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
-    block_shape: List[int],
+    block_shape: list[int],
     down_moe: bool = False,
 ) -> None:
     dtype_str = get_config_dtype_str(
@@ -683,7 +687,7 @@ def main(args: argparse.Namespace):
         for _ in range(num_gpus)
     ]
 
-    def _distribute(method: str, inputs: List[Any]) -> List[Any]:
+    def _distribute(method: str, inputs: list[Any]) -> list[Any]:
         outputs = []
         worker_idx = 0
         for input_args in inputs:

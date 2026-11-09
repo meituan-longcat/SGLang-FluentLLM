@@ -3,8 +3,9 @@ from typing import Optional
 from eps.executor import AokGroupedGemm
 
 from sglang.srt.layers.moe.config import DispatcherType, EPConfig
-from sglang.srt.layers.activation import SwigluArg
-from sglang.srt.layers.moe.executors.eps_executor import EPSExecutor
+from sglang.srt.ops.activation import SwigluArg
+from sglang.srt.layers.moe.executors.bf16_deepep_executor import BF16DeepEPExecutor
+from sglang.srt.layers.moe.executors.bf16_eps_executor import BF16EPSExecutor
 from sglang.srt.layers.moe.layouts.unquant import UnquantMoELayout
 
 
@@ -27,8 +28,13 @@ class AokGroupedGemmWrapper:
         activation: str,
         swiglu_arg: Optional[SwigluArg] = None,
     ):
+        ep_config = EPConfig.from_gemm_wrapper(self)
         if dispatcher_type == DispatcherType.EPS:
-            ep_config = EPConfig.from_gemm_wrapper(self)
-            return EPSExecutor(self.gemm, ep_config, activation, swiglu_arg)
-        else:
-            raise RuntimeError("To implement")
+            return BF16EPSExecutor(self.gemm, ep_config, activation, swiglu_arg)
+        if dispatcher_type == DispatcherType.DEEPEP:
+            return BF16DeepEPExecutor(
+                ep_config,
+                activation,
+                swiglu_arg,
+            )
+        raise RuntimeError("To implement")

@@ -14,19 +14,15 @@
 """DetokenizerManager is a process that detokenizes the token ids."""
 
 import dataclasses
-from sglang.srt.utils import get_colorful_logger, register_usr_signal
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Union
+from typing import Union
 
 import psutil
 import setproctitle
 import zmq
 
-# noinspection PyUnusedImports
-import sglang.srt.distributed  # 解决循环import
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchMultimodalDecodeReq,
@@ -36,9 +32,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
+    get_colorful_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
+    register_usr_signal,
 )
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.utils import (
     TypeBasedDispatcher,
     find_printable_text,
@@ -59,11 +58,12 @@ class DecodeStatus:
     """Store the status of incremental decoding."""
 
     decoded_text: str
-    decode_ids: List[int]
+    decode_ids: list[int]
     surr_offset: int
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
+
 
 class DetokenizerManager:
     """DetokenizerManager is a process that detokenizes the token ids."""
@@ -75,12 +75,8 @@ class DetokenizerManager:
     ):
         # Init inter-process communication
         context = zmq.Context(2)
-        self.recv_from_scheduler = get_zmq_socket(
-            context, zmq.PULL, port_args.detokenizer_ipc_name, True
-        )
-        self.send_to_tokenizer = get_zmq_socket(
-            context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-        )
+        self.recv_from_scheduler = get_zmq_socket(context, zmq.PULL, port_args.detokenizer_ipc_name, True)
+        self.send_to_tokenizer = get_zmq_socket(context, zmq.PUSH, port_args.tokenizer_ipc_name, False)
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
@@ -114,13 +110,11 @@ class DetokenizerManager:
             output = self._request_dispatcher(recv_obj)
             self.send_to_tokenizer.send_pyobj(output)
 
-    def trim_matched_stop(
-        self, output: Union[str, List[int]], finished_reason: Dict, no_stop_trim: bool
-    ):
+    def trim_matched_stop(self, output: Union[str, list[int]], finished_reason: dict, no_stop_trim: bool):
         if no_stop_trim or not finished_reason:
             return output
 
-        matched = finished_reason.get("matched", None)
+        matched = finished_reason.get("matched")
         if not matched:
             return output
 
@@ -211,7 +205,7 @@ class DetokenizerManager:
         for i in range(bs):
             try:
                 s = self.decode_status[recv_obj.rids[i]]
-            except KeyError:
+            except KeyError as e:
                 raise RuntimeError(
                     f"Decode status not found for request {recv_obj.rids[i]}. "
                     "It may be due to the request being evicted from the decode status due to memory pressure. "
@@ -219,7 +213,7 @@ class DetokenizerManager:
                     "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
                     f"The current value is {DETOKENIZER_MAX_STATES}. "
                     "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                )
+                ) from e
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
@@ -241,15 +235,26 @@ class DetokenizerManager:
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
+            # Drop the per-request state once the request is done. decode_status is
+            # keyed by rid and never expires otherwise; if a caller later reuses the
+            # same rid for a fresh request, the stale surr_offset/read_offset would be
+            # taken (the else branch above), re-emitting the tail of the previous
+            # request's prompt before the new output. Deleting on finish forces the
+            # next same-rid request back through fresh initialization.
+            if recv_obj.finished_reasons[i] is not None:
+                self.decode_status.pop(recv_obj.rids[i], None)
+
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
             output_strs=output_strs,
-            output_ids=recv_obj.decode_ids,
+            output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
+            reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
+            dequeue_times=recv_obj.dequeue_times,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
@@ -265,7 +270,9 @@ class DetokenizerManager:
             output_hidden_states=recv_obj.output_hidden_states,
             batch_accept_draft_tokens=recv_obj.batch_accept_draft_tokens,
             output_extra_infos=recv_obj.output_extra_infos,
-            generated_time=recv_obj.generated_time
+            l3_prefetch_e2e_s=recv_obj.l3_prefetch_e2e_s,
+            l3_prefetch_tokens=recv_obj.l3_prefetch_tokens,
+            generated_time=recv_obj.generated_time,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
@@ -298,8 +305,13 @@ def run_detokenizer_process(
     try:
         manager = DetokenizerManager(server_args, port_args)
         manager.event_loop()
+    except KeyboardInterrupt:
+        if "manager" in locals():
+            manager.maybe_clear_socket_mapping()
+        logger.info("DetokenizerManager received KeyboardInterrupt, exiting.")
     except Exception:
-        manager.maybe_clear_socket_mapping()
+        if "manager" in locals():
+            manager.maybe_clear_socket_mapping()
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGUSR1)

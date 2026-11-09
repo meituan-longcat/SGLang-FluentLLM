@@ -16,7 +16,9 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Grok1 model."""
 
-from typing import Iterable, List, Optional, Tuple
+# ruff: noqa: F821
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -27,26 +29,25 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
-
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ops.activation import GeluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
 
 
 class Grok1MLP(nn.Module):
@@ -120,9 +121,7 @@ class Grok1MoE(nn.Module):
             quant_config=None,
         )
 
-        self.router_logit_softcapping = getattr(
-            config, "router_logit_softcapping", 30.0
-        )
+        self.router_logit_softcapping = getattr(config, "router_logit_softcapping", 30.0)
         self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
@@ -298,10 +297,7 @@ class Grok1DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states = (
-            self.post_moe_norm(self.block_sparse_moe(self.pre_moe_norm(hidden_states)))
-            + hidden_states
-        )
+        hidden_states = self.post_moe_norm(self.block_sparse_moe(self.pre_moe_norm(hidden_states))) + hidden_states
         return hidden_states
 
 
@@ -364,12 +360,9 @@ class Grok1ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
-        if (
-            self.config.num_local_experts > 0
-            and get_tensor_model_parallel_world_size() > 1
-        ):
+        if self.config.num_local_experts > 0 and get_tensor_model_parallel_world_size() > 1:
             self.use_presharded_weights = True
-            setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
+            DefaultModelLoader._prepare_weights = _prepare_presharded_weights
         else:
             self.use_presharded_weights = False
 
@@ -389,13 +382,11 @@ class Grok1ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(
         self,
-        weights: Iterable[Tuple[str, torch.Tensor]],
+        weights: Iterable[tuple[str, torch.Tensor]],
     ):
         num_experts = self.config.num_local_experts
 
@@ -418,7 +409,6 @@ class Grok1ForCausalLM(nn.Module):
         )
 
         params_dict = dict(self.named_parameters())
-        all_names = set(params_dict.keys())
         hit_names = set()
 
         def load_weight_wrapper(name, loaded_weight, *args, **kwargs):
@@ -470,12 +460,10 @@ class Grok1ForCausalLM(nn.Module):
                     load_weight_wrapper(name=name, loaded_weight=loaded_weight)
 
 
-old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")
+old_prepare_weights = DefaultModelLoader._prepare_weights
 
 
-def _prepare_presharded_weights(
-    self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
-) -> Tuple[str, List[str], bool]:
+def _prepare_presharded_weights(self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool) -> tuple[str, list[str], bool]:
     import glob
     import os
 
@@ -504,14 +492,11 @@ def _prepare_presharded_weights(
     # The new format
     allow_patterns += [f"*-TP-{tp_rank:03d}.safetensors", "*-TP-common.safetensors"]
 
-    hf_weights_files: List[str] = []
+    hf_weights_files: list[str] = []
     for pattern in allow_patterns:
         hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
 
-    if hf_weights_files[0].endswith("safetensors"):
-        use_safetensors = True
-    else:
-        use_safetensors = False
+    use_safetensors = bool(hf_weights_files[0].endswith("safetensors"))
 
     return hf_folder, hf_weights_files, use_safetensors
 

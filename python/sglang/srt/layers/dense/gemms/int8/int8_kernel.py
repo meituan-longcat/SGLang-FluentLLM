@@ -143,9 +143,7 @@ def per_token_group_quant_int8(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     iinfo = torch.iinfo(dtype)
@@ -188,9 +186,7 @@ def sglang_per_token_group_quant_int8(
     eps: float = 1e-10,
     dtype: torch.dtype = torch.int8,
 ):
-    assert (
-        x.shape[-1] % group_size == 0
-    ), "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] % group_size == 0, "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
     iinfo = torch.iinfo(dtype)
@@ -295,9 +291,7 @@ def _w8a8_block_int8_matmul(
 
 
 @functools.lru_cache
-def get_w8a8_block_int8_configs(
-    N: int, K: int, block_n: int, block_k: int
-) -> Optional[Dict[int, Any]]:
+def get_w8a8_block_int8_configs(N: int, K: int, block_n: int, block_k: int) -> Optional[Dict[int, Any]]:
     """
     Return optimized configurations for the w8a8 block fp8 kernel.
 
@@ -312,9 +306,7 @@ def get_w8a8_block_int8_configs(
     device_name = get_device_name().replace(" ", "_")
     json_file_name = f"N={N},K={K},device_name={device_name},dtype=int8_w8a8,block_shape=[{block_n}, {block_k}].json"
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name
-    )
+    config_file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs", json_file_name)
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             logger.info(
@@ -327,10 +319,7 @@ def get_w8a8_block_int8_configs(
     # If no optimized configuration is available, we will use the default
     # configuration
     logger.warning(
-        (
-            "Using default W8A8 Block INT8 kernel config. Performance might be sub-optimal! "
-            "Config file not found at %s"
-        ),
+        ("Using default W8A8 Block INT8 kernel config. Performance might be sub-optimal! Config file not found at %s"),
         config_file_path,
     )
     return None
@@ -394,9 +383,7 @@ def w8a8_block_int8_matmul(
         }
 
     def grid(META):
-        return (
-            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-        )
+        return (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),)
 
     _w8a8_block_int8_matmul[grid](
         A,

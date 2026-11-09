@@ -5,7 +5,10 @@ import triton
 import triton.language as tl
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    # Type alias: NSATokenToKVPool does not exist as a separate class
+    NSATokenToKVPool = DSATokenToKVPool
 
 """
 k: data, 128 item per token, fp8
@@ -19,9 +22,7 @@ class GetK:
         return cls.torch_fast(*args, **kwargs)
 
     @classmethod
-    def slow(
-        cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
-    ):
+    def slow(cls, pool: "DSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor):
         num_pages = (seq_len + pool.page_size - 1) // pool.page_size
         seq_len_ = num_pages * pool.page_size
         index_k_fp8 = torch.empty(
@@ -31,16 +32,14 @@ class GetK:
         )
         for i in range(num_pages):
             page_index = page_indices[i]
-            index_k_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
-                page_index
-            ][: pool.page_size * pool.index_head_dim].view(-1, pool.index_head_dim)
+            index_k_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[page_index][: pool.page_size * pool.index_head_dim].view(
+                -1, pool.index_head_dim
+            )
 
         return index_k_fp8[:seq_len]
 
     @classmethod
-    def torch_fast(
-        cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
-    ):
+    def torch_fast(cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor):
         """
         :param page_indices: (num_pages,), int32
         :return: (seq_len, index_head_dim), uint8
@@ -59,9 +58,7 @@ class GetK:
         flat_buf = buf.flatten()
 
         # flat_indices: (num_pages, num_k_bytes_per_page), int32, element := an index into flat_buf that we want to access
-        flat_indices = (page_indices * buf_numel_per_page)[:, None] + torch.arange(
-            num_k_bytes_per_page, dtype=torch.int32, device="cuda"
-        )[None, :]
+        flat_indices = (page_indices * buf_numel_per_page)[:, None] + torch.arange(num_k_bytes_per_page, dtype=torch.int32, device="cuda")[None, :]
         flat_indices = flat_indices.flatten()[: seq_len * num_k_bytes_per_token]
 
         out = flat_buf[flat_indices]
@@ -74,9 +71,7 @@ class GetS:
         return cls.torch_fast(*args, **kwargs)
 
     @classmethod
-    def slow(
-        cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
-    ):
+    def slow(cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor):
         num_pages = (seq_len + pool.page_size - 1) // pool.page_size
         seq_len_ = num_pages * pool.page_size
         assert pool.index_head_dim // pool.quant_block_size == 1
@@ -87,15 +82,11 @@ class GetS:
         )
         for i in range(num_pages):
             page_index = page_indices[i]
-            index_k_scale_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[
-                page_index
-            ][pool.page_size * pool.index_head_dim :].view(-1, 4)
+            index_k_scale_fp8[i * pool.page_size : (i + 1) * pool.page_size] = buf[page_index][pool.page_size * pool.index_head_dim :].view(-1, 4)
         return index_k_scale_fp8[:seq_len]
 
     @classmethod
-    def torch_fast(
-        cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor
-    ):
+    def torch_fast(cls, pool: "NSATokenToKVPool", buf, seq_len: int, page_indices: torch.Tensor):
         """
         :param page_indices: (num_pages,), int32
         :return: (seq_len, index_head_dim // quant_block_size), uint8
@@ -109,9 +100,7 @@ class GetS:
         flat_buf = buf.flatten()
         flat_indices = (
             (page_indices * buf_numel_per_page)[:, None]
-            + torch.arange(num_s_bytes_per_page, dtype=torch.int32, device="cuda")[
-                None, :
-            ]
+            + torch.arange(num_s_bytes_per_page, dtype=torch.int32, device="cuda")[None, :]
             + s_offset_in_page
         )
         flat_indices = flat_indices.flatten()[: seq_len * num_s_bytes_per_token]
@@ -161,9 +150,7 @@ class SetK:
         flat_indices = (
             (loc_page_index * buf_numel_per_page)[:, None]
             + (loc_token_offset_in_page * num_k_bytes_per_token)[:, None]
-            + torch.arange(num_k_bytes_per_token, dtype=torch.int32, device="cuda")[
-                None, :
-            ]
+            + torch.arange(num_k_bytes_per_token, dtype=torch.int32, device="cuda")[None, :]
         )
         num_k_bytes_total = num_tokens_to_write * num_k_bytes_per_token
         flat_indices = flat_indices.flatten()[:num_k_bytes_total]
@@ -187,9 +174,7 @@ class SetS:
             page_index = loc[i] // pool.page_size
             offset = loc[i] % pool.page_size
             start = pool.page_size * pool.index_head_dim
-            buf[page_index, start + offset * 4 : start + (offset + 1) * 4] = (
-                index_k_scale[i].view(torch.uint8)
-            )
+            buf[page_index, start + offset * 4 : start + (offset + 1) * 4] = index_k_scale[i].view(torch.uint8)
 
     @classmethod
     def torch_fast(
@@ -213,9 +198,7 @@ class SetS:
             (loc_page_index * buf_numel_per_page)[:, None]
             + s_offset_in_page
             + (loc_token_offset_in_page * num_s_bytes_per_token)[:, None]
-            + torch.arange(num_s_bytes_per_token, dtype=torch.int32, device="cuda")[
-                None, :
-            ]
+            + torch.arange(num_s_bytes_per_token, dtype=torch.int32, device="cuda")[None, :]
         )
         number_s_bytes_total = num_tokens_to_write * num_s_bytes_per_token
         flat_indices = flat_indices.flatten()[:number_s_bytes_total]
@@ -226,7 +209,6 @@ class SetKAndS:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
         if 0:
-            # print("SetK, SetS comparison test")
             buf_cloned = buf.clone()
             cls.vanilla(*args, **kwargs, buf=buf)
             cls.triton(*args, **kwargs, buf=buf_cloned)
@@ -237,9 +219,7 @@ class SetKAndS:
             _clear_token_0(buf)
             _clear_token_0(buf_cloned)
 
-            assert torch.all(
-                buf == buf_cloned
-            ), f"{buf=} {buf_cloned=} {kwargs['loc'].to_list()=}"
+            assert torch.all(buf == buf_cloned), f"{buf=} {buf_cloned=} {kwargs['loc'].to_list()=}"
             return
 
         cls.triton(*args, **kwargs, buf=buf)
@@ -285,7 +265,7 @@ def _set_k_and_s_triton(
     assert page_size == 64
 
     assert buf.dtype == torch.uint8
-    loc = loc.to(torch.int64) # can be int32
+    loc = loc.to(torch.int64)  # can be int32
     assert loc.dtype == torch.int64, f"{loc.dtype=}"
     assert index_k.dtype == torch.float8_e4m3fn
     assert index_k_scale.dtype == torch.float32
@@ -327,7 +307,7 @@ def _set_k_and_s_triton_kernel(
 ):
     token_id = tl.program_id(0)
 
-    loc = tl.load(loc_ptr + token_id)
+    loc = tl.load(loc_ptr + token_id).to(tl.int64)
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
@@ -338,18 +318,99 @@ def _set_k_and_s_triton_kernel(
     loc_page_index = loc // PAGE_SIZE
     loc_token_offset_in_page = loc % PAGE_SIZE
 
-    out_k_offsets = (
-        loc_page_index * BUF_NUMEL_PER_PAGE
-        + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN
-        + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
-    )
+    out_k_offsets = loc_page_index * BUF_NUMEL_PER_PAGE + loc_token_offset_in_page * NUM_K_ELEMS_PER_TOKEN + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
     # "//4" b/c it is fp32 instead of uint8
-    out_s_offset = (
-        loc_page_index * BUF_NUMEL_PER_PAGE // 4
-        + S_OFFSET_NBYTES_IN_PAGE // 4
-        + loc_token_offset_in_page
-    )
+    out_s_offset = loc_page_index * BUF_NUMEL_PER_PAGE // 4 + S_OFFSET_NBYTES_IN_PAGE // 4 + loc_token_offset_in_page
 
     tl.store(buf_fp8_ptr + out_k_offsets, k)
     tl.store(buf_fp32_ptr + out_s_offset, k_scale)
+
+
+def get_k_and_s_by_token_idxs_torch(
+    pool: "DSATokenToKVPool",
+    buf: torch.Tensor,
+    token_idxs: torch.Tensor,
+):
+    """
+    buf: (num_pages, buf_numel_per_page), uint8
+
+    Each page packs the fp8 k cache followed by its fp32 scales:
+      - first  page_size * head_dim                       bytes: fp8 k data
+        (page_size tokens, each head_dim fp8 values)
+      - then   page_size * head_dim // quant_block_size   fp32 values: scales
+        (per token, head_dim // quant_block_size fp32 scales, 4 bytes each)
+
+    :param token_idxs: (num_tokens,), int, element := the token index to read
+    :return: (k, s)
+        k: (num_tokens, index_head_dim), uint8 (fp8 bytes)
+        s: (num_tokens, index_head_dim // quant_block_size), uint8 (fp32 bytes, 4 per scale)
+    """
+    device = buf.device
+    (num_tokens,) = token_idxs.shape
+    buf_numel_per_page = buf.shape[1]
+
+    num_k_bytes_per_token = pool.index_head_dim
+    num_s_bytes_per_token = pool.index_head_dim // pool.quant_block_size * 4
+    s_offset_in_page = pool.page_size * pool.index_head_dim
+
+    # token_idxs: (num_tokens,), element := a token index
+    page_idxs = token_idxs // pool.page_size
+    token_offset_in_page = token_idxs % pool.page_size
+
+    flat_buf = buf.flatten()
+    page_base = page_idxs * buf_numel_per_page
+
+    # gather k: per token, index_head_dim contiguous fp8 bytes
+    k_flat_indices = (
+        page_base[:, None]
+        + (token_offset_in_page * num_k_bytes_per_token)[:, None]
+        + torch.arange(num_k_bytes_per_token, dtype=torch.int32, device=device)[None, :]
+    )
+    k = flat_buf[k_flat_indices.flatten()].view(num_tokens, num_k_bytes_per_token)
+
+    # gather s: per token, num_s_bytes_per_token contiguous fp32 bytes after the k region
+    s_flat_indices = (
+        page_base[:, None]
+        + s_offset_in_page
+        + (token_offset_in_page * num_s_bytes_per_token)[:, None]
+        + torch.arange(num_s_bytes_per_token, dtype=torch.int32, device=device)[None, :]
+    )
+    s = flat_buf[s_flat_indices.flatten()].view(num_tokens, num_s_bytes_per_token)
+
+    return k, s
+
+
+def get_k_and_s_flat_idxs_by_token_idxs_torch(
+    pool: "DSATokenToKVPool",
+    buf: torch.Tensor,
+    token_idxs: torch.Tensor,
+):
+    device = buf.device
+    (num_tokens,) = token_idxs.shape
+    buf_numel_per_page = buf.shape[1]
+
+    num_k_bytes_per_token = pool.index_head_dim
+    num_s_bytes_per_token = pool.index_head_dim // pool.quant_block_size * 4
+    s_offset_in_page = pool.page_size * pool.index_head_dim
+
+    # token_idxs: (num_tokens,), element := a token index
+    page_idxs = token_idxs // pool.page_size
+    token_offset_in_page = token_idxs % pool.page_size
+
+    page_base = page_idxs * buf_numel_per_page
+
+    # gather k: per token, index_head_dim contiguous fp8 bytes
+    k_flat_indices = (
+        page_base[:, None]
+        + (token_offset_in_page * num_k_bytes_per_token)[:, None]
+        + torch.arange(num_k_bytes_per_token, dtype=torch.int32, device=device)[None, :]
+    )
+    s_flat_indices = (
+        page_base[:, None]
+        + s_offset_in_page
+        + (token_offset_in_page * num_s_bytes_per_token)[:, None]
+        + torch.arange(num_s_bytes_per_token, dtype=torch.int32, device=device)[None, :]
+    )
+
+    return k_flat_indices, s_flat_indices

@@ -19,15 +19,12 @@ from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
 from sglang.srt.utils import get_ip, get_open_port, is_valid_ipv6_address
 
 # SGLANG_RINGBUFFER_WARNING_INTERVAL can be set to 60
-SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
-    os.environ.get("SGLANG_RINGBUFFER_WARNING_INTERVAL", "60")
-)
+SGLANG_RINGBUFFER_WARNING_INTERVAL = int(os.environ.get("SGLANG_RINGBUFFER_WARNING_INTERVAL", "60"))
 
 logger = get_colorful_logger(__name__)
 
 
 class ShmRingBuffer:
-
     def __init__(
         self,
         n_reader: int,
@@ -88,22 +85,16 @@ class ShmRingBuffer:
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes
         self.max_chunks = max_chunks
-        self.total_bytes_of_buffer = (
-            self.max_chunk_bytes + self.metadata_size
-        ) * self.max_chunks
+        self.total_bytes_of_buffer = (self.max_chunk_bytes + self.metadata_size) * self.max_chunks
         self.data_offset = 0
         self.metadata_offset = self.max_chunk_bytes * self.max_chunks
 
         if name is None:
             # we are creating a buffer
             self.is_creator = True
-            self.shared_memory = shared_memory.SharedMemory(
-                create=True, size=self.total_bytes_of_buffer
-            )
+            self.shared_memory = shared_memory.SharedMemory(create=True, size=self.total_bytes_of_buffer)
             # initialize the metadata section to 0
-            with memoryview(
-                self.shared_memory.buf[self.metadata_offset :]
-            ) as metadata_buffer:
+            with memoryview(self.shared_memory.buf[self.metadata_offset :]) as metadata_buffer:
                 torch.frombuffer(metadata_buffer, dtype=torch.uint8).fill_(0)
         else:
             # we are opening an existing buffer
@@ -167,7 +158,6 @@ class Handle:
 
 
 class MessageQueue:
-
     def __init__(
         self,
         n_reader,  # number of all readers
@@ -345,10 +335,7 @@ class MessageQueue:
                     os.sched_yield()
 
                     # if we wait for a long time, we should warn the user
-                    if (
-                        time.monotonic() - start_time
-                        > SGLANG_RINGBUFFER_WARNING_INTERVAL * n_warning
-                    ):
+                    if time.monotonic() - start_time > SGLANG_RINGBUFFER_WARNING_INTERVAL * n_warning:
                         logger.warning(
                             "No available block found in %s second. ",
                             SGLANG_RINGBUFFER_WARNING_INTERVAL,
@@ -401,10 +388,7 @@ class MessageQueue:
                     os.sched_yield()
 
                     # if we wait for a long time, we should warn the user
-                    if (
-                        time.monotonic() - start_time
-                        > SGLANG_RINGBUFFER_WARNING_INTERVAL * n_warning
-                    ):
+                    if time.monotonic() - start_time > SGLANG_RINGBUFFER_WARNING_INTERVAL * n_warning:
                         logger.warning(
                             "No available block found in %s second. ",
                             SGLANG_RINGBUFFER_WARNING_INTERVAL,
@@ -465,9 +449,7 @@ class MessageQueue:
             return self.dequeue()
 
     @staticmethod
-    def create_from_process_group(
-        pg: ProcessGroup, max_chunk_bytes, max_chunks, writer_rank=0
-    ) -> "MessageQueue":
+    def create_from_process_group(pg: ProcessGroup, max_chunk_bytes, max_chunks, writer_rank=0) -> "MessageQueue":
         group_rank = dist.get_rank(pg)
         group_world_size = dist.get_world_size(pg)
         global_ranks = dist.get_process_group_ranks(pg)
@@ -489,9 +471,7 @@ class MessageQueue:
                 max_chunks=max_chunks,
             )
             handle = buffer_io.export_handle()
-            dist.broadcast_object_list(
-                [handle], src=global_ranks[writer_rank], group=pg
-            )
+            dist.broadcast_object_list([handle], src=global_ranks[writer_rank], group=pg)
         else:
             recv = [None]
             dist.broadcast_object_list(recv, src=global_ranks[writer_rank], group=pg)

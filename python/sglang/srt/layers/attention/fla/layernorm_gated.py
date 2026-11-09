@@ -143,11 +143,7 @@ def _layer_norm_fwd(
     else:
         out = torch.empty_like(x)
     assert out.stride(-1) == 1
-    mean = (
-        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
-        else None
-    )
+    mean = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device) if not is_rms_norm else None
     rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -181,7 +177,6 @@ def _layer_norm_fwd(
 
 
 class LayerNormFn(torch.autograd.Function):
-
     @staticmethod
     def forward(
         ctx,
@@ -232,21 +227,14 @@ def layernorm_fn(
     norm_before_gate=True,
     is_rms_norm=False,
 ):
-    return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm
-    )
+    return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, is_rms_norm)
 
 
-def rmsnorm_fn(
-    x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True
-):
-    return LayerNormFn.apply(
-        x, weight, bias, z, eps, group_size, norm_before_gate, True
-    )
+def rmsnorm_fn(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True):
+    return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, True)
 
 
 class LayerNorm(torch.nn.Module):
-
     def __init__(
         self,
         hidden_size,
@@ -287,7 +275,6 @@ class LayerNorm(torch.nn.Module):
 
 
 class RMSNorm(torch.nn.Module):
-
     def __init__(
         self,
         hidden_size,

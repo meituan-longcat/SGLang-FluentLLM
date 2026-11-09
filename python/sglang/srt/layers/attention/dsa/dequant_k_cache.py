@@ -25,9 +25,7 @@ def _dequantize_k_cache_slow(
     num_tiles = dv // tile_size
     num_blocks, block_size, h_k, _ = quant_k_cache.shape
     assert h_k == 1
-    result = torch.empty(
-        (num_blocks, block_size, d), dtype=torch.bfloat16, device=quant_k_cache.device
-    )
+    result = torch.empty((num_blocks, block_size, d), dtype=torch.bfloat16, device=quant_k_cache.device)
 
     quant_k_cache = quant_k_cache.view(num_blocks, block_size, -1)
 
@@ -37,13 +35,9 @@ def _dequantize_k_cache_slow(
     result[..., dv:] = input_rope
 
     for tile_idx in range(0, num_tiles):
-        cur_nope = input_nope[
-            ..., tile_idx * tile_size : (tile_idx + 1) * tile_size
-        ].to(torch.float32)
+        cur_nope = input_nope[..., tile_idx * tile_size : (tile_idx + 1) * tile_size].to(torch.float32)
         cur_scales = input_scale[..., tile_idx].unsqueeze(-1)
-        result[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = (
-            cur_nope * cur_scales
-        )
+        result[..., tile_idx * tile_size : (tile_idx + 1) * tile_size] = cur_nope * cur_scales
 
     result = result.view(num_blocks, block_size, 1, d)
     return result
@@ -88,9 +82,7 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
     NUM_NOPE_BLOCKS = dim_nope // group_size
 
     input_nope_q = quant_k_cache[:, :dim_nope]
-    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(
-        torch.float32
-    )
+    input_nope_s = quant_k_cache[:, dim_nope : dim_nope + num_tiles * 4].view(torch.float32)
     input_rope = quant_k_cache[:, dim_nope + num_tiles * 4 :].view(torch.bfloat16)
 
     _dequantize_k_cache_fast_kernel[(num_tokens, num_blocks_per_token)](

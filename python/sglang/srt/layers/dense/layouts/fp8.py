@@ -11,10 +11,10 @@ from torch.nn.parameter import Parameter
 
 MARLIN_FP8_AVAILABLE = False
 
+
 def dummy_func(*args, **kwargs):
-    raise ImportError(
-        "marlin FP8 requires some operators from vllm. Please install vllm."
-    )
+    raise ImportError("marlin FP8 requires some operators from vllm. Please install vllm.")
+
 
 apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
@@ -31,7 +31,7 @@ from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
 )
-from sglang.srt.layers.dense.gemms.fp8.fp8_utils  import (
+from sglang.srt.layers.dense.gemms.fp8.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -100,6 +100,7 @@ class Fp8LinearMethod(LinearMethodBase):
         self.block_quant = self.quant_config.weight_block_size is not None
 
         from sglang.srt.layers.dense.gemms.fp8 import dispatch_w8a8_block_fp8_linear
+
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     def create_weights(
@@ -125,20 +126,14 @@ class Fp8LinearMethod(LinearMethodBase):
             if tp_size > 1 and input_size // input_size_per_partition == tp_size:
                 if input_size_per_partition % block_k != 0:
                     raise ValueError(
-                        f"Weight input_size_per_partition = "
-                        f"{input_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
+                        f"Weight input_size_per_partition = {input_size_per_partition} is not divisible by weight quantization block_k = {block_k}."
                     )
             # Required by column parallel or enabling merged weights
-            if (
-                tp_size > 1 and output_size // output_size_per_partition == tp_size
-            ) or len(output_partition_sizes) > 1:
+            if (tp_size > 1 and output_size // output_size_per_partition == tp_size) or len(output_partition_sizes) > 1:
                 for output_partition_size in output_partition_sizes:
                     if output_partition_size % block_n != 0:
                         raise ValueError(
-                            f"Weight output_partition_size = "
-                            f"{output_partition_size} is not divisible by "
-                            f"weight quantization block_n = {block_n}."
+                            f"Weight output_partition_size = {output_partition_size} is not divisible by weight quantization block_n = {block_n}."
                         )
 
         layer.logical_widths = output_partition_sizes
@@ -147,16 +142,10 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.orig_dtype = params_dtype
 
         # WEIGHT
-        weight_dtype = (
-            torch.float8_e4m3fn
-            if self.quant_config.is_checkpoint_fp8_serialized
-            else params_dtype
-        )
+        weight_dtype = torch.float8_e4m3fn if self.quant_config.is_checkpoint_fp8_serialized else params_dtype
 
         weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-            ),
+            data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=weight_dtype),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
@@ -193,12 +182,8 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("weight_scale", scale)
 
             # INPUT ACTIVATION SCALE
-            if (
-                hasattr(self.quant_config, "activation_scheme")
-                and self.quant_config.activation_scheme == "static"
-            ) or (
-                hasattr(self.quant_config, "linear_activation_scheme")
-                and self.quant_config.linear_activation_scheme == "static"
+            if (hasattr(self.quant_config, "activation_scheme") and self.quant_config.activation_scheme == "static") or (
+                hasattr(self.quant_config, "linear_activation_scheme") and self.quant_config.linear_activation_scheme == "static"
             ):
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
@@ -233,9 +218,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 if self.cutlass_fp8_supported or self.use_marlin:
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
-                    qweight, weight_scale = per_token_group_quant_fp8(
-                        layer.weight, layer.weight.shape[-1]
-                    )
+                    qweight, weight_scale = per_token_group_quant_fp8(layer.weight, layer.weight.shape[-1])
                     weight_scale = weight_scale.t().contiguous()
                 else:
                     # per-tensor quantization
@@ -249,43 +232,29 @@ class Fp8LinearMethod(LinearMethodBase):
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module
             else:
-                layer.weight_scale = Parameter(
-                    layer.weight_scale.data, requires_grad=False
-                )
-                if (
-                    hasattr(self.quant_config, "activation_scheme")
-                    and self.quant_config.activation_scheme == "static"
-                ) or (
-                    hasattr(self.quant_config, "linear_activation_scheme")
-                    and self.quant_config.linear_activation_scheme == "static"
+                layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
+                if (hasattr(self.quant_config, "activation_scheme") and self.quant_config.activation_scheme == "static") or (
+                    hasattr(self.quant_config, "linear_activation_scheme") and self.quant_config.linear_activation_scheme == "static"
                 ):
-                    layer.input_scale = Parameter(
-                        layer.input_scale.data, requires_grad=False
-                    )
+                    layer.input_scale = Parameter(layer.input_scale.data, requires_grad=False)
 
                 # cutlass sgl-kernel and marlin only support per-channel scale
                 if self.cutlass_fp8_supported or self.use_marlin:
                     weight = layer.weight
-                    weight_scale = convert_to_channelwise(
-                        layer.weight_scale, layer.logical_widths
-                    )
+                    weight_scale = convert_to_channelwise(layer.weight_scale, layer.logical_widths)
                 else:
                     # Dequant -> Quant with max scale so we can run per tensor.
                     weight = layer.weight
                     weight_scale = layer.weight_scale
                     # If ROCm, normalize the weights and scales to e4m3fnuz
                     if _is_fp8_fnuz:
-                        weight, weight_scale, input_scale = (
-                            normalize_e4m3fn_to_e4m3fnuz(
-                                weight=weight,
-                                weight_scale=weight_scale,
-                                input_scale=layer.input_scale,
-                            )
+                        weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=weight,
+                            weight_scale=weight_scale,
+                            input_scale=layer.input_scale,
                         )
                         if input_scale is not None:
-                            layer.input_scale = Parameter(
-                                input_scale, requires_grad=False
-                            )
+                            layer.input_scale = Parameter(input_scale, requires_grad=False)
 
                     weight_scale, weight = requantize_with_max_scale(
                         weight=weight,
@@ -296,16 +265,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 # Update layer with new values.
                 layer.weight = Parameter(weight.t(), requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                if (
-                    hasattr(self.quant_config, "activation_scheme")
-                    and self.quant_config.activation_scheme == "static"
-                ) or (
-                    hasattr(self.quant_config, "linear_activation_scheme")
-                    and self.quant_config.linear_activation_scheme == "static"
+                if (hasattr(self.quant_config, "activation_scheme") and self.quant_config.activation_scheme == "static") or (
+                    hasattr(self.quant_config, "linear_activation_scheme") and self.quant_config.linear_activation_scheme == "static"
                 ):
-                    layer.input_scale = Parameter(
-                        layer.input_scale.max(), requires_grad=False
-                    )
+                    layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
 
         if self.use_marlin:
             if self.block_quant:
@@ -341,7 +304,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale_inv,
                 input_scale=block_scale,
                 bias=bias,
-                output_dtype=output_dtype
+                output_dtype=output_dtype,
             )
 
         return apply_fp8_linear(

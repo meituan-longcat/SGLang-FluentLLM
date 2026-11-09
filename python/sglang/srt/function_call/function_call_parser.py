@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
+from typing import Any, Literal, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import (
     StructuralTagResponseFormat,
@@ -13,15 +13,16 @@ from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.longcat_detector import LongCatDetector
+from sglang.srt.function_call.longcat_xml_detector import LongCatXMLDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
-from sglang.srt.function_call.longcat_detector import LongCatDetector
-from sglang.srt.function_call.longcat_xml_detector import LongCatXMLDetector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.utils import get_json_schema_constraint
 
@@ -37,7 +38,7 @@ class FunctionCallParser:
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
-    ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+    ToolCallParserEnum: dict[str, type[BaseFormatDetector]] = {
         "deepseekv3": DeepSeekV3Detector,
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
@@ -45,6 +46,7 @@ class FunctionCallParser:
         "longcat_xml": LongCatXMLDetector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
+        "glm47": Glm47MoeDetector,
         "gpt-oss": GptOssDetector,
         "kimi_k2": KimiK2Detector,
         "llama3": Llama32Detector,
@@ -56,8 +58,8 @@ class FunctionCallParser:
         "step3": Step3Detector,
     }
 
-    def __init__(self, tools: List[Tool], tool_call_parser: str):
-        detector: Type[BaseFormatDetector] = None
+    def __init__(self, tools: list[Tool], tool_call_parser: str):
+        detector: type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             detector = detector_class()
@@ -83,10 +85,8 @@ class FunctionCallParser:
         return self.detector.has_tool_call(text)
 
     def parse_non_stream(
-        self,
-        full_text: str,
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
-    ) -> Tuple[str, list[ToolCallItem]]:
+        self, full_text: str, tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+    ) -> tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
@@ -100,11 +100,7 @@ class FunctionCallParser:
         """
         if not self.tools:
             return full_text, []
-        parsed_result = self.detector.detect_and_parse(
-            text=full_text,
-            tools=self.tools,
-            tool_choice=tool_choice
-        )
+        parsed_result = self.detector.detect_and_parse(text=full_text, tools=self.tools, tool_choice=tool_choice)
         tool_call_list = parsed_result.calls
         if tool_call_list:
             return parsed_result.normal_text, tool_call_list
@@ -112,10 +108,8 @@ class FunctionCallParser:
             return full_text, []
 
     def parse_stream_chunk(
-        self,
-        chunk_text: str,
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
-    ) -> Tuple[str, list[ToolCallItem]]:
+        self, chunk_text: str, tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+    ) -> tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
 
@@ -141,7 +135,7 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def flush(self) -> Tuple[str, list[ToolCallItem]]:
+    def flush(self) -> tuple[str, list[ToolCallItem]]:
         """Flush any incomplete streaming state at end-of-stream."""
         if not self.tools:
             return "", []
@@ -155,8 +149,8 @@ class FunctionCallParser:
 
         This creates the necessary structural tags that guide the model's output format.
         """
-        tool_structures: List[StructuresResponseFormat] = list()
-        tool_trigger_set: Set[str] = set()
+        tool_structures: list[StructuresResponseFormat] = list()
+        tool_trigger_set: set[str] = set()
 
         get_structure_info = self.detector.structure_info()
         for tool in self.tools:
@@ -183,9 +177,7 @@ class FunctionCallParser:
             triggers=list(tool_trigger_set),
         )
 
-    def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
-    ) -> Optional[Tuple[str, Any]]:
+    def get_structure_constraint(self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]) -> Optional[tuple[str, Any]]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
         The constraint is used to guide the model's output format.
@@ -199,11 +191,7 @@ class FunctionCallParser:
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
         # It cannot parse or validate function call Pythonic or XML-ish syntax.
-        if (
-            self.detector.supports_structural_tag()
-            and tool_choice == "auto"
-            and any(tool.function.strict for tool in self.tools)
-        ):
+        if self.detector.supports_structural_tag() and tool_choice == "auto" and any(tool.function.strict for tool in self.tools):
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):

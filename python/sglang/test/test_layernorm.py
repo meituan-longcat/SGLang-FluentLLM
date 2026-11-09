@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
+from sglang.srt.ops.layernorm import GemmaRMSNorm, RMSNorm
 
 
 class TestRMSNorm(unittest.TestCase):

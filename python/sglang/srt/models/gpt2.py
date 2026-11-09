@@ -1,4 +1,3 @@
-# coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/gpt2/modeling_gpt2.py
 # Copyright 2023 The vLLM team.
@@ -17,29 +16,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
-from typing import Iterable, Optional, Tuple
+
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import GPT2Config
 
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ops.activation import get_act_fn
 
 
 class GPT2Attention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -92,7 +92,6 @@ class GPT2Attention(nn.Module):
 
 
 class GPT2MLP(nn.Module):
-
     def __init__(
         self,
         intermediate_size: int,
@@ -116,9 +115,7 @@ class GPT2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.c_proj",
         )
-        self.act = get_act_fn(
-            config.activation_function, quant_config, intermediate_size
-        )
+        self.act = get_act_fn(config.activation_function, quant_config, intermediate_size)
 
     def forward(
         self,
@@ -131,7 +128,6 @@ class GPT2MLP(nn.Module):
 
 
 class GPT2Block(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -144,9 +140,7 @@ class GPT2Block(nn.Module):
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPT2Attention(
-            layer_id, config, quant_config, prefix=f"{prefix}.attn"
-        )
+        self.attn = GPT2Attention(layer_id, config, quant_config, prefix=f"{prefix}.attn")
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.mlp = GPT2MLP(inner_dim, config, quant_config, prefix=f"{prefix}.mlp")
 
@@ -173,7 +167,6 @@ class GPT2Block(nn.Module):
 
 
 class GPT2Model(nn.Module):
-
     def __init__(
         self,
         config: GPT2Config,
@@ -188,12 +181,7 @@ class GPT2Model(nn.Module):
         self.embed_dim = config.hidden_size
         self.wte = VocabParallelEmbedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-        self.h = nn.ModuleList(
-            [
-                GPT2Block(i, config, quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        self.h = nn.ModuleList([GPT2Block(i, config, quant_config) for i in range(config.num_hidden_layers)])
 
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
@@ -216,7 +204,6 @@ class GPT2Model(nn.Module):
 
 
 class GPT2LMHeadModel(nn.Module):
-
     def __init__(
         self,
         config: GPT2Config,
@@ -237,11 +224,9 @@ class GPT2LMHeadModel(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, forward_batch)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "lm_head.weight" in name:

@@ -13,14 +13,12 @@ try:
 except ImportError:
     logger.warning("Ignoring mcp import error")
 
-from openai_harmony import ToolDescription, ToolNamespaceConfig
+from openai_harmony import ToolDescription, ToolNamespaceConfig  # noqa: E402
 
 
 async def list_server_and_tools(server_url: str):
 
-    async with sse_client(url=server_url) as streams, ClientSession(
-        *streams
-    ) as session:
+    async with sse_client(url=server_url) as streams, ClientSession(*streams) as session:
         initialize_response = await session.initialize()
         list_tools_response = await session.list_tools()
         return initialize_response, list_tools_response
@@ -37,17 +35,11 @@ def trim_schema(schema: dict) -> dict:
         # into "type": ["type-1", "type-2"]
         # if there's more than 1 types, also remove "null" type as Harmony will
         # just ignore it
-        types = [
-            type_dict["type"]
-            for type_dict in schema["anyOf"]
-            if type_dict["type"] != "null"
-        ]
+        types = [type_dict["type"] for type_dict in schema["anyOf"] if type_dict["type"] != "null"]
         schema["type"] = types
         del schema["anyOf"]
     if "properties" in schema:
-        schema["properties"] = {
-            k: trim_schema(v) for k, v in schema["properties"].items()
-        }
+        schema["properties"] = {k: trim_schema(v) for k, v in schema["properties"].items()}
     return schema
 
 
@@ -60,17 +52,12 @@ def post_process_tools_description(
 
     # Some tools schema don't need to be part of the prompt (e.g. simple text
     # in text out for Python)
-    list_tools_result.tools = [
-        tool
-        for tool in list_tools_result.tools
-        if getattr(tool.annotations, "include_in_prompt", True)
-    ]
+    list_tools_result.tools = [tool for tool in list_tools_result.tools if getattr(tool.annotations, "include_in_prompt", True)]
 
     return list_tools_result
 
 
 class ToolServer(ABC):
-
     @abstractmethod
     def has_tool(self, tool_name: str):
         pass
@@ -84,7 +71,6 @@ class ToolServer(ABC):
 
 
 class MCPToolServer(ToolServer):
-
     def __init__(self):
         self.harmony_tool_descriptions = {}
 
@@ -130,9 +116,7 @@ class MCPToolServer(ToolServer):
     async def get_tool_session(self, tool_name: str):
         url = self.urls.get(tool_name)
         if url:
-            async with sse_client(url=url) as streams, ClientSession(
-                *streams
-            ) as session:
+            async with sse_client(url=url) as streams, ClientSession(*streams) as session:
                 await session.initialize()
                 yield session
         else:
@@ -140,7 +124,6 @@ class MCPToolServer(ToolServer):
 
 
 class DemoToolServer(ToolServer):
-
     def __init__(self):
         from sglang.srt.entrypoints.tool import (
             HarmonyBrowserTool,

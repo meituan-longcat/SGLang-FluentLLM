@@ -2,7 +2,8 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Union, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any, Optional, Union
 
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -10,7 +11,6 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
-import json
 
 logger = logging.getLogger(__name__)
 
@@ -29,33 +29,26 @@ class OpenAIServingBase(ABC):
         if isinstance(response, StreamingResponse):
             """Handle streaming response output"""
             try:
-                if hasattr(response, 'body_iterator'):
+                if hasattr(response, "body_iterator"):
                     async for chunk in response.body_iterator:
-                        yield chunk.decode('utf-8') if isinstance(chunk, bytes) else str(chunk)
+                        yield chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 yield "data: [DONE]\n\n"
         else:
             """Handle non-streaming response output"""
             try:
-                if hasattr(response, 'model_dump_json'):
+                if hasattr(response, "model_dump_json"):
                     yield response.model_dump_json()
                 elif isinstance(response, ORJSONResponse):
-                    yield response.body.decode('utf-8')
+                    yield response.body.decode("utf-8")
                 else:
                     yield "no type"
             except Exception as e:
                 logger.exception(f"Serialization error: {e}")
-                yield json.dumps({
-                    "error": {
-                        "message": f"Serialization failed: {str(e)}",
-                        "type": "InternalServerError"
-                    }
-                }, ensure_ascii=False)
+                yield json.dumps({"error": {"message": f"Serialization failed: {str(e)}", "type": "InternalServerError"}}, ensure_ascii=False)
 
-    async def handle_request(
-        self, request: OpenAIServingRequest, raw_request: Request
-    ) -> Union[Any, StreamingResponse, ErrorResponse]:
+    async def handle_request(self, request: OpenAIServingRequest, raw_request: Request) -> Union[Any, StreamingResponse, ErrorResponse]:
         """Handle the specific request type with common pattern"""
         try:
             # Validate request
@@ -64,23 +57,15 @@ class OpenAIServingBase(ABC):
                 return self.create_error_response(error_msg)
 
             # Convert to internal format
-            adapted_request, processed_request = await self._convert_to_internal_request(
-                request
-            )
+            adapted_request, processed_request = await self._convert_to_internal_request(request)
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
-                return await self._handle_streaming_request(
-                    adapted_request, processed_request, raw_request
-                )
+                return await self._handle_streaming_request(adapted_request, processed_request, raw_request)
             else:
-                return await self._handle_non_streaming_request(
-                    adapted_request, processed_request, raw_request
-                )
+                return await self._handle_non_streaming_request(adapted_request, processed_request, raw_request)
         except HTTPException as e:
-            return self.create_error_response(
-                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
-            )
+            return self.create_error_response(message=e.detail, err_type=str(e.status_code), status_code=e.status_code)
         except Exception as e:
             logger.exception(f"Error in request: {e}")
             return self.create_error_response(

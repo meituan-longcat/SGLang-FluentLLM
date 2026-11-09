@@ -50,9 +50,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int64)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         all = T
         T = eos - bos
     else:
@@ -186,7 +184,6 @@ def fused_recurrent_gated_delta_rule_fwd(
 
 
 class FusedRecurrentFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(
@@ -348,12 +345,8 @@ def fused_recurrent_gated_delta_rule(
     {
         "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
-        is not None,
-        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
-            "retrieve_parent_token_ptr"
-        ]
-        is not None,
+        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"] is not None,
+        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args["retrieve_parent_token_ptr"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["T"])
@@ -395,9 +388,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int64)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         all = T
         T = eos - bos
     else:
@@ -420,9 +411,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         token_indices = tl.arange(0, NP2_T)
         mask_retrieve = token_indices < T
         retrieve_parent_token_base = (
-            retrieve_parent_token_ptr
-            + (i_n * stride_retrieve_parent_token_seq)
-            + token_indices * stride_retrieve_parent_token_token
+            retrieve_parent_token_ptr + (i_n * stride_retrieve_parent_token_seq) + token_indices * stride_retrieve_parent_token_token
         )
         parent_idx_tokens = tl.load(retrieve_parent_token_base, mask_retrieve)
 
@@ -435,13 +424,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         idx = tl.load(h0_indices + i_n)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
+            p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     # Prepare intermediate state cache variables if enabled
@@ -455,17 +438,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
             # step_idx = 0 should use the b_h from USE_INITIAL_STATE
             if step_idx != 0 and cache_idx >= 0:
                 # when calculating current step's attention, load the state from the parent token
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
+                parent_step_idx = tl.sum(tl.where(token_indices == step_idx, parent_idx_tokens, 0))
                 step_offset = parent_step_idx * HV * K * V
                 cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    intermediate_states_buffer + cache_idx * cache_steps * HV * K * V + step_offset + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
                 )
                 b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
@@ -501,12 +477,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 # Compute cache pointer for this step
                 step_offset = step_idx * HV * K * V
                 cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_k[:, None] * V
-                    + o_v[None, :]
+                    intermediate_states_buffer + cache_idx * cache_steps * HV * K * V + step_offset + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
                 )
                 tl.store(cache_ptr, b_h.to(cache_ptr.dtype.element_ty), mask=mask_h)
 
@@ -524,13 +495,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     if not DISABLE_STATE_UPDATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:  # Add bounds checking
-            p_h0 = (
-                h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
-            )
+            p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_k[:, None] * V + o_v[None, :]
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
 
@@ -615,7 +580,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
 
 
 class FusedRecurrentUpdateFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(
@@ -689,10 +653,7 @@ def fused_recurrent_gated_delta_rule_update(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing."
             )
-        if (
-            initial_state_source is not None
-            and initial_state_indices.shape[0] != len(cu_seqlens) - 1
-        ):
+        if initial_state_source is not None and initial_state_indices.shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
                 f"i.e., {len(cu_seqlens) - 1} rather than {initial_state_indices.shape[0]}."

@@ -11,8 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# ruff: noqa: S106
 """Completion templates."""
-
 
 import dataclasses
 import logging
@@ -58,9 +58,7 @@ completion_templates: dict[str, CompletionTemplate] = {}
 def register_completion_template(template: CompletionTemplate, override: bool = False):
     """Register a new completion template."""
     if not override:
-        assert (
-            template.name not in completion_templates
-        ), f"{template.name} has been registered."
+        assert template.name not in completion_templates, f"{template.name} has been registered."
 
     completion_templates[template.name] = template
 
@@ -79,9 +77,7 @@ def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
     if request.suffix == "":
         return request.prompt
 
-    return generate_completion_prompt(
-        request.prompt, request.suffix, completion_template_name
-    )
+    return generate_completion_prompt(request.prompt, request.suffix, completion_template_name)
 
 
 def generate_completion_prompt(prompt: str, suffix: str, template_name: str) -> str:

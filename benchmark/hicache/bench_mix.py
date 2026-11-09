@@ -16,13 +16,13 @@ import aiohttp
 # Add current directory to sys.path for local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from data_processing import sample_fixed_sharegpt_requests
 from sglang.bench_serving import (
     RequestFuncOutput,
     get_tokenizer,
     remove_prefix,
     sample_random_requests,
 )
-from data_processing import sample_fixed_sharegpt_requests
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -800,7 +800,7 @@ def main():
         
         # Wait between tests to let system stabilize
         if rate != request_rates[-1]:
-            print(f"\nWaiting 5 seconds before next test...")
+            print("\nWaiting 5 seconds before next test...")
             time.sleep(5)
     
     # Print summary of all results

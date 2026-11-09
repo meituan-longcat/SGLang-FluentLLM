@@ -1,11 +1,12 @@
 import os
-from sglang.srt.utils import is_npu
-
 import subprocess
+import tempfile
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
 from typing import Any
+
+from sglang.srt.utils import is_npu
 
 __is_npu__ = is_npu()
 
@@ -14,12 +15,20 @@ __is_npu__ = is_npu()
 # The real values are populated at runtime when global_server_args_dict_update() is called.
 global_server_args_dict: dict = {}
 
+
 class EnvVar:
     npu_enable_all2all_comm: bool = os.getenv("NPU_ENABLE_ALL2ALL_COMM", "1") == "1"
     npu_enable_graph: bool = os.getenv("NPU_ENABLE_GRAPH", "0") == "1"
     npu_enable_mla_split_kv_kr: bool = __is_npu__ and os.getenv("NPU_ENABLE_MLA_SPLIT_KV_KR", "1") == "1"
-    npu_enable_get_out_cache: bool=os.getenv("NPU_ENABLE_GET_OUT_CACHE", "0")=="1"
+    npu_enable_sfad_rank_major_query: bool = __is_npu__ and os.getenv("NPU_ENABLE_SFAD_RANK_MAJOR_QUERY", "0") == "1"
+    npu_enable_get_out_cache: bool = os.getenv("NPU_ENABLE_GET_OUT_CACHE", "0") == "1"
     npu_moe_core_num: bool = int(os.getenv("NPU_MOE_CORE_NUM", "12"))
+    # Read before graph capture: torch_npu patches getenv with a logger.
+    npu_moe_mask_padding: bool = os.getenv("NPU_MOE_MASK_PADDING", "0") == "1"
+    npu_offload_metadata_only_init: bool = os.getenv("NPU_OFFLOAD_METADATA_ONLY_INIT", "0") == "1"
+    # Disable graph mode (warm_up + compile_forward), fall back to plain model.forward.
+    # Default: disabled (graph mode is active). Set NPU_DISABLE_GRAPH_MODE=1 to disable.
+    npu_disable_graph_mode: bool = os.getenv("NPU_DISABLE_GRAPH_MODE", "0") == "1"
 
     def __init__(self):
         """
@@ -30,19 +39,24 @@ class EnvVar:
         pass
 
 
-
-
 ENV = EnvVar()
+
 
 def global_server_args_dict_update(server_args):
     global_server_args_dict.update(
         {
+            "context_length": server_args.context_length,
             "attention_backend": server_args.attention_backend,
+            "full_attention_backend": getattr(server_args, "full_attention_backend", None),
             "sampling_backend": server_args.sampling_backend,
+            "grammar_mask_timeout_ms": server_args.grammar_mask_timeout_ms if server_args.grammar_backend is not None else 0.0,
             "chunker_backend": server_args.chunker_backend,
             "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
             "torchao_config": server_args.torchao_config,
             "kv_cache_dtype": server_args.kv_cache_dtype,
+            "npu_dsa_kv_int8": server_args.npu_dsa_kv_int8,
+            "npu_dsa_packed_kv_row_bytes": server_args.npu_dsa_packed_kv_row_bytes,
+            "index_k_dtype": server_args.index_k_dtype,
             "enable_nan_detection": server_args.enable_nan_detection,
             "enable_dp_attention": server_args.enable_dp_attention,
             "enable_ep_moe": server_args.enable_ep_moe,
@@ -53,7 +67,10 @@ def global_server_args_dict_update(server_args):
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
             "speculative_accept_threshold_single": server_args.speculative_accept_threshold_single,
             "speculative_accept_threshold_acc": server_args.speculative_accept_threshold_acc,
+            "speculative_force_accept_num": server_args.speculative_force_accept_num,
             "speculative_algorithm": server_args.speculative_algorithm,
+            "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
+            "speculative_num_steps": server_args.speculative_num_steps,
             "is_multi_head_eagle": server_args.is_multi_head_eagle,
             "draft_use_oe": server_args.draft_use_oe,
             "enable_flashinfer_mla": server_args.enable_flashinfer_mla,
@@ -74,18 +91,20 @@ def global_server_args_dict_update(server_args):
             "ep_dispatch_algorithm": server_args.ep_dispatch_algorithm,
             "enable_eplb": server_args.enable_eplb,
             "mm_mode": server_args.mm_mode,
+            "mm_attention_backend": server_args.mm_attention_backend,
+            "mm_enable_dp_encoder": server_args.mm_enable_dp_encoder,
+            "vit_cuda_graph_seq_lens": server_args.vit_cuda_graph_seq_lens,
             "npu_enable_weight_nz": server_args.npu_enable_weight_nz,
             "npu_enable_opt_rope": server_args.npu_enable_opt_rope,
             "flashinfer_comm_max_num_tokens": server_args.flashinfer_comm_max_num_tokens,
-            "enable_deep_ep": server_args.enable_deep_ep,
             "max_prefill_tokens": server_args.max_prefill_tokens,
             "max_running_requests": server_args.max_running_requests,
             "enable_mla_l1_5_cache": server_args.enable_mla_l1_5_cache,
+            "enable_dsa_qcp": server_args.enable_dsa_qcp,
             "max_total_tokens": server_args.max_total_tokens,
             "npu_hccl_buffsize_a2a": server_args.npu_hccl_buffsize_a2a,
             "npu_o_proj_tp_size": server_args.npu_o_proj_tp_size,
             "npu_smooth_quant": server_args.npu_smooth_quant,
-            "npu_kvp_accuracy_fix": server_args.npu_kvp_accuracy_fix,
             "npu_enable_super_kernel": server_args.npu_enable_super_kernel,
             "npu_disable_kv_nz": server_args.npu_disable_kv_nz,
             "model_path": server_args.model_path,
@@ -98,11 +117,40 @@ def global_server_args_dict_update(server_args):
             "npu_enable_sp_for_indexer": server_args.npu_enable_sp_for_indexer,
             "npu_disable_dsa_head_parallel": server_args.npu_disable_dsa_head_parallel,
             "npu_enable_a2_dispatch_combine_opt": server_args.npu_enable_a2_dispatch_combine_opt,
+            "enable_oe_cpu_offload": server_args.enable_oe_cpu_offload,
+            "oep_backend": server_args.oep_backend,
+            "disable_eps": server_args.disable_eps,
+            "nnodes": server_args.nnodes,
+            "skip_tokenizer_init": server_args.skip_tokenizer_init,
             "npu_limit_max_new_tokens": server_args.npu_limit_max_new_tokens,
             "npu_moe_chunked_prefill_size": server_args.npu_moe_chunked_prefill_size,
+            "keep_mm_feature_on_device": server_args.keep_mm_feature_on_device,
+            "mm_feature_cache_mb": server_args.mm_feature_cache_mb,
+            "disable_vit_cuda_graph": server_args.disable_vit_cuda_graph,
             "npu_lmhead_tp_size": server_args.npu_lmhead_tp_size,
-            "npu_enable_oe_cpu_offload": server_args.npu_enable_oe_cpu_offload,
+            "npu_enable_int4_moe_comm": server_args.npu_enable_int4_moe_comm,
+            "npu_disabled_fused_kernels": server_args.npu_disabled_fused_kernels or [],
+            "npu_enable_prefill_two_stream": server_args.npu_enable_prefill_two_stream,
+            "npu_enable_w4a4_prefill_two_stream": server_args.npu_enable_w4a4_prefill_two_stream,
             "pp_layer_nums": server_args.pp_layer_nums,
+            "enable_hierarchical_cache": server_args.enable_hierarchical_cache,
+            "npu_enable_level2_indexer": server_args.npu_enable_level2_indexer,
+            "level2_pass_layers": server_args.level2_pass_layers,
+            "level2_kv_block_len": server_args.level2_kv_block_len,
+            "level1_topk": server_args.level1_topk,
+            "level2_block_page_len": server_args.level2_block_page_len,
+            "level2_min_kv_len": server_args.level2_min_kv_len,
+            "offload_cache": server_args.offload_cache,
+            "offload_cache_bs": server_args.offload_cache_bs,
+            "offload_cache_update_policy": server_args.offload_cache_update_policy,
+            "offload_cache_storage": server_args.offload_cache_storage,
+            "offload_cache_update_timing": server_args.offload_cache_update_timing,
+            "enable_speculative_sampling": server_args.enable_speculative_sampling,
+            "npu_split_k_router": server_args.npu_split_k_router,
+            "encoder_only": server_args.encoder_only,
+            "language_only": server_args.language_only,
+            "encoder_output_format": server_args.encoder_output_format,
+            "use_deterministic_topk": server_args.use_deterministic_topk,
         }
     )
 
@@ -133,9 +181,7 @@ class EnvField:
         try:
             return self.parse(value)
         except ValueError as e:
-            warnings.warn(
-                f'Invalid value for {self.name}: {e}, using default "{self.default}"'
-            )
+            warnings.warn(f'Invalid value for {self.name}: {e}, using default "{self.default}"', stacklevel=2)
             return self.default
 
     def is_set(self):
@@ -176,14 +222,10 @@ class EnvField:
         return self.get()
 
     def __bool__(self):
-        raise RuntimeError(
-            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
-        )
+        raise RuntimeError("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`")
 
     def __len__(self):
-        raise RuntimeError(
-            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
-        )
+        raise RuntimeError("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`")
 
 
 class EnvTuple(EnvField):
@@ -210,16 +252,16 @@ class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
             return int(value)
-        except ValueError:
-            raise ValueError(f'"{value}" is not a valid integer value')
+        except ValueError as e:
+            raise ValueError(f'"{value}" is not a valid integer value') from e
 
 
 class EnvFloat(EnvField):
     def parse(self, value: str) -> float:
         try:
             return float(value)
-        except ValueError:
-            raise ValueError(f'"{value}" is not a valid float value')
+        except ValueError as e:
+            raise ValueError(f'"{value}" is not a valid float value') from e
 
 
 class ToolStrictLevel(IntEnum):
@@ -264,10 +306,11 @@ class Envs:
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
-    SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
+    SGLANG_TORCH_PROFILER_DIR = EnvStr(tempfile.gettempdir())
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+    SGLANG_OVERRIDE_ENCODER_PORT = EnvInt(9101)  # EPD remote encoder HTTP port; non-empty overrides the default
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
@@ -309,7 +352,6 @@ class Envs:
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
 
     # Constrained Decoding
-    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
     SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
     # Tool Calling
@@ -371,7 +413,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_CANARY = EnvBool(False)
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
-    SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr(tempfile.gettempdir())
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
 
     # TBO
@@ -434,6 +476,22 @@ class Envs:
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
+    # Shard visual embedding bridge RVQ levels over the Attention-TP group.
+    # Disabled by default because the level SUM collective can outweigh the
+    # parallel lookup saving for the current Pro-V workload.
+    ENABLE_VISUAL_EMBEDDING_BRIDGE_PARALLEL = EnvBool(False)
+
+    # Multimodal Processing
+    # Whether to skip hash computation (use UUID instead, for debugging)
+    SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
+    # Whether to use pool handle cache for CUDA IPC
+    SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(True)
+    # Memory pool recycle interval (seconds)
+    SGLANG_MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = EnvFloat(8)
+    # Enable ViT CUDA Graph
+    SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
+    # Video max pixels
+    VIDEO_MAX_PIXELS = EnvInt(128 * 28 * 28)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -452,7 +510,10 @@ class Envs:
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
     # Warmup
-    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+    # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent
+    # hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache
+    # e.g. deep gemm
+    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1)
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
@@ -473,9 +534,7 @@ envs = Envs()
 
 def _print_deprecated_env(new_name: str, old_name: str):
     if old_name in os.environ:
-        warnings.warn(
-            f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
-        )
+        warnings.warn(f"Environment variable {old_name} will be deprecated, please use {new_name} instead", stacklevel=2)
         os.environ[new_name] = os.environ[old_name]
 
 
@@ -485,28 +544,22 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
     This is for env vars that are deprecated in favor of CLI flags.
     """
     if env_name in os.environ:
-        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}", stacklevel=2)
 
 
-def _convert_SGL_to_SGLANG():
+def _convert_sgl_to_sglang():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
-    _print_deprecated_env(
-        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
-    )
-    _print_deprecated_env(
-        "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
-    )
+    _print_deprecated_env("SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM")
+    _print_deprecated_env("SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH")
 
     for key, value in os.environ.items():
         if key.startswith("SGL_"):
             new_key = key.replace("SGL_", "SGLANG_", 1)
-            warnings.warn(
-                f"Environment variable {key} is deprecated, please use {new_key}"
-            )
+            warnings.warn(f"Environment variable {key} is deprecated, please use {new_key}", stacklevel=2)
             os.environ[new_key] = value
 
 
-_convert_SGL_to_SGLANG()
+_convert_sgl_to_sglang()
 
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
@@ -534,14 +587,16 @@ def example_with_exit_stack():
 def example_with_subprocess():
     command = ["python", "-c", "import os; print(os.getenv('SGLANG_TEST_RETRACT'))"]
     with envs.SGLANG_TEST_RETRACT.override(True):
-        process = subprocess.Popen(
+        process = subprocess.Popen(  # noqa: S603
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         process.wait()
         output = process.stdout.read().decode("utf-8").strip()
         assert output == "True"
 
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(  # noqa: S603
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
     output = process.stdout.read().decode("utf-8").strip()
     assert output == "None"
 
@@ -555,7 +610,7 @@ def example_with_implicit_bool_avoidance():
             assert message_matcher in str(e), f"{e=}"
             print(f"assert_throws find expected error: {e}")
             return
-        raise AssertionError(f"assert_throws do not see exceptions")
+        raise AssertionError("assert_throws do not see exceptions")
 
     with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
         if envs.SGLANG_TEST_RETRACT:
@@ -585,9 +640,7 @@ def examples():
     assert envs.SGLANG_TEST_RETRACT.value is True
 
     with envs.SGLANG_TEST_RETRACT.override(None):
-        assert (
-            envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
-        )
+        assert envs.SGLANG_TEST_RETRACT.is_set() and envs.SGLANG_TEST_RETRACT.value is None
 
     assert envs.SGLANG_TEST_RETRACT.value is True
 

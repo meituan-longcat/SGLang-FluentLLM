@@ -1,7 +1,8 @@
+# ruff: noqa: S105
 import json
 import logging
 import re
-from typing import List, Optional, Union, Literal
+from typing import Literal, Optional, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -40,10 +41,7 @@ class GptOssDetector(BaseFormatDetector):
         return self.bot_token in text
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """Parse TypeScript-style function calls from complete text."""
         if not self.has_tool_call(text):
@@ -78,10 +76,7 @@ class GptOssDetector(BaseFormatDetector):
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """Parse incremental streaming text for TypeScript-style function calls."""
         self._buffer += new_text
@@ -113,27 +108,17 @@ class GptOssDetector(BaseFormatDetector):
                 return StreamingParseResult(normal_text=out, calls=[])
 
         # Quick check if we might have tool calls
-        if (
-            "<|channel|>commentary to=" not in self._buffer
-            and not self.current_tool_name_sent
-        ):
+        if "<|channel|>commentary to=" not in self._buffer and not self.current_tool_name_sent:
             # No tool calls detected, check for final content
-            if (
-                "<|channel|>final" in self._buffer
-                or "assistantfinal" in self._buffer.lower()
-            ):
+            if "<|channel|>final" in self._buffer or "assistantfinal" in self._buffer.lower():
                 # Extract normal text from events
-                normal_text = "".join(
-                    [e.content for e in events if e.event_type == "normal"]
-                )
+                normal_text = "".join([e.content for e in events if e.event_type == "normal"])
                 if normal_text:
                     self._buffer = ""
                     return StreamingParseResult(normal_text=normal_text, calls=[])
 
             # For other content, extract normal text from events (with filtering applied)
-            normal_text = "".join(
-                [e.content for e in events if e.event_type == "normal"]
-            )
+            normal_text = "".join([e.content for e in events if e.event_type == "normal"])
             if normal_text or events:
                 self._buffer = ""
                 return StreamingParseResult(normal_text=normal_text, calls=[])
@@ -185,9 +170,7 @@ class GptOssDetector(BaseFormatDetector):
                     calls.append(tool_call_info)
 
                     # Mark as streamed
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        tool_call_info.parameters
-                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = tool_call_info.parameters
 
                     # Move to next tool
                     self.current_tool_id += 1
@@ -201,9 +184,7 @@ class GptOssDetector(BaseFormatDetector):
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-    def _extract_tool_call_from_event(
-        self, content: str, tool_indices: dict, tool_index: int
-    ) -> Optional[ToolCallItem]:
+    def _extract_tool_call_from_event(self, content: str, tool_indices: dict, tool_index: int) -> Optional[ToolCallItem]:
         """
         Extract tool call information from HarmonyParser event content.
 
@@ -219,11 +200,7 @@ class GptOssDetector(BaseFormatDetector):
         json_content = match.group(2)
 
         # Extract function name (last part after .)
-        function_name = (
-            full_function_name.split(".")[-1]
-            if "." in full_function_name
-            else full_function_name
-        )
+        function_name = full_function_name.split(".")[-1] if "." in full_function_name else full_function_name
 
         # Check if tool exists
         if function_name not in tool_indices:

@@ -2,29 +2,28 @@
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_group, get_dense_tp_group
 from sglang.srt.layers.dense.mlp import ParallelMLP
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.managers.scheduling.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
+from sglang.srt.ops.layernorm import RMSNorm
 from sglang.srt.utils import add_prefix, get_colorful_logger
-
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.layers.dp_attention import get_attention_tp_group, get_dense_tp_group
 
 logger = get_colorful_logger(__name__)
 
@@ -50,13 +49,14 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        if config.model_type == "llama4_text":
-            inter_size = config.intermediate_size_mlp
-        else:
-            inter_size = config.intermediate_size
+        inter_size = config.intermediate_size_mlp if config.model_type == "llama4_text" else config.intermediate_size
 
         self.mlp = ParallelMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix=f"{prefix}.mlp",
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            quant_config,
+            prefix=f"{prefix}.mlp",
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -69,7 +69,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tp_num_tokens: int = 0,
-        final_norm: RMSNorm = None
+        final_norm: RMSNorm = None,
     ):
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
@@ -85,17 +85,15 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         )
         block_scale = None
         hidden_states, residual, block_scale, _ = self.post_attention_layernorm.forward_with_allreduce_fusion(
-            get_attention_tp_group(),
-            hidden_states,
-            residual,
-            fuse_block_quant_fp8=not self.mlp.gateup_unquanted
+            get_attention_tp_group(), hidden_states, residual, fuse_block_quant_fp8=not self.mlp.gateup_unquanted
         )
         hidden_states = self.mlp(hidden_states, block_scale)
         hidden_states, residual, _, _ = final_norm.forward_with_allreduce_fusion(
             get_dense_tp_group(),
             hidden_states,
             residual,
-            fuse_block_quant_fp8=False
+            fuse_block_quant_fp8=False,
+            residual_reduce_scattered=True,
         )
         return hidden_states, residual
 
@@ -107,18 +105,10 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tp_num_tokens: int = 0,
-        final_norm: RMSNorm = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        final_norm: RMSNorm = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if tp_num_tokens < global_server_args_dict["flashinfer_comm_max_num_tokens"]:
-            return self.forward_low_latency(
-                positions,
-                embeds,
-                hidden_states,
-                forward_batch,
-                residual,
-                tp_num_tokens,
-                final_norm
-            )
+            return self.forward_low_latency(positions, embeds, hidden_states, forward_batch, residual, tp_num_tokens, final_norm)
 
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
@@ -138,13 +128,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected
-        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(
-            hidden_states, forward_batch, tp_num_tokens
-        )
+        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(hidden_states, forward_batch, tp_num_tokens)
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(
-            hidden_states, residual, tp_num_tokens, forward_batch
-        )
+        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(hidden_states, residual, tp_num_tokens, forward_batch)
 
         return hidden_states, residual
 
@@ -178,10 +164,7 @@ class LlamaModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
-        else:
-            embeds = input_embeds
+        embeds = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
@@ -193,21 +176,12 @@ class LlamaModel(nn.Module):
 
         residual = None
         tp_num_tokens = hidden_states.shape[0]
-        hidden_states, residual = self.midlayer(
-            positions,
-            embeds,
-            hidden_states,
-            forward_batch,
-            residual,
-            tp_num_tokens,
-            self.norm
-        )
+        hidden_states, residual = self.midlayer(positions, embeds, hidden_states, forward_batch, residual, tp_num_tokens, self.norm)
         if tp_num_tokens < global_server_args_dict["flashinfer_comm_max_num_tokens"]:
             hidden_states_to_logits, hidden_states_to_aux = hidden_states, residual
+            hidden_states_to_aux, _ = self.midlayer.decoder_comm_manager.post_final_norm_comm(hidden_states_to_aux, None, tp_num_tokens)
         else:
-            hidden_states_to_logits, hidden_states_to_aux = self.norm(
-                hidden_states, residual
-            )
+            hidden_states_to_logits, hidden_states_to_aux = self.norm(hidden_states, residual)
 
             hidden_states_to_logits, _ = self.midlayer.decoder_comm_manager.post_final_norm_comm(hidden_states_to_logits, None, tp_num_tokens)
             hidden_states_to_aux, _ = self.midlayer.decoder_comm_manager.post_final_norm_comm(hidden_states_to_aux, None, tp_num_tokens)
@@ -230,9 +204,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
 
-        self.model = LlamaModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
@@ -249,7 +221,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         # Define the parameter mapping for stacked parameters
         stacked_params_mapping = [
@@ -277,9 +249,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 param_name = f"model.{name}" if name not in params_dict else name
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -287,9 +257,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 param_name = name if name in params_dict else f"model.{name}"
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
 
     def get_hot_token_id(self):

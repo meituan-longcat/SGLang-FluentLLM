@@ -1,4 +1,3 @@
-import dataclasses
 import os
 import random
 import string
@@ -7,23 +6,17 @@ import tempfile
 import time
 import unittest
 from functools import cache
-from multiprocessing import Process
 from types import SimpleNamespace
-from typing import Callable
 from urllib.parse import urlparse
 
 import numpy as np
 import requests
-
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import kill_process_tree, popen_launch_pd_server
 
 default_lb_url: str = "http://127.0.0.1:8192"
 default_timeout_for_server_launch = 300
-default_model_path: str = (
-    "/mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite"
-)
+default_model_path: str = os.environ.get("MODEL_PATH") or "deepseek-ai/DeepSeek-V2-Lite"
 
 np.random.seed(1234)
 
@@ -34,7 +27,7 @@ def get_user_name():
 
 
 def kill_all_sglang(kill_lb: bool = False):
-    kill_lb_pat = f"| grep -v mini_lb" if not kill_lb else ""
+    kill_lb_pat = "| grep -v mini_lb" if not kill_lb else ""
     kill_cmds = (
         f"ps aux | grep sglang {kill_lb_pat} | awk '{{print $2}}' | xargs kill -9"
     )
@@ -107,7 +100,6 @@ def send_request_and_get_resp(
         error = response.json()
         raise RuntimeError(f"Sync request failed: {error}")
     d = response.json()
-    # print(d, flush=True)
     if isinstance(d, list):
         texts, match_lengths = ([], [])
         for item in d:
@@ -143,9 +135,8 @@ class DisaggregationSimulatedBase(unittest.TestCase):
         cls.prefill_in, cls.prefill_out = cls.get_prefill_out_file()
         cls.decode_in, cls.decode_out = cls.get_decode_out_file()
 
+        # 子进程继承调用环境中的 EPS_HOME 和 PYTHONPATH。
         cls.dependency_env = {
-            "EPS_HOME": "/workdir/lvyongkang/code/eps",
-            "PYTHONPATH": "/workdir/lvyongkang/code/eps/python:/home/FlashMLA/build/lib.linux-x86_64-cpython-39",
             "LD_LIBRARY_PATH": f"/usr/local/lib:/usr/local/lib64:{os.environ.get('LD_LIBRARY_PATH', '')}",
             "LD_PRELOAD": "/usr/lib64/libcuda.so",
             "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
@@ -340,7 +331,6 @@ class DisaggregationSimulatedBase(unittest.TestCase):
             mode="w+", delete=False
         )
         print("prefill_log:", cls.temp_prefill_stdout_file.name, flush=True)
-        return
 
     @classmethod
     def tearDownHook(cls):
@@ -421,7 +411,6 @@ class DisaggregationSimulatedBaseWithSingle(DisaggregationSimulatedBase):
         cls.wait_server_ready(cls.single_url + "/health")
         cls.error = 0
 
-        return
 
     @classmethod
     def setUpHook(cls):

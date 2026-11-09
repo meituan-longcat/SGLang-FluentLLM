@@ -1,6 +1,6 @@
-import logging
-from typing import Any, Dict, List, Optional, Union, get_origin, get_args
 import inspect
+import logging
+from typing import Any, Optional, Union, get_args, get_origin
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -30,9 +30,7 @@ def to_openai_style_logprobs(
     def append_top_logprobs(top_logprobs):
         for tokens in top_logprobs:
             if tokens is not None:
-                ret_logprobs.top_logprobs.append(
-                    {token[2]: token[0] for token in tokens}
-                )
+                ret_logprobs.top_logprobs.append({token[2]: token[0] for token in tokens})
             else:
                 ret_logprobs.top_logprobs.append(None)
 
@@ -49,12 +47,12 @@ def to_openai_style_logprobs(
 
 
 def process_hidden_states_from_ret(
-    ret_item: Dict[str, Any],
+    ret_item: dict[str, Any],
     request: Union[
         ChatCompletionRequest,
         CompletionRequest,
     ],
-) -> Optional[List]:
+) -> Optional[list]:
     """Process hidden states from a ret item in non-streaming response.
 
     Args:
@@ -93,7 +91,7 @@ def recursive_type_check(value, expected_type, param_name="参数"):
             except ValueError:
                 continue
         # Only throw error if none pass
-        allowed_types = [t.__name__ if hasattr(t, '__name__') else str(t) for t in args]
+        allowed_types = [t.__name__ if hasattr(t, "__name__") else str(t) for t in args]
         raise ValueError(f"{param_name} type error, expected {'|'.join(allowed_types)}, got {type(value).__name__}")
 
     # Non-generic, direct judgment
@@ -154,7 +152,7 @@ def recursive_type_check(value, expected_type, param_name="参数"):
 def validate_sampling_params(params: dict, cls):
     sig = inspect.signature(cls.__init__)
     for name, param in sig.parameters.items():
-        if name == 'self':
+        if name == "self":
             continue
         expected_type = param.annotation
         has_default = param.default != inspect._empty

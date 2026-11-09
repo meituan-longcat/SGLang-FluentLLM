@@ -4,6 +4,8 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 SHORTCUT_PRETRAINED_CONFIG_ARCHIVE_MAP = {}
+
+
 class ShortcutConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`ShortcutModel`]. It is used to instantiate an Shortcut
@@ -93,9 +95,9 @@ class ShortcutConfig(PretrainedConfig):
         num_hidden_layers=12,
         num_attention_heads=20,
         num_key_value_heads=10,
-        ep_size = 1,
-        num_experts_per_tok = None,
-        norm_topk_prob = False,
+        ep_size=1,
+        num_experts_per_tok=None,
+        norm_topk_prob=False,
         max_position_embeddings=8192,
         initializer_range=0.02,
         rms_norm_eps=1e-05,
@@ -109,7 +111,7 @@ class ShortcutConfig(PretrainedConfig):
         rope_scaling=None,
         attention_bias=False,
         attention_dropout=0.0,
-        disable_quant_module=[],
+        disable_quant_module=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -134,7 +136,7 @@ class ShortcutConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.disable_quant_module = disable_quant_module
+        self.disable_quant_module = disable_quant_module if disable_quant_module is not None else []
 
         super().__init__(
             pad_token_id=pad_token_id,

@@ -16,27 +16,28 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/gemma.py#L1
 """Inference-only Gemma model compatible with HuggingFace weights."""
 
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import GeluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ops.activation import GeluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
 
 
 class GemmaMLP(nn.Module):
@@ -171,9 +172,7 @@ class GemmaDecoderLayer(nn.Module):
             quant_config=quant_config,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -181,7 +180,7 @@ class GemmaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -213,12 +212,7 @@ class GemmaModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.layers = nn.ModuleList(
-            [
-                GemmaDecoderLayer(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        self.layers = nn.ModuleList([GemmaDecoderLayer(config, i, quant_config=quant_config) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -228,10 +222,7 @@ class GemmaModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds
+        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
 
         # Normalize the embedding by sqrt(hidden_size)
         hidden_states *= self.config.hidden_size**0.5
@@ -293,11 +284,9 @@ class GemmaForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.model.embed_tokens, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.model.embed_tokens, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),

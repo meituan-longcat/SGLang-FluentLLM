@@ -1,4 +1,3 @@
-
 import torch
 from compressed_tensors import CompressionFormat
 
@@ -28,6 +27,7 @@ def gptq_marlin_moe_repack(
     )
     for e in range(num_experts):
         import flashinfer
+
         output[e] = flashinfer.gptq_marlin_repack(
             b_q_weight[e],
             perm[e],
@@ -36,6 +36,7 @@ def gptq_marlin_moe_repack(
             num_bits,
         )
     return output
+
 
 def get_scale_perms():
     scale_perm: list[int] = []
@@ -46,9 +47,8 @@ def get_scale_perms():
         scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
     return scale_perm, scale_perm_single
 
-def marlin_permute_scales(
-    s: torch.Tensor, size_k: int, size_n: int, group_size: int
-) -> torch.Tensor:
+
+def marlin_permute_scales(s: torch.Tensor, size_k: int, size_n: int, group_size: int) -> torch.Tensor:
 
     scale_perm, scale_perm_single = get_scale_perms()
     if group_size < size_k and group_size != -1:
@@ -58,6 +58,7 @@ def marlin_permute_scales(
     s = s.reshape((-1, size_n)).contiguous()
 
     return s
+
 
 def marlin_moe_permute_scales(
     s: torch.Tensor,

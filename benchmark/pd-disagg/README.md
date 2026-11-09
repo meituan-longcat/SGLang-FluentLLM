@@ -12,6 +12,12 @@ benchmark/pd-disagg/
 ├── bench_pd_prefix_cache.py       # 基础前缀缓存基准测试(暂不使用)
 ```
 
+## 路径配置
+
+测试脚本通过 `MODEL_PATH` 读取模型目录或 Hugging Face 模型 ID，未设置时使用 `deepseek-ai/DeepSeek-V2-Lite`。下面的启动示例使用同一变量；运行多个终端时，请在各终端设置相同的值。
+
+如果使用本地安装的 EPS 或 FlashMLA，请在运行前配置 `EPS_HOME` 和 `PYTHONPATH`。`bench_pd_prefix_cache.py` 的子进程继承这些变量，脚本不再指定固定的依赖安装目录。
+
 ## 核心概念
 
 ### PD分离架构
@@ -163,12 +169,13 @@ Retract机制测试类，通过环境变量触发并验证回缩功能
 目前代码启动在虚拟环境存在找不到环境的问题尚未解决，建议命令行启动
 参考命令如下
 ``` bash
+export MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V2-Lite}"
 pkill -f "sglang" || true
 pkill -f "mini_lb" || true
 
 nohup python3 -m sglang.srt.disaggregation.mini_lb --host 0.0.0.0 --port 8192 >lb.log 2>&1 &
-nohup python3 -m sglang.launch_server --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite --disaggregation-mode prefill --base-gpu-id 0 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8292 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >pr.log 2>&1 &
-nohup python3 -m sglang.launch_server --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite --disaggregation-mode decode --base-gpu-id 2 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8392 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >de.log 2>&1 &
+nohup python3 -m sglang.launch_server --model-path "$MODEL_PATH" --disaggregation-mode prefill --base-gpu-id 0 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8292 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >pr.log 2>&1 &
+nohup python3 -m sglang.launch_server --model-path "$MODEL_PATH" --disaggregation-mode decode --base-gpu-id 2 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8392 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >de.log 2>&1 &
 
 sleep 40
 python3 benchmark/pd-disagg/test_pd_prefix_cache_detailed.py --test_case all
@@ -177,14 +184,15 @@ python3 benchmark/pd-disagg/test_pd_prefix_cache_detailed.py --test_case all
 
 如果需要测试evict或者retract需要在服务拉起前设置环境变量
 ``` bash
+export MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V2-Lite}"
 export SGLANG_CI_SMALL_KV_SIZE=512
 export SGLANG_NUM_RESERVED_DECODE_TOKENS=64
 pkill -f "sglang" || true
 pkill -f "mini_lb" || true
 
 nohup python3 -m sglang.srt.disaggregation.mini_lb --host 0.0.0.0 --port 8192 >lb.log 2>&1 &
-nohup python3 -m sglang.launch_server --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite --disaggregation-mode prefill --base-gpu-id 0 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8292 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >pr.log 2>&1 &
-nohup python3 -m sglang.launch_server --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite --disaggregation-mode decode --base-gpu-id 2 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8392 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >de.log 2>&1 &
+nohup python3 -m sglang.launch_server --model-path "$MODEL_PATH" --disaggregation-mode prefill --base-gpu-id 0 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8292 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >pr.log 2>&1 &
+nohup python3 -m sglang.launch_server --model-path "$MODEL_PATH" --disaggregation-mode decode --base-gpu-id 2 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8392 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >de.log 2>&1 &
 
 sleep 40
 python3 benchmark/pd-disagg/test_pd_prefix_cache_detailed.py --test_case evict
@@ -195,14 +203,15 @@ unset SGLANG_NUM_RESERVED_DECODE_TOKENS
 ```
 
 ``` bash
+export MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V2-Lite}"
 
 export SGLANG_TEST_RETRACT=true
 pkill -f "sglang" || true
 pkill -f "mini_lb" || true
 
 nohup python3 -m sglang.srt.disaggregation.mini_lb --host 0.0.0.0 --port 8192 >lb.log 2>&1 &
-nohup python3 -m sglang.launch_server --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite --disaggregation-mode prefill --base-gpu-id 0 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8292 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >pr.log 2>&1 &
-nohup python3 -m sglang.launch_server --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite --disaggregation-mode decode --base-gpu-id 2 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8392 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >de.log 2>&1 &
+nohup python3 -m sglang.launch_server --model-path "$MODEL_PATH" --disaggregation-mode prefill --base-gpu-id 0 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8292 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >pr.log 2>&1 &
+nohup python3 -m sglang.launch_server --model-path "$MODEL_PATH" --disaggregation-mode decode --base-gpu-id 2 --context-length 448 --low-latency-max-num-tokens-per-gpu 512 --chunked-prefill-size 4096 --port 8392 --disable-cuda-graph --enable-flashinfer-mla --trust-remote-code --moe-parallel-strategy ep --dense-parallel-strategy rep --nprocs-per-node 1 --attn-tp-size 1 --dp-size 1 --random-seed 1234 --host 0.0.0.0 --log-level debug --pdlb-url http://0.0.0.0:8192 >de.log 2>&1 &
 
 sleep 40
 python3 benchmark/pd-disagg/test_pd_prefix_cache_detailed.py --test_case retract
@@ -323,12 +332,14 @@ python test_pd_prefix_cache_detailed.py --tail-logs
 
 ### 2. 手动启动服务
 ```bash
+export MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V2-Lite}"
+
 # 1. 启动Load Balancer
 python3 -m sglang.srt.disaggregation.mini_lb --host 0.0.0.0 --port 8192
 
 # 2. 启动Prefill Server
 CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m sglang.srt.launch_server \
-    --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite \
+    --model-path "$MODEL_PATH" \
     --port 8292 \
     --disaggregation-mode prefill \
     --base-gpu-id 0 \
@@ -336,7 +347,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 -m sglang.srt.launch_server \
 
 # 3. 启动Decode Server  
 CUDA_VISIBLE_DEVICES=4,5,6,7 python3 -m sglang.srt.launch_server \
-    --model-path /mnt/hdfs/zw04mlnn01/checkpoint/llm_platform/model/DeepSeek-V2-Lite \
+    --model-path "$MODEL_PATH" \
     --port 8392 \
     --disaggregation-mode decode \
     --base-gpu-id 4 \

@@ -1,4 +1,5 @@
-from typing import Any, Dict, Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -9,40 +10,40 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
+from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    get_dense_tp_rank,
+    get_dense_tp_size,
+)
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
-
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    get_attention_tp_size,
-    get_attention_tp_rank,
-    get_dense_tp_size,
-    get_dense_tp_rank,
-)
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
-from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
-from sglang.srt.managers.expert_distribution import (
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.managers.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
-from sglang.srt.utils import is_npu, LazyValue
+from sglang.srt.managers.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ops.activation import SiluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.utils import LazyValue, is_npu
+
 if not is_npu():
     from sglang.srt.layers.moe.layer import MoELayer
 
@@ -63,9 +64,13 @@ class LlamaMLP(nn.Module):
             tp_rank = get_dense_tp_rank()
             tp_size = get_dense_tp_size()
             self.gate_up_proj = MergedColumnParallelLinear(
-                hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config,
-                tp_size=tp_size, tp_rank=tp_rank,
-                prefix=f"{prefix}.gate_up_proj"
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+                quant_config=quant_config,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                prefix=f"{prefix}.gate_up_proj",
             )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
@@ -75,21 +80,16 @@ class LlamaMLP(nn.Module):
                 reduce_results=False,
                 tp_rank=tp_rank,
                 tp_size=tp_size,
-                prefix=f"{prefix}.down_proj"
+                prefix=f"{prefix}.down_proj",
             )
         else:
             self.gate_up_proj = ReplicatedLinear(
                 hidden_size, intermediate_size * 2, bias=False, quant_config=quant_config, prefix=f"{prefix}.gate_up_proj"
             )
-            self.down_proj = ReplicatedLinear(
-                intermediate_size, hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj"
-            )
+            self.down_proj = ReplicatedLinear(intermediate_size, hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.down_proj")
 
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -131,7 +131,7 @@ class LongcatMoe(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
-        MoEImpl = MoELayer if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        MoEImpl = MoELayer if global_server_args_dict["enable_ep_moe"] else FusedMoE  # noqa: F821
         self.experts = MoEImpl(
             num_experts=num_experts + global_server_args_dict["ep_num_redundant_experts"],
             top_k=top_k,
@@ -141,15 +141,11 @@ class LongcatMoe(nn.Module):
             params_dtype=params_dtype,
             renormalize=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.experts"
+            prefix=f"{prefix}.experts",
         )
 
     def get_moe_routed_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"] and "shared_experts" not in name
-        ]
+        return [x.data for name, x in self.experts.named_parameters() if name not in ["correction_bias"] and "shared_experts" not in name]
 
     def forward(self, hidden_states: torch.Tensor, num_global_tokens: int, max_num_tokens_per_gpu: int) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -162,10 +158,10 @@ class LongcatMoe(nn.Module):
             router_logits, _ = self.gate(hidden_states)
 
         final_hidden_states = self.experts(
-              hidden_states=hidden_states,
-              router_logits=router_logits,
-              num_global_tokens=num_global_tokens,
-              max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -180,7 +176,7 @@ class LlamaAttention(nn.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
@@ -205,9 +201,7 @@ class LlamaAttention(nn.Module):
             assert self.attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
         # MistralConfig has an optional head_dim introduced by Mistral-Nemo
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.total_num_heads
-        )
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.total_num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -280,12 +274,8 @@ class LongcatMoeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        if rope_scaling is not None and getattr(
-            config, "original_max_position_embeddings", None
-        ):
-            rope_scaling["original_max_position_embeddings"] = (
-                config.original_max_position_embeddings
-            )
+        if rope_scaling is not None and getattr(config, "original_max_position_embeddings", None):
+            rope_scaling["original_max_position_embeddings"] = config.original_max_position_embeddings
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
@@ -294,9 +284,7 @@ class LongcatMoeDecoderLayer(nn.Module):
             self.tp_rank = get_tensor_model_parallel_rank()
             self.tp_size = get_tensor_model_parallel_world_size()
             self.tp_group = get_tp_group()
-        attention_bias = getattr(config, "attention_bias", False) or getattr(
-            config, "bias", False
-        )
+        attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
 
         self.self_attn = LlamaAttention(
             config=config,
@@ -335,9 +323,7 @@ class LongcatMoeDecoderLayer(nn.Module):
             self.is_moe_layer = False
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.attn_tp_group = get_attention_tp_group()
         self.attn_tp_size = get_attention_tp_size()
@@ -349,7 +335,7 @@ class LongcatMoeDecoderLayer(nn.Module):
             dense_parallel_strategy=global_server_args_dict["dense_parallel_strategy"],
             moe_parallel_strategy=global_server_args_dict["moe_parallel_strategy"],
             is_moe_layer=self.is_moe_layer,
-            num_layers=config.num_hidden_layers
+            num_layers=config.num_hidden_layers,
         )
 
     def forward(
@@ -359,7 +345,7 @@ class LongcatMoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tp_num_tokens: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         num_global_tokens, max_num_tokens_per_gpu = forward_batch.get_num_tokens(tp_num_tokens)
 
         if not forward_batch.forward_mode.is_idle():
@@ -375,8 +361,7 @@ class LongcatMoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(
-                    hidden_states, residual, tp_num_tokens)
+            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(hidden_states, residual, tp_num_tokens)
 
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
@@ -408,16 +393,9 @@ class LongcatMoeDecoderLayer(nn.Module):
         max_num_tokens_per_gpu,
         tp_num_tokens,
     ):
-        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(
-            hidden_states, forward_batch, tp_num_tokens
-        )
-        if self.is_moe_layer:
-            hidden_states = self.mlp(hidden_states, num_global_tokens, max_num_tokens_per_gpu)
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(
-            hidden_states, residual, tp_num_tokens
-        )
+        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(hidden_states, forward_batch, tp_num_tokens)
+        hidden_states = self.mlp(hidden_states, num_global_tokens, max_num_tokens_per_gpu) if self.is_moe_layer else self.mlp(hidden_states)
+        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(hidden_states, residual, tp_num_tokens)
         if start_idx is not None and end_idx is not None:
             hidden_states = hidden_states[start_idx:end_idx]
         return hidden_states
@@ -440,12 +418,7 @@ class LongcatMoeModel(nn.Module):
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.layers = nn.ModuleList(
-            [
-                LongcatMoeDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"{prefix}.layers"
-                )
-                for i in range(config.num_hidden_layers)
-            ]
+            [LongcatMoeDecoderLayer(config, i, quant_config=quant_config, prefix=f"{prefix}.layers") for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -456,18 +429,13 @@ class LongcatMoeModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
-        else:
-            hidden_states = input_embeds.type_as(self.embed_tokens.weight)
+        hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds.type_as(self.embed_tokens.weight)
         tp_num_tokens = hidden_states.shape[0]
         residual = None
         for i in range(len(self.layers)):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens
-                )
+                hidden_states, residual = layer(positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens)
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
@@ -490,19 +458,15 @@ class LlamaForCausalLMMoE(nn.Module):
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
-                prefix='lm_head',
+                prefix="lm_head",
             )
             self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
             self.logits_processor = LogitsProcessor(config)
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_routed_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, LongcatMoe)
+                layer_id: layer.mlp.get_moe_routed_weights() for layer_id, layer in enumerate(self.model.layers) if isinstance(layer.mlp, LongcatMoe)
             }
         )
 
@@ -517,11 +481,9 @@ class LlamaForCausalLMMoE(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -532,7 +494,7 @@ class LlamaForCausalLMMoE(nn.Module):
         ]
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = MoELayer if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        MoEImpl = MoELayer if global_server_args_dict["enable_ep_moe"] else FusedMoE  # noqa: F821
         expert_params_mapping = MoEImpl.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -566,9 +528,7 @@ class LlamaForCausalLMMoE(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                    if (name.endswith(".bias") or name.endswith("_bias")) and name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -582,9 +542,7 @@ class LlamaForCausalLMMoE(nn.Module):
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                    if (name.endswith(".bias") or name.endswith("_bias")) and name not in params_dict:
                         continue
                     # Skip loading kv_scale from ckpts towards new design.
                     if name.endswith(".kv_scale") and name not in params_dict:
@@ -595,9 +553,7 @@ class LlamaForCausalLMMoE(nn.Module):
                         name = name.replace("router.classifier", "gate")
 
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
 
     @classmethod
@@ -607,5 +563,6 @@ class LlamaForCausalLMMoE(nn.Module):
             num_logical_experts=config.num_experts[1],
             num_groups=None,
         )
+
 
 EntryClass = LlamaForCausalLMMoE

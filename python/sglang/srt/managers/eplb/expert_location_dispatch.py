@@ -1,0 +1,147 @@
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+import torch
+
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.managers.eplb.expert_location import get_global_expert_location_metadata
+from sglang.srt.utils import get_colorful_logger, is_npu
+
+logger = get_colorful_logger(__name__)
+_is_npu = is_npu()
+
+
+@dataclass
+class ExpertLocationDispatchInfo:
+    ep_dispatch_algorithm: Literal["static", "random", "static_with_zero_expert", "dynamic_with_zero_expert"]
+    # (num_logical_experts,)
+    partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
+    # (num_logical_experts, X)
+    partial_logical_to_all_physical_map: torch.Tensor
+    # (num_logical_experts,)
+    partial_logical_to_all_physical_map_num_valid: torch.Tensor
+    num_physical_experts: int
+
+    @classmethod
+    def init_new(cls, layer_id: int):
+        ep_dispatch_algorithm = global_server_args_dict["ep_dispatch_algorithm"]
+        expert_location_metadata = get_global_expert_location_metadata()
+
+        if ep_dispatch_algorithm is None:
+            return None
+
+        partial_logical_to_rank_dispatch_physical_map = None
+        if _is_npu:
+            partial_logical_to_rank_dispatch_physical_map = (
+                expert_location_metadata.logical_to_rank_dispatch_physical_map_list[layer_id]
+                if expert_location_metadata.logical_to_rank_dispatch_physical_map_list is not None
+                else None
+            )
+        else:
+            partial_logical_to_rank_dispatch_physical_map = (
+                expert_location_metadata.logical_to_rank_dispatch_physical_map[layer_id, :]
+                if expert_location_metadata.logical_to_rank_dispatch_physical_map is not None
+                else None
+            )
+
+        return cls(
+            ep_dispatch_algorithm=ep_dispatch_algorithm,
+            partial_logical_to_rank_dispatch_physical_map=partial_logical_to_rank_dispatch_physical_map,
+            partial_logical_to_all_physical_map=expert_location_metadata.logical_to_all_physical_map[layer_id, :],
+            partial_logical_to_all_physical_map_num_valid=expert_location_metadata.logical_to_all_physical_map_num_valid[layer_id, :],
+            num_physical_experts=expert_location_metadata.num_physical_experts,
+        )
+
+
+def transform_select_experts_inputs(
+    router_logits: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
+    info: Optional[ExpertLocationDispatchInfo],
+):
+    if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
+        router_logits = torch.randn_like(router_logits)
+        if correction_bias is not None:
+            correction_bias = torch.zeros_like(correction_bias)
+    return router_logits, correction_bias
+
+
+def topk_ids_logical_to_physical(
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    num_experts: Optional[int] = None,
+) -> torch.Tensor:
+    if info is None:
+        return topk_ids
+
+    if info.ep_dispatch_algorithm == "static":
+        return _topk_ids_logical_to_physical_static(topk_ids, info)
+    if info.ep_dispatch_algorithm == "static_with_zero_expert":
+        return _topk_ids_logical_to_physical_static_with_zero_expert(topk_ids, info, num_experts)
+    if info.ep_dispatch_algorithm == "dynamic_with_zero_expert":
+        return _topk_ids_logical_to_physical_dynamic_with_zero_expert(topk_ids, info, num_experts)
+    if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
+        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
+
+
+def _topk_ids_logical_to_physical_static(topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
+    return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
+
+
+def _topk_ids_logical_to_physical_static_with_zero_expert(
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo], num_experts: Optional[int] = None
+) -> torch.Tensor:
+    assert num_experts is not None
+    expert_map = info.partial_logical_to_rank_dispatch_physical_map
+    assert expert_map.dim() == 1
+    assert expert_map.shape[0] == num_experts + 1
+
+    if _is_npu:
+        assert topk_ids.dtype == torch.int32
+        assert expert_map.dtype == torch.int32
+        return torch.ops.custom.npu_moe_expert_id_map(
+            topk_ids.contiguous(),
+            expert_map.contiguous(),
+        )
+
+    topk_ids_original_shape = topk_ids.shape
+    topk_ids_flat = topk_ids.flatten()
+    indices = torch.clamp(topk_ids_flat, 0, num_experts)
+    converted = torch.gather(expert_map, 0, indices.to(torch.int64))
+    return converted.view(topk_ids_original_shape)
+
+
+def _topk_ids_logical_to_physical_dynamic_with_zero_expert(
+    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo], num_experts: Optional[int] = None
+) -> torch.Tensor:
+    assert num_experts is not None
+    topk_ids_original_shape = topk_ids.shape
+    device = topk_ids.device
+    topk_ids = topk_ids.flatten()
+
+    mask_less_than_num_experts = topk_ids < num_experts
+    topk_ids_to_convert = topk_ids[mask_less_than_num_experts]
+
+    chosen_dispatch_index = (
+        torch.randint(0, 65536, topk_ids_to_convert.shape, dtype=torch.int32, device=device)
+        % info.partial_logical_to_all_physical_map_num_valid[topk_ids_to_convert]
+    )
+    converted_topk_ids = info.partial_logical_to_all_physical_map[topk_ids_to_convert, chosen_dispatch_index]
+    topk_ids[mask_less_than_num_experts] = converted_topk_ids
+
+    topk_ids = topk_ids.view(topk_ids_original_shape)
+    return topk_ids
+
+
+def _topk_ids_logical_to_physical_dynamic(topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]) -> torch.Tensor:
+    topk_ids_original_shape = topk_ids.shape
+    device = topk_ids.device
+    topk_ids = topk_ids.flatten()
+
+    chosen_dispatch_index = (
+        torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device) % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
+    )
+    topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+
+    topk_ids = topk_ids.view(topk_ids_original_shape)
+    return topk_ids

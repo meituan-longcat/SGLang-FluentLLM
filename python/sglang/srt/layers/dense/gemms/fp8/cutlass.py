@@ -1,12 +1,16 @@
 from typing import List, Optional
 
+import math
 import torch
 
-from sglang.srt.utils import get_bool_env_var, is_npu
+from sglang.srt.utils import is_npu
+
+from sglang.srt.layers.dense.gemms.fp8.triton import triton_w8a8_block_fp8_linear
 
 __is_npu__ = is_npu()
 if not __is_npu__:
-    from flashinfer import fp8_blockwise_scaled_mm
+    import flashinfer
+    from flashinfer.sgl_fp8_quantization import sgl_fp8_quantize_1x128
 
 # use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 # use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
@@ -16,20 +20,6 @@ if not __is_npu__:
 TORCH_DEVICE_IDENTITY = None
 
 
-def cutlass_block_fp8_supported() -> bool:
-    if not get_bool_env_var("SGLANG_SUPPORT_CUTLASS_BLOCK_FP8"):
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    sm_version = major * 10 + minor
-    cuda_version = tuple(map(int, torch.version.cuda.split(".")))
-    if cuda_version >= (12, 0) and sm_version >= 90:
-        return True
-    return False
-
-
-CUTLASS_BLOCK_FP8_SUPPORTED = cutlass_block_fp8_supported()
-
-
 def cutlass_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -37,6 +27,8 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    *args,
+    **kwargs,
 ) -> torch.Tensor:
     assert input_scale is None
 
@@ -45,19 +37,22 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
 
     if not shape_supported:
         # fallback to triton
-        return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
-        )
+        return triton_w8a8_block_fp8_linear(input, weight, block_size, weight_scale, input_scale, bias)
 
     input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[0]]
+    M = input_2d.shape[0]
+    K = input_2d.shape[1]
+    m_padded = math.ceil(M / 4) * 4
+    k_blocks = K // 128
+    output_shape = [M, weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=True
-    )
-    output = fp8_blockwise_scaled_mm(
-        q_input, weight.T, x_scale, weight_scale.T, out_dtype=input_2d.dtype
-    )
+    gemm_output = torch.empty(M, weight.shape[0], dtype=torch.bfloat16, device="cuda")
+    mat_a = torch.empty(m_padded, K, dtype=torch.float8_e4m3fn, device="cuda")
+    scales = torch.empty(k_blocks, m_padded, dtype=torch.float32, device="cuda")
+    # Reuqires [k_blocks, M] shape with row-major scale, and the gemm will treat it as [M, k_blocks] col-major
+    # and mat_a is [M, K] with row-major, weight should be [N, K] with row-major
+    sgl_fp8_quantize_1x128(input_2d, mat_a, scales, use_ue8m0=False)
+    flashinfer.fp8_blockwise_scaled_mm_sm89(gemm_output, mat_a[:M], weight, scales, weight_scale)
     if bias is not None:
-        output += bias
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+        gemm_output += bias
+    return gemm_output.to(dtype=input_2d.dtype).view(*output_shape)

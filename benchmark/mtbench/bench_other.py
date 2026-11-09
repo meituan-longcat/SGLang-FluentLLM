@@ -6,9 +6,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from fastchat.model import get_conversation_template
-from tqdm import tqdm
-
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from tqdm import tqdm
 
 
 def load_questions(filename):

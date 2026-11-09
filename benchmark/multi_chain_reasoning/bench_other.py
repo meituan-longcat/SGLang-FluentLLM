@@ -7,10 +7,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from tqdm import tqdm
-
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
 from sglang.utils import dump_state_text, read_jsonl
+from tqdm import tqdm
 
 INVALID = -9999999
 

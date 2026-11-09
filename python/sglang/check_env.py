@@ -28,10 +28,8 @@ PACKAGE_LIST = [
     "fastapi",
     "hf_transfer",
     "huggingface_hub",
-    "interegular",
     "modelscope",
     "orjson",
-    "outlines",
     "packaging",
     "psutil",
     "pydantic",
@@ -153,18 +151,8 @@ def _get_nvcc_info():
 
         try:
             nvcc = os.path.join(CUDA_HOME, "bin/nvcc")
-            nvcc_output = (
-                subprocess.check_output(f'"{nvcc}" -V', shell=True)
-                .decode("utf-8")
-                .strip()
-            )
-            return {
-                "NVCC": nvcc_output[
-                    nvcc_output.rfind("Cuda compilation tools") : nvcc_output.rfind(
-                        "Build"
-                    )
-                ].strip()
-            }
+            nvcc_output = subprocess.check_output(f'"{nvcc}" -V', shell=True).decode("utf-8").strip()  # noqa: S602
+            return {"NVCC": nvcc_output[nvcc_output.rfind("Cuda compilation tools") : nvcc_output.rfind("Build")].strip()}
         except subprocess.SubprocessError:
             return {"NVCC": "Not Available"}
     elif is_hip():
@@ -172,16 +160,8 @@ def _get_nvcc_info():
 
         try:
             hipcc = os.path.join(ROCM_HOME, "bin/hipcc")
-            hipcc_output = (
-                subprocess.check_output(f'"{hipcc}" --version', shell=True)
-                .decode("utf-8")
-                .strip()
-            )
-            return {
-                "HIPCC": hipcc_output[
-                    hipcc_output.rfind("HIP version") : hipcc_output.rfind("AMD clang")
-                ].strip()
-            }
+            hipcc_output = subprocess.check_output(f'"{hipcc}" --version', shell=True).decode("utf-8").strip()  # noqa: S602
+            return {"HIPCC": hipcc_output[hipcc_output.rfind("HIP version") : hipcc_output.rfind("AMD clang")].strip()}
         except subprocess.SubprocessError:
             return {"HIPCC": "Not Available"}
     else:
@@ -238,8 +218,7 @@ def get_gpu_topology():
         try:
             result = subprocess.run(
                 ["nvidia-smi", "topo", "-m"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
                 check=True,
             )
@@ -250,8 +229,7 @@ def get_gpu_topology():
         try:
             result = subprocess.run(
                 ["rocm-smi", "--showtopotype"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 text=True,
                 check=True,
             )
@@ -269,7 +247,7 @@ def get_hypervisor_vendor():
             if "Hypervisor vendor:" in line:
                 return line.split(":")[1].strip()
         return None
-    except:
+    except Exception:
         return None
 
 

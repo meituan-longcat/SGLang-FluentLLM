@@ -117,8 +117,7 @@ def main(args):
     # Write results
     dump_state_text(f"tmp_output_{args.backend}_{args.mode}.txt", states)
     with open(f"{args.backend}_{args.mode}.json", "w") as fout:
-        for state in states:
-            fout.write(state["json_output"] + "\n")
+        fout.writelines(state["json_output"] + "\n" for state in states)
 
     with open(args.result_file, "a") as fout:
         value = {

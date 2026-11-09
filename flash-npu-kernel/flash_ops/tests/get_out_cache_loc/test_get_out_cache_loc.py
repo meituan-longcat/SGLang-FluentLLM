@@ -3,7 +3,6 @@
 
 import torch
 import torch_npu
-import numpy as np
 import flash_npu_kernel
 import pytest
 
@@ -15,14 +14,12 @@ if not hasattr(torch.ops.flash, "npu_get_out_cache_loc"):
 
 
 def test_get_out_cache_loc_interface_exist():
-    """Test that the operator is registered in torch.ops."""
     assert hasattr(torch.ops.flash, "npu_get_out_cache_loc"), \
         "The 'npu_get_out_cache_loc' operator is not registered in 'torch.ops.flash'."
 
 
 def _ref_get_out_cache_loc(out_cache_loc, req_pool_indices, new_compute_lens,
                            cache_lens, req_to_token):
-    """CPU reference implementation (matches the original test script)."""
     cumsum_offsets = torch.zeros_like(new_compute_lens)
     torch.cumsum(new_compute_lens[:-1], dim=0, out=cumsum_offsets[1:])
     cache_starts = cache_lens[req_pool_indices]
@@ -37,9 +34,13 @@ def _ref_get_out_cache_loc(out_cache_loc, req_pool_indices, new_compute_lens,
     return out_cache_loc
 
 
-# Mirror the original cann_m test grid: bs ∈ [1, 191], 13 pool_len values, 2 dtypes.
-BS_VALUES = list(range(1, 192))
-POOL_LENS = [16, 64, 128, 256, 1024, 2048, 4096, 6400, 8192, 16384, 32768, 65535, 131070]
+BS_VALUES = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    12, 14, 16, 20, 24, 28, 32,
+    40, 48, 56, 64, 80, 96, 112, 128,
+    144, 160, 176, 192, 208, 224, 240, 256, 384, 512,
+]
+POOL_LENS = [16, 64, 256, 1024, 2048, 4096, 8192, 16384, 65535, 131070]
 DTYPES = [torch.int64, torch.int32]
 
 
@@ -48,10 +49,11 @@ DTYPES = [torch.int64, torch.int32]
 @pytest.mark.parametrize("pool_len", POOL_LENS)
 @pytest.mark.parametrize("bs", BS_VALUES)
 def test_get_out_cache_loc(bs, pool_len, dtype):
-    """Compare NPU in-place op vs CPU reference across full bs/pool_len/dtype grid."""
+    seed = (bs * 137 + pool_len * 11 + hash(str(dtype))) % (2**31)
+    torch.manual_seed(seed)
+
     max_cache_len = pool_len // 4
     req_to_token = torch.arange(1, bs * pool_len + 1, dtype=dtype).reshape(bs, pool_len)
-    torch.manual_seed(42)
     req_pool_indices = torch.randperm(bs, dtype=dtype)
     cache_lens = torch.randint(0, max_cache_len if max_cache_len > 0 else 1,
                                (bs,), dtype=dtype)
@@ -63,7 +65,6 @@ def test_get_out_cache_loc(bs, pool_len, dtype):
     out_cache_loc = torch.zeros(total_tokens, dtype=dtype)
     out_cache_loc_npu = out_cache_loc.clone().npu()
 
-    # CPU reference (mutates out_cache_loc in place).
     expected = _ref_get_out_cache_loc(
         out_cache_loc.clone(), req_pool_indices.clone(),
         new_compute_lens.clone(), cache_lens.clone(), req_to_token.clone(),

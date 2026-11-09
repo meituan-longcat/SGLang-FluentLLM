@@ -12,33 +12,30 @@
 # limitations under the License.
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
-from typing import List
 
-from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
-from sglang.srt.utils import get_colorful_logger
 import multiprocessing as mp
+import os
 import signal
-import threading
 from collections import deque
 from enum import Enum, auto
 
-import os
 import psutil
 import setproctitle
 import zmq
 
+from sglang.srt.layers.attention.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.io_struct import (
+    BlockReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
-    BlockReqInput,
 )
 from sglang.srt.managers.req import Req
-from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduling.scheduler import run_scheduler_process
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, get_zmq_socket, register_usr_signal
+from sglang.srt.utils import configure_logger, get_colorful_logger, get_zmq_socket, register_usr_signal
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -80,10 +77,7 @@ class DPBudget:
         if not loads:
             return
 
-        if self.method == LoadBalanceMethod.MINIMUM_CACHE_USAGE:
-            metrics = [load.num_pages for load in loads]
-        else:
-            metrics = [load.num_reqs for load in loads]
+        metrics = [load.num_pages for load in loads] if self.method == LoadBalanceMethod.MINIMUM_CACHE_USAGE else [load.num_reqs for load in loads]
 
         max_metric = max(metrics)
         if all(x == max_metric for x in metrics):
@@ -93,9 +87,7 @@ class DPBudget:
             min_load = min(metrics)
             min_indices = [i for i, x in enumerate(metrics) if x == min_load]
             second_min_load = min(x for x in metrics if x > min_load)
-            self.budget_queue.extend(
-                [loads[i].dp_rank for i in min_indices] * (second_min_load - min_load)
-            )
+            self.budget_queue.extend([loads[i].dp_rank for i in min_indices] * (second_min_load - min_load))
             for idx in min_indices:
                 metrics[idx] = second_min_load
 
@@ -103,6 +95,7 @@ class DPBudget:
         if self.budget_queue:
             return self.budget_queue.popleft()
         return None
+
 
 class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
@@ -116,16 +109,12 @@ class DataParallelController:
         self.context_length = None
         self.server_args = server_args
         self.port_args = port_args
-        self.load_balance_method = LoadBalanceMethod.from_str(
-            server_args.load_balance_method
-        )
+        self.load_balance_method = LoadBalanceMethod.from_str(server_args.load_balance_method)
 
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
-            self.recv_from_tokenizer = get_zmq_socket(
-                self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-            )
+            self.recv_from_tokenizer = get_zmq_socket(self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False)
         # dp_worker for fixed data dispatch can be set by SINGLE_WORKER_ID environment variable
         robin_scheduler = self.round_robin_scheduler if os.environ.get("SINGLE_WORKER_ID", "-1") == "-1" else self.single_robin_scheduler
         # Dispatch method
@@ -144,7 +133,7 @@ class DataParallelController:
         self.scheduler_procs = []
         self.workers = [None] * server_args.dp_size
 
-        dp_port_args = self.launch_dp_schedulers(server_args, port_args)
+        self.launch_dp_schedulers(server_args, port_args)
 
         # Workers are already created in launch_dp_schedulers before starting scheduler threads
 
@@ -179,9 +168,6 @@ class DataParallelController:
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
 
     def launch_dp_schedulers(self, server_args, port_args):
-        base_gpu_id = 0
-
-        threads = []
         dp_port_args = []
 
         # Parse dist_init_addr from port_args to create per-dp-rank ports
@@ -235,11 +221,9 @@ class DataParallelController:
         server_args: ServerArgs,
         port_args: PortArgs,
         base_gpu_id: int,
-        dp_port_args: List[PortArgs],
+        dp_port_args: list[PortArgs],
     ):
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
+        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=server_args.enable_memory_saver)
         scheduler_pipe_readers = []
 
         pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
@@ -259,14 +243,14 @@ class DataParallelController:
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
                 assert server_args.enable_dp_attention
-                _, _, dp_rank=compute_dp_attention_world_info(
+                _, _, dp_rank = compute_dp_attention_world_info(
                     server_args.enable_dp_attention,
                     tp_rank,
                     server_args.tp_size,
                     server_args.dp_size,
                 )
                 # compute zmq ports for this dp rank
-                rank_port_args=dp_port_args[dp_rank]
+                rank_port_args = dp_port_args[dp_rank]
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -281,10 +265,10 @@ class DataParallelController:
                 # - Attention: Global(TP) -> DP -> ATTN_CP/TP
                 attn_tp_size = server_args.tp_size // attn_dp_size
                 attn_tp_rank = tp_rank % attn_tp_size
-                moe_ep_rank = tp_rank % server_args.tp_size // (server_args.tp_size  // server_args.ep_size)
+                moe_ep_rank = tp_rank % server_args.tp_size // (server_args.tp_size // server_args.ep_size)
 
                 # run scheduler
-                proc=mp.Process(
+                proc = mp.Process(
                     target=run_scheduler_process,
                     args=(server_args, rank_port_args, gpu_id, pp_rank, attn_tp_rank, moe_ep_rank, dp_rank, tp_rank, writer),
                 )
@@ -299,27 +283,44 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
-        self.max_total_num_tokens=scheduler_info[0]["max_total_num_tokens"]
-        self.max_req_input_len=scheduler_info[0]["max_req_input_len"]
-        self.max_running_requests=scheduler_info[0]["max_running_requests"]
-        self.chunked_prefill_size=scheduler_info[0]["chunked_prefill_size"]
-        self.context_length=scheduler_info[0]["context_length"]
+        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
+        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.max_running_requests = scheduler_info[0]["max_running_requests"]
+        self.chunked_prefill_size = scheduler_info[0]["chunked_prefill_size"]
+        self.context_length = scheduler_info[0]["context_length"]
+
+    def maybe_external_dp_rank_routing(self, req: Req) -> bool:
+        if req.routed_dp_rank is not None:
+            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
+            self.workers[req.routed_dp_rank].send_pyobj(req)
+            return True
+        return False
 
     def round_robin_scheduler(self, req: Req):
-        if self.server_args.disaggregation_mode == "null" or self.server_args.disaggregation_mode == "decode":
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        if self.server_args.disaggregation_mode == "decode":
+            if req.bootstrap_room is not None:
+                self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
+            else:
+                self.workers[self.round_robin_counter].send_pyobj(req)
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
+        elif self.server_args.disaggregation_mode == "null":
             self.workers[self.round_robin_counter].send_pyobj(req)
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(self.workers)
         else:
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def single_robin_scheduler(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
         worker_id = int(os.environ.get("SINGLE_WORKER_ID", "-1"))
         assert worker_id > -1 and worker_id < (self.server_args.dp_size - 1), f"Invalid SINGLE_WORKER_ID:{worker_id}"
         self.workers[worker_id].send_pyobj(req)
 
     def budget_scheduler(self, req):
+        if self.maybe_external_dp_rank_routing(req):
+            return
         target_worker = self.dp_budget.dispatch()
         if target_worker is None:
             self.round_robin_scheduler(req)
@@ -355,16 +356,16 @@ def run_data_parallel_controller_process(
                 "max_req_input_len": controller.max_req_input_len,
                 "max_running_requests": controller.max_running_requests,
                 "chunked_prefill_size": controller.chunked_prefill_size,
-                "context_length": controller.context_length
+                "context_length": controller.context_length,
             }
         )
         if server_args.node_rank == 0:
             controller.event_loop()
         for proc in controller.scheduler_procs:
             proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
+            logger.error(f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}")
+    except KeyboardInterrupt:
+        logger.info("DataParallelController received KeyboardInterrupt, exiting.")
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DataParallelController hit an exception: {traceback}")

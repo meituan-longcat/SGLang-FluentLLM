@@ -1,23 +1,22 @@
-"""
-Copyright 2025 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 KV caching events
 """
 
 import atexit
+import enum
 import logging
 import queue
 import threading
@@ -56,15 +55,27 @@ class KVCacheEvent(
     """Base class for all KV cache-related events"""
 
 
+class StorageMedium(str, enum.Enum):
+    """Storage tier for KV cache events."""
+
+    GPU = "GPU"  # L1: device HBM
+    CPU = "CPU_PINNED"  # L2: host pinned memory
+    DISK = "DISK"  # L3: SSD / NVMe
+    EXTERNAL = "EXTERNAL"  # L4: shared / remote pool (e.g. Mooncake)
+
+
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
-    parent_block_hash: Optional[int]
+    parent_block_hash: int
     token_ids: list[int]
     block_size: int
+    lora_id: Optional[int] = None
+    medium: Optional[StorageMedium] = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: Optional[StorageMedium] = None
 
 
 class AllBlocksCleared(KVCacheEvent):
@@ -77,7 +88,7 @@ class KVEventBatch(EventBatch):
 
 class EventPublisher(ABC):
     """
-    Lightweight publisher for EventBatch batches with
+    Lightweight publisher for EventBatches with
     support for DP attention.
 
     In DP attention - each rank has its own Scheduler and
@@ -163,9 +174,7 @@ class ZmqEventPublisher(EventPublisher):
         self._replay: Optional[zmq.Socket] = None
         self._dp_rank = attn_dp_rank
         self._endpoint = self.offset_endpoint_port(endpoint, self._dp_rank)
-        self._replay_endpoint = self.offset_endpoint_port(
-            replay_endpoint, self._dp_rank
-        )
+        self._replay_endpoint = self.offset_endpoint_port(replay_endpoint, self._dp_rank)
         self._hwm = hwm
         self._socket_setup()
 
@@ -177,9 +186,7 @@ class ZmqEventPublisher(EventPublisher):
         self._running = True
         logger.info("Starting ZMQ publisher thread")
 
-        self._thread = threading.Thread(
-            target=self._publisher_thread, daemon=True, name="zmq-publisher"
-        )
+        self._thread = threading.Thread(target=self._publisher_thread, daemon=True, name="zmq-publisher")
         self._thread.start()
 
         atexit.register(self.shutdown)
@@ -231,12 +238,7 @@ class ZmqEventPublisher(EventPublisher):
             self._pub.set_hwm(self._hwm)
             # Heuristic: bind if wildcard / * present, else connect.
             # bind stable, connect volatile convention
-            if (
-                "*" in self._endpoint
-                or "::" in self._endpoint
-                or self._endpoint.startswith("ipc://")
-                or self._endpoint.startswith("inproc://")
-            ):
+            if "*" in self._endpoint or "::" in self._endpoint or self._endpoint.startswith("ipc://") or self._endpoint.startswith("inproc://"):
                 self._pub.bind(self._endpoint)
             else:
                 self._pub.connect(self._endpoint)
@@ -302,17 +304,13 @@ class ZmqEventPublisher(EventPublisher):
                 # [identity, empty_delim, seq_bytes, payload]
                 # (identity, empty_delim) are stripped off by the router
                 # receiving payload is (seq_bytes, payload)
-                self._replay.send_multipart(
-                    (client_id, b"", seq.to_bytes(8, "big"), buf)
-                )
+                self._replay.send_multipart((client_id, b"", seq.to_bytes(8, "big"), buf))
         # Send end of sequence marker
         # receiving payload is (-1, b""")
         self._replay.send_multipart((client_id, b"", self.END_SEQ, b""))
 
     @staticmethod
-    def offset_endpoint_port(
-        endpoint: Optional[str], data_parallel_rank: int
-    ) -> Optional[str]:
+    def offset_endpoint_port(endpoint: Optional[str], data_parallel_rank: int) -> Optional[str]:
         """Helper function to offset the port in an endpoint by
             the data parallel rank.
 

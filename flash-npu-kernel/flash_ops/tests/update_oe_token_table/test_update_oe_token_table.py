@@ -3,7 +3,6 @@
 
 import torch
 import torch_npu
-import numpy as np
 import flash_npu_kernel
 import pytest
 
@@ -15,14 +14,12 @@ if not hasattr(torch.ops.flash, "npu_update_oe_token_table"):
 
 
 def test_npu_update_oe_token_table_interface_exist():
-    """Test that the operator is registered in torch.ops."""
     assert hasattr(torch.ops.flash, "npu_update_oe_token_table"), \
         "The 'npu_update_oe_token_table' operator is not registered in 'torch.ops.flash'."
 
 
 def _ref_update_oe_token_table(tokens, row_indices, column_starts,
                                oe_req_lens, ignore_token, oe_token_table):
-    """CPU reference implementation — mirrors the original test script."""
     if tokens.numel() != oe_req_lens.sum():
         raise ValueError(
             f"Token total {tokens.numel()} != sum(req_lens) {oe_req_lens.sum()}")
@@ -39,19 +36,22 @@ def _ref_update_oe_token_table(tokens, row_indices, column_starts,
     return oe_token_table
 
 
-# Keep the test grid manageable: original test went up to 1M max_len which is
-# prohibitive on CI. Cover representative bs values and context lengths.
-BS_VALUES = [1, 2, 4, 8, 16, 24, 32, 48, 49, 64, 128, 168, 256]
-MAX_LENS = [20, 128, 256, 300, 412, 512, 1024, 1600, 2048, 3330, 4096,
-            10 * 1024, 100 * 1024]
+BS_VALUES = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 18, 20, 22, 24,
+    26, 28, 30, 32, 36, 40, 44, 48, 52, 56,
+    60, 64, 72, 80, 88, 96, 112, 128, 160, 192,
+]
+MAX_LENS = [20, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65535, 102400]
 
 
 @pytest.mark.skipif(not torch.npu.is_available(), reason="NPU device not found")
 @pytest.mark.parametrize("max_len", MAX_LENS)
 @pytest.mark.parametrize("bs", BS_VALUES)
 def test_update_oe_token_table(bs, max_len):
-    """Compare NPU in-place op vs CPU reference across bs/max_len grid."""
-    torch.manual_seed(42)
+    seed = (bs * 149 + max_len * 17) % (2**31)
+    torch.manual_seed(seed)
+
     max_reqs = int(bs + torch.randint(0, 100, (1,), dtype=torch.int32).item())
 
     oe_token_table = torch.zeros(max_reqs * max_len,

@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-import os
-import json
-import pandas as pd
 import argparse
+import json
+import os
 import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pandas as pd
+from sglang.test.run_eval import run_eval
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
-    make_report,
     set_ulimit,
 )
-
-
-from sglang.test.run_eval import run_eval
-from sglang.test.simple_eval_mmlu import MMLUEval, subject2category
-from sglang.test.simple_eval_common import ChatCompletionSampler
+from sglang.test.simple_eval_mmlu import subject2category
 
 MMLU_CSV_FILE="https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv" #参考run_eval.py 可以替换为其余数据集
 # 添加项目路径到Python路径
@@ -180,7 +177,10 @@ def save_detailed_outputs(args, subject, output_dir):
     保存详细的模型输出，包括每个问题的详细信息
     """
     # 创建自定义评估器来获取详细信息
-    from sglang.test.simple_eval_common import format_multichoice_question, ANSWER_PATTERN_MULTICHOICE
+    from sglang.test.simple_eval_common import (
+        ANSWER_PATTERN_MULTICHOICE,
+        format_multichoice_question,
+    )
     
     # 重新加载数据
     df = pd.read_csv(args.mmlu_test_file)

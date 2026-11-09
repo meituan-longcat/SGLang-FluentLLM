@@ -12,21 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
-from __future__ import annotations
-from typing import TYPE_CHECKING, Optional
-import os
 
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.utils import get_colorful_logger, is_npu
+from __future__ import annotations
+
+import os
 import threading
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_size
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -34,14 +32,15 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.scheduling.schedule_batch import ModelWorkerBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, get_colorful_logger, is_npu, set_random_seed
+from sglang.srt.utils.hf_transformers_utils import get_processor, get_tokenizer, get_tokenizer_from_processor
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.mem_cache.hicache_operation import LayerDoneCounter
 
 logger = get_colorful_logger(__name__)
 
@@ -49,10 +48,8 @@ _is_npu = is_npu()
 
 _RANDOM_ROUTER = None
 if _RANDOM_ROUTER is None:
-    if os.getenv("RANDOM_ROUTER", "0") == "1":
-        _RANDOM_ROUTER = True
-    else:
-        _RANDOM_ROUTER = False
+    _RANDOM_ROUTER = os.getenv("RANDOM_ROUTER", "0") == "1"
+
 
 class TpModelWorker:
     """A tensor parallel model worker."""
@@ -66,9 +63,10 @@ class TpModelWorker:
         global_rank: int,
         nccl_port: int,
         is_draft_worker: bool = False,
-        req_to_token_pool= None,
+        req_to_token_pool=None,
         kv_allocator=None,
         oe_token_table=None,
+        speculative_sampling_info=None,
         enable_overlap: bool = False,
         is_multi_head_eagle: bool = False,
     ):
@@ -77,23 +75,18 @@ class TpModelWorker:
         self.gpu_id = gpu_id
         self.attn_tp_rank = attn_tp_rank
         self.pp_rank = global_rank // server_args.tp_size
-        self.pp_size=server_args.pp_size
+        self.pp_size = server_args.pp_size
         self.moe_ep_rank = moe_ep_rank
         self.global_rank = global_rank
         self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
         self.req_to_token_pool = req_to_token_pool
         self.kv_allocator = kv_allocator
-        self.oe_token_table = oe_token_table
         self.is_multi_head_eagle = is_multi_head_eagle
 
         # Init model and tokenizer
         self.model_config = ModelConfig(
-            (
-                server_args.model_path
-                if not is_draft_worker
-                else server_args.speculative_draft_model_path
-            ),
+            (server_args.model_path if not is_draft_worker else server_args.speculative_draft_model_path),
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             context_length=server_args.context_length,
@@ -123,14 +116,15 @@ class TpModelWorker:
             req_to_token_pool=req_to_token_pool,
             kv_allocator=kv_allocator,
             oe_token_table=oe_token_table,
+            speculative_sampling_info=speculative_sampling_info,
             enable_overlap=enable_overlap,
-            draft_model_idx=0 if self.is_multi_head_eagle and is_draft_worker else None
+            draft_model_idx=0 if self.is_multi_head_eagle and is_draft_worker else None,
         )
         if is_draft_worker:
             self.model_runner_list = []
             self.model_runner_list.append(self.model_runner)
         if self.is_multi_head_eagle:
-            self._init_multi_layer_eagle_model_runners()
+            self._init_multi_layer_eagle_model_runners(oe_token_table, speculative_sampling_info)
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -142,7 +136,7 @@ class TpModelWorker:
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                 )
-                self.tokenizer = self.processor.tokenizer
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
@@ -159,19 +153,16 @@ class TpModelWorker:
             (
                 self.max_total_num_tokens // 2
                 if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                else server_args.max_running_requests // (server_args.dp_size if server_args.enable_dp_attention else 1)
             ),
             self.model_runner.req_to_token_pool.size,
         )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.max_total_num_tokens - self.model_runner.page_size, # page 0 is for padding
+            self.max_total_num_tokens - self.model_runner.page_size,  # page 0 is for padding
         )
         self.max_req_input_len = self.max_req_len - 5
-        assert (
-            self.max_req_len > 0 and self.max_req_input_len > 0
-        ), "Memory pool size is too small"
+        assert self.max_req_len > 0 and self.max_req_input_len > 0, "Memory pool size is too small"
 
         # Sync random seed across TP workers
         if get_attention_tp_size() > 1:
@@ -190,10 +181,10 @@ class TpModelWorker:
             set_random_seed(self.random_seed)
 
         # for hicache load
-        self.hicache_layer_transfer_counter = None
-        self.pp_group=get_pp_group()
+        self.hicache_layer_transfer_counters: list[LayerDoneCounter] = []
+        self.pp_group = get_pp_group()
 
-    def _init_multi_layer_eagle_model_runners(self):
+    def _init_multi_layer_eagle_model_runners(self, oe_token_table, speculative_sampling_info):
         for i in range(1, self.server_args.speculative_num_steps):
             self.model_runner_list.append(
                 ModelRunner(
@@ -211,8 +202,9 @@ class TpModelWorker:
                     is_draft_worker=self.is_draft_worker,
                     req_to_token_pool=self.req_to_token_pool,
                     kv_allocator=self.kv_allocator,
-                    oe_token_table=self.oe_token_table,
-                    draft_model_idx=i
+                    oe_token_table=oe_token_table,
+                    speculative_sampling_info=speculative_sampling_info,
+                    draft_model_idx=i,
                 )
             )
 
@@ -253,45 +245,46 @@ class TpModelWorker:
         )
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
-        self.hicache_layer_transfer_counter = counter
+        self.hicache_layer_transfer_counters.append(counter)
 
     def set_hicache_consumer(self, consumer_index: int):
-        if self.hicache_layer_transfer_counter is not None:
-            self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+        for counter in self.hicache_layer_transfer_counters:
+            counter.set_consumer(consumer_index)
 
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
-        launch_done: Optional[threading.Event] = None,
+        launch_done: threading.Event | None = None,
         skip_sample: bool = False,
-    ) -> Tuple[LogitsProcessorOutput, Optional[torch.Tensor]]:
+    ) -> tuple[LogitsProcessorOutput, torch.Tensor | None]:
         self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         if self.use_over_embedding:
             if forward_batch.forward_mode == ForwardMode.EXTEND:
-                forward_batch.oe_column_starts[:forward_batch.batch_size] = forward_batch.extend_prefix_lens
-                forward_batch.oe_req_lens[:forward_batch.batch_size] = forward_batch.extend_seq_lens
+                forward_batch.oe_column_starts[: forward_batch.batch_size] = forward_batch.extend_prefix_lens
+                forward_batch.oe_req_lens[: forward_batch.batch_size] = forward_batch.extend_seq_lens
             elif forward_batch.forward_mode == ForwardMode.DECODE:
-                forward_batch.oe_column_starts[:forward_batch.batch_size] = forward_batch.seq_lens - 1
-                forward_batch.oe_req_lens[:forward_batch.batch_size] = 1
+                forward_batch.oe_column_starts[: forward_batch.batch_size] = forward_batch.seq_lens - 1
+                forward_batch.oe_req_lens[: forward_batch.batch_size] = 1
         logits_output = self.model_runner.forward(forward_batch)
         if launch_done:
             launch_done.set()
 
         if get_pp_group().is_last_rank:
             if skip_sample:
-                next_token_ids=None
-                next_token_multi_ids=None
+                next_token_ids = None
+                next_token_multi_ids = None
             else:
-                next_token_ids=self.model_runner.sample(logits_output, forward_batch)
+                next_token_ids = self.model_runner.sample(logits_output, forward_batch)
                 if forward_batch.temp_multi_ids is not None:
                     # Multi id decoding is completed by multimodal module itself
-                    assert next_token_ids.shape==(forward_batch.batch_size,)
-                    assert len(forward_batch.temp_multi_ids.shape)==2 and forward_batch.temp_multi_ids.shape[
-                        0]==forward_batch.batch_size, f"\033[31m[{forward_batch=}]\033[0m"
-                    next_token_multi_ids=forward_batch.temp_multi_ids
+                    assert next_token_ids.shape == (forward_batch.batch_size,)
+                    assert len(forward_batch.temp_multi_ids.shape) == 2 and forward_batch.temp_multi_ids.shape[0] == forward_batch.batch_size, (
+                        f"\033[31m[{forward_batch=}]\033[0m"
+                    )
+                    next_token_multi_ids = forward_batch.temp_multi_ids
                 else:
-                    next_token_multi_ids=None
+                    next_token_multi_ids = None
                 if model_worker_batch.sampling_info.thinking_budgets is not None:  # check whether thinking budget is out of
                     model_worker_batch.sampling_info.apply_thinking_budgets(model_worker_batch.seq_lens, next_token_ids)
                 if model_worker_batch.disagg_set_aux_fn is not None:
@@ -308,9 +301,7 @@ class TpModelWorker:
         return embeddings
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
-        )
+        success, message = self.model_runner.update_weights_from_disk(recv_req.model_path, recv_req.load_format)
         return success, message
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
@@ -324,18 +315,15 @@ class TpModelWorker:
         )
         return success, message
 
-    def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
-    ):
-        success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.name, recv_req.dtype, recv_req.shape
-        )
+    def update_weights_from_distributed(self, recv_req: UpdateWeightsFromDistributedReqInput):
+        success, message = self.model_runner.update_weights_from_distributed(recv_req.name, recv_req.dtype, recv_req.shape)
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=MultiprocessingSerializer.deserialize(
-                # TODO(2025-09-06 yanghao32): Support weight update for different parallel modes, currently only supports attn_tp_size==dense_dp_size case
+                # TODO(2025-09-06 yanghao32): Support weight update for different parallel
+                # modes, currently only supports attn_tp_size==dense_dp_size case
                 recv_req.serialized_named_tensors[self.global_rank]
             ),
             load_format=recv_req.load_format,
@@ -343,7 +331,5 @@ class TpModelWorker:
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
-        parameter = self.model_runner.get_weights_by_name(
-            recv_req.name, recv_req.truncate_size
-        )
+        parameter = self.model_runner.get_weights_by_name(recv_req.name, recv_req.truncate_size)
         return parameter

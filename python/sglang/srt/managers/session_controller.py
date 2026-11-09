@@ -10,8 +10,9 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 import uuid
-from typing import Dict, Optional
+from typing import Optional
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.req import Req
@@ -23,7 +24,7 @@ class SessionReqNode:
         self.parent = parent
         if parent is not None:
             parent.childs.append(self)
-        self.childs = [] if not childs else childs
+        self.childs = childs if childs else []
 
     def clear_childs(self, req_dict):
         for req_node in self.childs:
@@ -54,7 +55,7 @@ class SessionReqNode:
             prefix += " -- " + self.childs[0].req.rid
             ret = self.childs[0]._str_helper(prefix)
             for child in self.childs[1:]:
-                prefix = " " * len(origin_prefix) + " \- " + child.req.rid
+                prefix = " " * len(origin_prefix) + r" \- " + child.req.rid
                 ret += child._str_helper(prefix)
             return ret
 
@@ -63,8 +64,8 @@ class Session:
     def __init__(self, capacity_of_str_len: int, session_id: Optional[str] = None):
         self.session_id = session_id if session_id is not None else uuid.uuid4().hex
         self.capacity_of_str_len = capacity_of_str_len
-        self.req_nodes: Dict[str, SessionReqNode] = {}
-    
+        self.req_nodes: dict[str, SessionReqNode] = {}
+
     def create_req(self, req: TokenizedGenerateReqInput, tokenizer):
         assert req.session_params is not None
         session_params = req.session_params
@@ -92,9 +93,7 @@ class Session:
                     last_req_node = self.req_nodes[session_params.rid]
                     last_req = last_req_node.req
                     if not last_req.finished():
-                        logging.warning(
-                            "The request in a session is appending to a request that hasn't finished."
-                        )
+                        logging.warning("The request in a session is appending to a request that hasn't finished.")
                         abort = True
 
         if last_req is not None:
@@ -102,22 +101,14 @@ class Session:
             if tokenizer is not None and req.input_ids[0] == tokenizer.bos_token_id:
                 req.input_ids = req.input_ids[1:]
 
-            input_ids = (
-                last_req.origin_input_ids
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
+            input_ids = last_req.origin_input_ids + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
             if session_params.offset and session_params.offset != 0:
                 input_ids = input_ids[: session_params.offset] + req.input_ids
             else:
                 input_ids += req.input_ids
-            input_ids_unpadded = (
-                last_req.origin_input_ids_unpadded
-                + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
-            )
+            input_ids_unpadded = last_req.origin_input_ids_unpadded + last_req.output_ids[: last_req.sampling_params.max_new_tokens]
             if session_params.offset and session_params.offset != 0:
-                input_ids_unpadded = (
-                    input_ids_unpadded[: session_params.offset] + req.input_ids
-                )
+                input_ids_unpadded = input_ids_unpadded[: session_params.offset] + req.input_ids
             else:
                 input_ids_unpadded += req.input_ids
         else:

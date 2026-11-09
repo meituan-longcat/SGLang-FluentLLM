@@ -1,5 +1,6 @@
 import torch
 
+
 def fast_topk(values, topk, dim):
     if topk == 1:
         # Use max along the specified dimension to get both value and index

@@ -32,7 +32,7 @@ for i in range(len(parts)):
         tmp_len = 0
 
 for i, s in enumerate(segments):
-    print(i, len(t.encode(segments[i])))
+    print(i, len(t.encode(s)))
 
 # Dump
 with open("questions.jsonl", "w") as fout:

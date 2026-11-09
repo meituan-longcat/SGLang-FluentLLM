@@ -4,19 +4,20 @@ from typing import Optional
 import torch
 
 from sglang.srt.layers.moe.gemms.triton_common import moe_align_block_size, moe_sum_reduce_torch_compile, moe_sum_reduce_triton
-from sglang.srt.layers.activation import SwigluArg, silu_and_mul
+from sglang.srt.ops.activation import SwigluArg, silu_and_mul
 
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     _support_tensor_descriptor = True
-except:
+except Exception:
     _support_tensor_descriptor = False
 
 
 def support_tensor_descriptor():
     return _support_tensor_descriptor
+
 
 @functools.lru_cache()
 def _moe_use_tma():
@@ -24,28 +25,14 @@ def _moe_use_tma():
 
 
 class TritonExecutor:
-    def __init__(
-        self,
-        gate_up_gemm,
-        down_gemm,
-        get_config_func,
-        activation: str,
-        swiglu_arg: Optional[SwigluArg] = None
-    ):
+    def __init__(self, gate_up_gemm, down_gemm, get_config_func, activation: str, swiglu_arg: Optional[SwigluArg] = None):
         self.gate_up_gemm = gate_up_gemm
         self.down_gemm = down_gemm
         self.get_config_func = get_config_func
         self.activation = activation
         self.swiglu_arg = swiglu_arg
 
-    def forward(
-        self,
-        layer,
-        hidden_states,
-        topk_output,
-        num_global_tokens,
-        max_num_tokens_per_gpu
-    ):
+    def forward(self, layer, hidden_states, topk_output, num_global_tokens, max_num_tokens_per_gpu):
         assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
 
         routed_scaling_factor = None
@@ -59,28 +46,14 @@ class TritonExecutor:
 
         config, (down_config, max_block_m) = self.get_config_func(M=M)
 
-        gate_up_moe_use_tma = (
-            _moe_use_tma()
-            and config is not None
-            and config.pop("USE_TMA", False)
-        )
+        gate_up_moe_use_tma = _moe_use_tma() and config is not None and config.pop("USE_TMA", False)
 
-        down_moe_use_tma = (
-            _moe_use_tma()
-            and down_config is not None
-            and down_config.pop("USE_TMA", False)
-        )
+        down_moe_use_tma = _moe_use_tma() and down_config is not None and down_config.pop("USE_TMA", False)
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], E
-        )
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
 
         max_num_active_experts = min(M * topk, E + 1)
-        padded_tokens = (
-            max_num_active_experts * (config["BLOCK_SIZE_M"] - 1)
-            if down_moe_use_tma
-            else 0
-        )
+        padded_tokens = max_num_active_experts * (config["BLOCK_SIZE_M"] - 1) if down_moe_use_tma else 0
         intermediate_cache1 = torch.empty(
             (M * topk + padded_tokens, N),
             device=device,

@@ -8,9 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import tiktoken
-from tqdm import tqdm
-
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from tqdm import tqdm
 
 choices = ["A", "B", "C", "D"]
 
@@ -29,17 +28,15 @@ def format_example(df, idx, include_answer=True):
     prompt = df.iloc[idx, 0]
     k = df.shape[1] - 2
     for j in range(k):
-        prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j + 1])
+        prompt += f"\n{choices[j]}. {df.iloc[idx, j + 1]}"
     prompt += "\nAnswer:"
     if include_answer:
-        prompt += " {}\n\n".format(df.iloc[idx, k + 1])
+        prompt += f" {df.iloc[idx, k + 1]}\n\n"
     return prompt
 
 
 def gen_prompt(train_df, subject, k=-1):
-    prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
-        format_subject(subject)
-    )
+    prompt = f"The following are multiple choice questions (with answers) about{format_subject(subject)}.\n\n"
     if k == -1:
         k = train_df.shape[0]
     for i in range(k):
@@ -104,9 +101,7 @@ def evaluate(args, subject, dev_df, test_df, call_generate):
     cors = np.array(cors)
 
     print(
-        "Average accuracy {:.3f}, latency {:.2f}, #q: {} - {}".format(
-            acc, latency, len(prompts), subject
-        )
+        f"Average accuracy {acc:.3f}, latency {latency:.2f}, #q: {len(prompts)} - {subject}"
     )
 
     return cors, acc, latency
@@ -142,10 +137,10 @@ def main(args):
         num_requests += len(test_df)
 
     total_latency = np.sum(all_latencies)
-    print("Total latency: {:.3f}".format(total_latency))
+    print(f"Total latency: {total_latency:.3f}")
 
     weighted_acc = np.mean(np.concatenate(all_cors))
-    print("Average accuracy: {:.3f}".format(weighted_acc))
+    print(f"Average accuracy: {weighted_acc:.3f}")
 
     # Write results
     with open(args.result_file, "a") as fout:

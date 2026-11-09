@@ -1,4 +1,4 @@
-from typing import Callable, List, Tuple
+from typing import Callable
 
 import torch
 
@@ -6,7 +6,7 @@ LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
 
 def mamba_v2_sharded_weight_loader(
-    shard_spec: List[Tuple[int, int, float]],
+    shard_spec: list[tuple[int, int, float]],
     tp_size: int,
     tp_rank: int,
 ) -> LoaderFunction:
@@ -54,7 +54,9 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
+                loaded_start_idx : (
+                    loaded_start_idx + take
+                )  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries

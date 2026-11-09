@@ -67,7 +67,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
-    output_dtype = None,
+    output_dtype=None,
 ) -> torch.Tensor:
     if output_dtype is None:
         output_dtype = input.dtype
@@ -79,9 +79,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
-        return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
-        )
+        return triton_w8a8_block_fp8_linear(input, weight, block_size, weight_scale, input_scale, bias)
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -98,10 +96,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     else:
         q_input, x_scale = input_2d, input_scale
 
-    output = dense_deep_gemm(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
-    )
+    output = dense_deep_gemm(q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype)
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
-

@@ -16,47 +16,48 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
-from typing import Any, Dict, Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
 from torch import nn
 
 from sglang.srt.utils import is_npu
+
 __is_npu__ = is_npu()
 if __is_npu__:
-    import torch_npu
+    pass
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_group, get_dense_tp_group
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_group, get_dense_tp_group
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+)
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
 )
-
-from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.utils import add_prefix
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
-
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.utils import add_prefix
 
 Qwen3Config = None
+
 
 class Qwen3Attention(nn.Module):
     def __init__(
@@ -66,7 +67,7 @@ class Qwen3Attention(nn.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 1000000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         head_dim: Optional[int] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
@@ -116,7 +117,7 @@ class Qwen3Attention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            reduce_results=False
+            reduce_results=False,
         )
 
         self.rotary_emb = get_rope(
@@ -135,9 +136,7 @@ class Qwen3Attention(nn.Module):
             # prefix=add_prefix("attn", prefix),
         )
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         q_by_head = q.reshape(-1, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
@@ -145,7 +144,7 @@ class Qwen3Attention(nn.Module):
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
         return q, k
-    
+
     def _rotate_half(self, x):
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
@@ -159,7 +158,7 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -188,6 +187,7 @@ class Qwen3Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+
 class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -211,7 +211,7 @@ class Qwen3DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             head_dim=head_dim,
             max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
+            quant_config=(None if "self_attn" in getattr(config, "disable_quant_module", []) else quant_config),
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
@@ -224,9 +224,7 @@ class Qwen3DecoderLayer(nn.Module):
             # prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -234,8 +232,8 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos_sin: Optional[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -258,9 +256,12 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         else:
-            hidden_states, residual, _ = self.post_attention_layernorm.forward_with_allreduce_fusion(get_attention_tp_group(), hidden_states, residual)
+            hidden_states, residual, _ = self.post_attention_layernorm.forward_with_allreduce_fusion(
+                get_attention_tp_group(), hidden_states, residual
+            )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
 
 class Qwen3Model(Qwen2Model):
     def __init__(
@@ -275,6 +276,7 @@ class Qwen3Model(Qwen2Model):
             # prefix=prefix,
             decoder_layer_type=Qwen3DecoderLayer,
         )
+
 
 class Qwen3ForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -308,9 +310,7 @@ class Qwen3ForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -328,11 +328,9 @@ class Qwen3ForCausalLM(nn.Module):
         forward_batch.req_pool_indices_cpu = None
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -342,7 +340,7 @@ class Qwen3ForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        '''
+        """
         'model.layers.0.self_attn.q_norm.weight',
         'model.layers.0.self_attn.k_norm.weight',
         'model.layers.0.self_attn.qkv_proj.weight',
@@ -351,7 +349,7 @@ class Qwen3ForCausalLM(nn.Module):
         'model.layers.0.mlp.down_proj.weight',
         'model.layers.0.input_layernorm.weight',
         'model.layers.0.post_attention_layernorm.weight'
-        '''
+        """
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "Embedding" in self.config.name_or_path:
@@ -360,10 +358,7 @@ class Qwen3ForCausalLM(nn.Module):
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
+                and (layer_id < self.model.start_layer or layer_id >= self.model.end_layer)
             ):
                 continue
 

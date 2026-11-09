@@ -11,6 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# ruff: noqa: S105
+# ruff: noqa: S106
 """Conversation chat templates.
 
 This module provides conversation template definitions, data structures, and utilities
@@ -28,7 +30,7 @@ Key components:
 import dataclasses
 import re
 from enum import IntEnum, auto
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Optional, Union
 
 from typing_extensions import Literal
 
@@ -77,9 +79,9 @@ class Conversation:
     # The system message
     system_message: str = ""
     # The names of two roles
-    roles: Tuple[str] = ("USER", "ASSISTANT")
+    roles: tuple[str] = ("USER", "ASSISTANT")
     # All messages. Each item is (role, message).
-    messages: List[List[str]] = ()
+    messages: list[list[str]] = ()
     # The number of few shot examples
     offset: int = 0
     # The separator style and configurations
@@ -87,18 +89,18 @@ class Conversation:
     sep: str = "\n"
     sep2: str = None
     # Stop criteria (the default one is EOS token)
-    stop_str: Union[str, List[str]] = None
+    stop_str: Union[str, list[str]] = None
     # The string that represents an image token in the prompt
     image_token: str = "<image>"
     video_token: str = "<video>"
     audio_token: str = "<audio>"
 
-    image_data: Optional[List[ImageData]] = None
-    video_data: Optional[List[str]] = None
-    modalities: Optional[List[str]] = None
+    image_data: Optional[list[ImageData]] = None
+    video_data: Optional[list[str]] = None
+    modalities: Optional[list[str]] = None
     stop_token_ids: Optional[int] = None
 
-    audio_data: Optional[List[str]] = None
+    audio_data: Optional[list[str]] = None
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -164,24 +166,17 @@ class Conversation:
             return ret
         elif self.sep_style == SeparatorStyle.RWKV:
             ret = system_prompt
-            for i, (role, message) in enumerate(self.messages):
+            for _i, (role, message) in enumerate(self.messages):
                 if message:
-                    ret += (
-                        role
-                        + ": "
-                        + message.replace("\r\n", "\n").replace("\n\n", "\n")
-                    )
+                    ret += role + ": " + message.replace("\r\n", "\n").replace("\n\n", "\n")
                     ret += "\n\n"
                 else:
                     ret += role + ":"
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA4:
             # begin_of_text is added by default
-            if self.system_message:
-                ret = system_prompt
-            else:
-                ret = ""
-            for i, (role, message) in enumerate(self.messages):
+            ret = system_prompt if self.system_message else ""
+            for _i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += f"<|header_start|>{role}<|header_end|>\n\n"
                     ret += f"{message.strip()}<|eot|>"
@@ -189,11 +184,8 @@ class Conversation:
                     ret += f"<|header_start|>{role}<|header_end|>\n\n"
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA3:
-            if self.system_message:
-                ret = system_prompt
-            else:
-                ret = ""
-            for i, (role, message) in enumerate(self.messages):
+            ret = system_prompt if self.system_message else ""
+            for _i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += f"<|start_header_id|>{role}<|end_header_id|>\n\n"
                     ret += f"{message.strip()}<|eot_id|>"
@@ -202,11 +194,8 @@ class Conversation:
             return ret
         elif self.sep_style == SeparatorStyle.LLAMA2:
             seps = [self.sep, self.sep2]
-            if self.system_message:
-                ret = system_prompt
-            else:
-                ret = "[INST] "
-            for i, (role, message) in enumerate(self.messages):
+            ret = system_prompt if self.system_message else "[INST] "
+            for i, (_role, message) in enumerate(self.messages):
                 tag = self.roles[i % 2]
                 if message:
                     if i == 0:
@@ -220,10 +209,7 @@ class Conversation:
             # source: https://huggingface.co/THUDM/chatglm-6b/blob/1d240ba371910e9282298d4592532d7f0f3e9f3e/modeling_chatglm.py#L1302-L1308
             # source2: https://huggingface.co/THUDM/chatglm2-6b/blob/e186c891cf64310ac66ef10a87e6635fa6c2a579/modeling_chatglm.py#L926
             round_add_n = 1 if self.name == "chatglm2" else 0
-            if system_prompt:
-                ret = system_prompt + self.sep
-            else:
-                ret = ""
+            ret = system_prompt + self.sep if system_prompt else ""
 
             for i, (role, message) in enumerate(self.messages):
                 if i % 2 == 0:
@@ -323,10 +309,7 @@ class Conversation:
             return ret
         elif self.sep_style == SeparatorStyle.DeepSeekVL2:
             seps = [self.sep, self.sep2]
-            if system_prompt == "" or system_prompt is None:
-                ret = ""
-            else:
-                ret = system_prompt + seps[0]
+            ret = "" if system_prompt == "" or system_prompt is None else system_prompt + seps[0]
             for i, (role, message) in enumerate(self.messages):
                 if message:
                     ret += role + ": " + message + seps[i % 2]
@@ -362,9 +345,7 @@ class Conversation:
             for role, message in self.messages:
                 if message:
                     while self.audio_token in message:
-                        message = message.replace(
-                            self.audio_token, self.audio_token.format(idx=counter), 1
-                        )
+                        message = message.replace(self.audio_token, self.audio_token.format(idx=counter), 1)
                         counter += 1
 
                     ret += role + "\n" + message + self.sep
@@ -406,7 +387,7 @@ class Conversation:
     def to_gradio_chatbot(self):
         """Convert the conversation to gradio chatbot format."""
         ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset :]):
+        for i, (_role, msg) in enumerate(self.messages[self.offset :]):
             if i % 2 == 0:
                 ret.append([msg, None])
             else:
@@ -415,10 +396,7 @@ class Conversation:
 
     def to_openai_api_messages(self):
         """Convert the conversation to OpenAI chat completion format."""
-        if self.system_message == "":
-            ret = []
-        else:
-            ret = [{"role": "system", "content": self.system_message}]
+        ret = [] if self.system_message == "" else [{"role": "system", "content": self.system_message}]
 
         for i, (_, msg) in enumerate(self.messages[self.offset :]):
             if i % 2 == 0:
@@ -456,16 +434,14 @@ class Conversation:
 
 
 # A global registry for all conversation templates
-chat_templates: Dict[str, Conversation] = {}
-matching_function_registry: List[Callable] = []
+chat_templates: dict[str, Conversation] = {}
+matching_function_registry: list[Callable] = []
 
 
 def register_conv_template(template: Conversation, override: bool = False):
     """Register a new conversation template."""
     if not override:
-        assert (
-            template.name not in chat_templates
-        ), f"{template.name} has been registered."
+        assert template.name not in chat_templates, f"{template.name} has been registered."
 
     chat_templates[template.name] = template
 
@@ -486,9 +462,7 @@ def chat_template_exists(template_name: str) -> bool:
     return template_name in chat_templates
 
 
-def generate_embedding_convs(
-    texts: List[str], images: List[str], template_name: str
-) -> List[Conversation]:
+def generate_embedding_convs(texts: list[str], images: list[str], template_name: str) -> list[Conversation]:
     conv_template = chat_templates[template_name].copy()
     convs = []
     for text, image in zip(texts, images):
@@ -514,11 +488,7 @@ def generate_embedding_convs(
         real_content = ""
 
         if image is not None:
-            image_token = (
-                conv.image_token + "\n"
-                if conv.name != "gme-qwen2-vl"
-                else conv.image_token
-            )
+            image_token = conv.image_token + "\n" if conv.name != "gme-qwen2-vl" else conv.image_token
             real_content += image_token
         if text is not None:
             real_content += text
@@ -536,27 +506,20 @@ _MODELS_REQUIRING_MODALITY_SUPPLEMENT = {"deepseek-vl2"}
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/5124f5bf51b83e6f344c1bc6652e8c4d81313b34/vllm/entrypoints/chat_utils.py#L856
-def _get_full_multimodal_text_prompt(
-    modality_token: str, modality_count: int, text_prompt: str
-) -> str:
+def _get_full_multimodal_text_prompt(modality_token: str, modality_count: int, text_prompt: str) -> str:
     """Combine multimodal prompts for a multimodal language model."""
 
     # For any existing placeholder in the text prompt, we leave it as is
     left: int = modality_count - text_prompt.count(modality_token)
     if left < 0:
-        raise ValueError(
-            f"Found more '{modality_token}' placeholders in input prompt than "
-            "actual multimodal data items."
-        )
+        raise ValueError(f"Found more '{modality_token}' placeholders in input prompt than actual multimodal data items.")
 
     # NOTE: For now we always add missing modality_token at the front of
     # the prompt. This may change to be customizable in the future.
     return "\n".join([modality_token] * left + [text_prompt])
 
 
-def generate_chat_conv(
-    request: ChatCompletionRequest, template_name: str
-) -> Conversation:
+def generate_chat_conv(request: ChatCompletionRequest, template_name: str) -> Conversation:
     conv = chat_templates[template_name].copy()
     conv = Conversation(
         name=conv.name,
@@ -586,10 +549,7 @@ def generate_chat_conv(
             if isinstance(message.content, str):
                 conv.system_message = message.content
             elif isinstance(message.content, list):
-                if (
-                    len(message.content) != 1
-                    or getattr(message.content[0], "type", None) != "text"
-                ):
+                if len(message.content) != 1 or getattr(message.content[0], "type", None) != "text":
                     raise ValueError("The system message should be a single text.")
                 else:
                     conv.system_message = getattr(message.content[0], "text", "")
@@ -605,14 +565,8 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
-                image_token = (
-                    conv.image_token + "\n"
-                    if conv.name != "qwen2-vl"
-                    else conv.image_token
-                )
-                add_token_as_needed: bool = (
-                    conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
-                )
+                image_token = conv.image_token + "\n" if conv.name != "qwen2-vl" else conv.image_token
+                add_token_as_needed: bool = conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
                 if add_token_as_needed:
                     image_token = ""
 
@@ -629,9 +583,7 @@ def generate_chat_conv(
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
-                        conv.append_image(
-                            content.image_url.url, content.image_url.detail
-                        )
+                        conv.append_image(content.image_url.url, content.image_url.detail)
                     elif content.type == "video_url":
                         real_content += video_token
                         conv.append_video(content.video_url.url)
@@ -639,22 +591,15 @@ def generate_chat_conv(
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)
                 if add_token_as_needed:
-                    real_content = _get_full_multimodal_text_prompt(
-                        conv.image_token, num_image_url, real_content
-                    )
+                    real_content = _get_full_multimodal_text_prompt(conv.image_token, num_image_url, real_content)
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""
             if isinstance(message.content, str):
                 parsed_content = message.content
             elif isinstance(message.content, list):
-                if (
-                    len(message.content) != 1
-                    or getattr(message.content[0], "type", None) != "text"
-                ):
-                    raise ValueError(
-                        "The assistant's response should be a single text."
-                    )
+                if len(message.content) != 1 or getattr(message.content[0], "type", None) != "text":
+                    raise ValueError("The assistant's response should be a single text.")
                 else:
                     parsed_content = getattr(message.content[0], "text", "")
             conv.append_message(conv.roles[1], parsed_content)
@@ -776,7 +721,9 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="llama_3_vision",
-        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_message="You are a helpful language and vision assistant. You are able "
+        "to understand the visual content that the user provides, and assist the user "
+        "with a variety of tasks using natural language.",
         system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
         roles=("user", "assistant"),
         sep_style=SeparatorStyle.LLAMA3,
@@ -789,7 +736,9 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="llava_llama_3",
-        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_message="You are a helpful language and vision assistant. You are able "
+        "to understand the visual content that the user provides, and assist the user "
+        "with a variety of tasks using natural language.",
         system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
         roles=("user", "assistant"),
         sep_style=SeparatorStyle.LLAMA3,
@@ -825,7 +774,16 @@ register_conv_template(
     Conversation(
         name="interns1",
         system_template="<|im_start|>system\n{system_message}",
-        system_message="You are an AI assistant whose name is Intern-S1 (书生大模型).\n- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n- Intern-S1 (书生大模型) can understand and communicate fluently in the language chosen by the user such as English and 中文.\nYou are an expert reasoner with extensive experience in all areas. You approach problems through systematic thinking and rigorous reasoning. Your response should reflect deep understanding and precise logical thinking, making your solution path and reasoning clear to others. Please put your thinking process within <think>...</think> tags.",
+        system_message="You are an AI assistant whose name is Intern-S1 (书生大模型).\n"
+        "- Intern-S1 (书生大模型) is a vision-language model that is developed by Shanghai "
+        "AI Laboratory (上海人工智能实验室).  It is designed to be helpful, honest, and harmless.\n"
+        "- Intern-S1 (书生大模型) can understand and communicate fluently in the language "
+        "chosen by the user such as English and 中文.\n"
+        "You are an expert reasoner with extensive experience in all areas. You approach "
+        "problems through systematic thinking and rigorous reasoning. Your response should "
+        "reflect deep understanding and precise logical thinking, making your solution path "
+        "and reasoning clear to others. Please put your thinking process within "
+        "<think>...</think> tags.",
         roles=("<|im_start|>user\n", "<|im_start|>assistant\n"),
         sep_style=SeparatorStyle.MPT,
         sep="<|im_end|>\n",
@@ -914,7 +872,9 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="janus-pro",
-        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language",
+        system_message="You are a helpful language and vision assistant. You are able "
+        "to understand the visual content that the user provides, and assist the user "
+        "with a variety of tasks using natural language",
         system_template="{system_message}.",
         roles=("User", "Assistant"),
         sep="\n\n",

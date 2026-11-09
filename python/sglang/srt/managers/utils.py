@@ -1,16 +1,13 @@
-import dataclasses
+from http import HTTPStatus
+from typing import Optional
 
-import torch
-
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.req import FinishAbort, Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.utils import get_colorful_logger
-from http import HTTPStatus
-from typing import Optional, List, Union
-
-from sglang.srt.managers.req import FINISH_ABORT, Req
 
 logger = get_colorful_logger(__name__)
+
 
 def get_logprob_from_pp_outputs(
     next_pp_outputs: PPProxyTensors,
@@ -22,12 +19,8 @@ def get_logprob_from_pp_outputs(
         next_token_logprobs=next_pp_outputs["next_token_logprobs"],
         next_token_top_logprobs_val=next_pp_outputs["next_token_top_logprobs_val"],
         next_token_top_logprobs_idx=next_pp_outputs["next_token_top_logprobs_idx"],
-        next_token_token_ids_logprobs_val=next_pp_outputs[
-            "next_token_token_ids_logprobs_val"
-        ],
-        next_token_token_ids_logprobs_idx=next_pp_outputs[
-            "next_token_token_ids_logprobs_idx"
-        ],
+        next_token_token_ids_logprobs_val=next_pp_outputs["next_token_token_ids_logprobs_val"],
+        next_token_token_ids_logprobs_idx=next_pp_outputs["next_token_token_ids_logprobs_idx"],
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],
@@ -35,16 +28,12 @@ def get_logprob_from_pp_outputs(
         input_token_ids_logprobs_idx=next_pp_outputs["input_token_ids_logprobs_idx"],
     )
     extend_input_len_per_req = next_pp_outputs["extend_input_len_per_req"]
-    extend_logprob_start_len_per_req = next_pp_outputs[
-        "extend_logprob_start_len_per_req"
-    ]
+    extend_logprob_start_len_per_req = next_pp_outputs["extend_logprob_start_len_per_req"]
 
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
 
 
-def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
-) -> Optional[str]:
+def validate_input_length(req: Req, max_req_input_len: int, allow_auto_truncate: bool) -> Optional[str]:
     """Validate and potentially truncate input length.
 
     Args:
@@ -71,9 +60,7 @@ def validate_input_length(
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             logger.error(error_msg)
-            req.finished_reason = FINISH_ABORT(
-                error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
-            )
+            req.finished_reason = FinishAbort(error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError")
             return error_msg
 
     return None

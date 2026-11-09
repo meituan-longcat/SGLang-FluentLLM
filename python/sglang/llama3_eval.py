@@ -36,9 +36,7 @@ provider_to_models = {
 }
 
 
-async def fetch_responses(
-    client, prompt, semaphore, index, provider, model_size, output_dir, max_tokens
-):
+async def fetch_responses(client, prompt, semaphore, index, provider, model_size, output_dir, max_tokens):
     output_file = os.path.join(output_dir, f"response_{index}.pkl")
     if os.path.exists(output_file):
         print(f"File {output_file} already exists, skipping.")
@@ -78,16 +76,13 @@ TASK_TO_EVAL_SET = {
 
 class CustomAsyncHTTPXClient(httpx.AsyncClient):
     async def send(self, request: httpx.Request, *args, **kwargs) -> httpx.Response:
-        request.url = httpx.URL(
-            f"https://model-{os.getenv('MODEL_ID')}.api.baseten.co/development/predict"
-        )
+        request.url = httpx.URL(f"https://model-{os.getenv('MODEL_ID')}.api.baseten.co/development/predict")
         return await super().send(request, *args, **kwargs)
 
 
 def get_client(provider):
-    if provider not in "b10":
-        if os.getenv("OPENAI_API_KEY") == None:
-            os.environ["OPENAI_API_KEY"] = "EMPTY"
+    if provider not in "b10" and os.getenv("OPENAI_API_KEY") is None:
+        os.environ["OPENAI_API_KEY"] = "EMPTY"
     return {
         "oai": AsyncOpenAI(base_url="http://127.0.0.1:8000/v1/"),
         "b10": AsyncOpenAI(
@@ -135,9 +130,7 @@ async def benchmark(args):
         )
 
     # Run the tasks with tqdm progress bar
-    for future in tqdm(
-        asyncio.as_completed(tasks), total=len(tasks), desc="Processing tasks"
-    ):
+    for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Processing tasks"):
         await future
 
 
@@ -189,7 +182,7 @@ TASK_TO_ANSWER_EXTRACTOR = {
 
 def get_dataset_from_task(task, response_path, model_size):
     ds_405b = load_dataset(
-        f"meta-llama/Llama-3.1-405B-Instruct-evals",
+        "meta-llama/Llama-3.1-405B-Instruct-evals",
         f"Llama-3.1-405B-Instruct-{task}",
     )
     ds_405b_hash_order = [x[0] for x in ds_405b["latest"]["input_final_prompts_hash"]]
@@ -197,12 +190,12 @@ def get_dataset_from_task(task, response_path, model_size):
     if "70b" in model_size or "8b" in model_size:
         if "70" in model_size:
             ref_model_ds = load_dataset(
-                f"meta-llama/Llama-3.1-70B-Instruct-evals",
+                "meta-llama/Llama-3.1-70B-Instruct-evals",
                 f"Llama-3.1-70B-Instruct-{task}",
             )
         else:
             ref_model_ds = load_dataset(
-                f"meta-llama/Llama-3.1-8B-Instruct-evals",
+                "meta-llama/Llama-3.1-8B-Instruct-evals",
                 f"Llama-3.1-8B-Instruct-{task}",
             )
 
@@ -225,9 +218,8 @@ def analyze(task, response_path, model_size):
     total = len(ds["latest"])
 
     for i in range(0, total):
-        response = pickle.load(
-            open(os.path.join(response_path, f"response_{i}.pkl"), "rb")
-        )
+        with open(os.path.join(response_path, f"response_{i}.pkl"), "rb") as f:
+            response = pickle.load(f)  # noqa: S301
         responses.append(response)
 
     @dataclass
@@ -255,7 +247,7 @@ def analyze(task, response_path, model_size):
         subtask_name_to_stats[subtask].total += 1
 
     micro_stats = Stats()
-    for subtask, stats in subtask_name_to_stats.items():
+    for _subtask, stats in subtask_name_to_stats.items():
         stats.average = stats.correct / stats.total
         stats.meta_average = stats.meta_correct / stats.total
 
@@ -277,9 +269,7 @@ def analyze(task, response_path, model_size):
 
 # Entry point for the script
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Script to run model with specified parameters."
-    )
+    parser = argparse.ArgumentParser(description="Script to run model with specified parameters.")
     parser.add_argument(
         "--model-size",
         type=str,
@@ -298,9 +288,7 @@ if __name__ == "__main__":
         required=True,
         help="Task (e.g., mmlu, mmlu_cot, mmlu_pro, gsm8k)",
     )
-    parser.add_argument(
-        "--num-examples", type=int, default=None, help="Number of examples to process"
-    )
+    parser.add_argument("--num-examples", type=int, default=None, help="Number of examples to process")
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument(
         "--output-dir",

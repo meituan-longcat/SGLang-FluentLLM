@@ -3,7 +3,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.activation import GeluAndMul
+from sglang.srt.ops.activation import GeluAndMul
 
 
 class TestGeluAndMul(unittest.TestCase):

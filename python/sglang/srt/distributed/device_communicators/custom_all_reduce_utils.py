@@ -19,6 +19,7 @@ from typing_extensions import ParamSpec
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.utils import is_npu
+
 __is_npu__ = is_npu()
 if not __is_npu__:
     import pynvml
@@ -34,7 +35,7 @@ def update_environment_variables(envs: Dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s " "from '%s' to '%s'",
+                "Overwriting environment variable %s from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -191,8 +192,7 @@ def can_actually_p2p(
         b = result_queue.get()
         if a != b:
             logger.warning(
-                "Two processes do not agree on the P2P access"
-                " status on %d -> %d, treat as disabled.",
+                "Two processes do not agree on the P2P access status on %d -> %d, treat as disabled.",
                 src,
                 tgt,
             )
@@ -236,15 +236,11 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     # VLLM_CACHE_ROOT -> SGLANG_CACHE_ROOT
     # "~/.cache/vllm" -> "~/.cache/sglang"
     SGLANG_CACHE_ROOT = os.path.expanduser("~/.cache/sglang")
-    path = os.path.join(
-        SGLANG_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
-    )
+    path = os.path.join(SGLANG_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     from sglang.srt.distributed.parallel_state import get_world_group
 
-    if (not is_distributed or get_world_group().local_rank == 0) and (
-        not os.path.exists(path)
-    ):
+    if (not is_distributed or get_world_group().local_rank == 0) and (not os.path.exists(path)):
         # only the local master process (with local_rank == 0) can
         #  enter this block to calculate the cache
         logger.info("generating GPU P2P access cache in %s", path)
@@ -264,18 +260,14 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         # because the subprocess might produce logging output
         with tempfile.NamedTemporaryFile() as output_file:
             input_bytes = pickle.dumps((batch_src, batch_tgt, output_file.name))
-            returned = subprocess.run(
-                [sys.executable, __file__], input=input_bytes, capture_output=True
-            )
+            returned = subprocess.run([sys.executable, __file__], input=input_bytes, capture_output=True)
             # check if the subprocess is successful
             try:
                 returned.check_returncode()
             except Exception as e:
                 # wrap raised exception to provide more information
                 raise RuntimeError(
-                    f"Error happened when batch testing "
-                    f"peer-to-peer access from {batch_src} to {batch_tgt}:\n"
-                    f"{returned.stderr.decode()}"
+                    f"Error happened when batch testing peer-to-peer access from {batch_src} to {batch_tgt}:\n{returned.stderr.decode()}"
                 ) from e
             with open(output_file.name, "rb") as f:
                 result = pickle.load(f)
@@ -314,25 +306,17 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
         for j, peer_handle in enumerate(handles):
             if i < j:
                 try:
-                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(
-                        handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
-                    )
+                    p2p_status = pynvml.nvmlDeviceGetP2PStatus(handle, peer_handle, pynvml.NVML_P2P_CAPS_INDEX_NVLINK)
                     if p2p_status != pynvml.NVML_P2P_STATUS_OK:
                         return False
                 except pynvml.NVMLError:
-                    logger.exception(
-                        "NVLink detection failed. This is normal if your"
-                        " machine has no NVLink equipped."
-                    )
+                    logger.exception("NVLink detection failed. This is normal if your machine has no NVLink equipped.")
                     return False
     return True
 
 
 def is_weak_contiguous(inp: torch.Tensor):
-    return inp.is_contiguous() or (
-        inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-        == inp.numel() * inp.element_size()
-    )
+    return inp.is_contiguous() or (inp.storage().nbytes() - inp.storage_offset() * inp.element_size() == inp.numel() * inp.element_size())
 
 
 __all__ = ["gpu_p2p_access_check"]

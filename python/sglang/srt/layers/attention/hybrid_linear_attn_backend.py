@@ -1,7 +1,10 @@
+import logging
+import os
 from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -12,26 +15,35 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.kda import (
-    chunk_kda,
-    fused_kda_gate,
-    fused_recurrent_kda,
-)
+from sglang.srt.layers.attention.fla.kda import chunk_kda
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.attention.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import fused_gdn_gating
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 
+logger = logging.getLogger(__name__)
+
+try:
+    import flash_kda
+
+    _FLASH_KDA_AVAILABLE = True
+except ImportError:
+    _FLASH_KDA_AVAILABLE = False
+
+_FLASH_KDA_ENABLED = _FLASH_KDA_AVAILABLE and os.getenv("FLA_FLASH_KDA", "1") != "0"
+
+
 @dataclass
 class ForwardMetadata:
     query_start_loc: Optional[torch.Tensor]
     mamba_cache_indices: torch.Tensor
+
 
 class MambaAttnBackend(AttentionBackend):
     """Attention backend using Mamba kernel."""
@@ -40,6 +52,7 @@ class MambaAttnBackend(AttentionBackend):
         super().__init__()
         self.pad_slot_id = -1  # Default pad slot id
         self.device = model_runner.device
+        self.speculative_num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -50,9 +63,7 @@ class MambaAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
         if forward_batch.forward_mode.is_decode_or_idle():
-            query_start_loc = torch.arange(
-                0, bs + 1, dtype=torch.int32, device=self.device
-            )
+            query_start_loc = torch.arange(0, bs + 1, dtype=torch.int32, device=self.device)
         elif forward_batch.forward_mode.is_extend():
             if forward_batch.forward_mode.is_target_verify():
                 query_start_loc = torch.arange(
@@ -63,46 +74,71 @@ class MambaAttnBackend(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
             else:
-                query_start_loc = torch.empty(
-                    (bs + 1,), dtype=torch.int32, device=self.device
-                )
+                query_start_loc = torch.empty((bs + 1,), dtype=torch.int32, device=self.device)
                 query_start_loc[:bs] = forward_batch.extend_start_loc
-                query_start_loc[bs] = (
-                    forward_batch.extend_start_loc[-1]
-                    + forward_batch.extend_seq_lens[-1]
-                )
+                query_start_loc[bs] = forward_batch.extend_start_loc[-1] + forward_batch.extend_seq_lens[-1]
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
-        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
-            forward_batch.req_pool_indices
-        )
+        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(forward_batch.req_pool_indices)
         self.forward_metadata = ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
         )
 
     def init_cuda_graph_state(self, max_num_tokens: int):
-        # max_bs, max_num_tokens
-        # verify_step = max_num_tokens / max_bs
-        verify_step = 2
+        # self.speculative_num_draft_tokens should equal to (max_num_tokens // max_bs)
         for i in range(max_num_tokens):
-            self.state_indices_list.append(
-                torch.full(
-                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
-                )
+            self.state_indices_list.append(torch.full((i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device))
+            self.query_start_loc_list.append(torch.empty((i + 2,), dtype=torch.int32, device=self.device))
+        self.cached_cuda_graph_decode_query_start_loc = torch.arange(0, max_num_tokens + 1, dtype=torch.int32, device=self.device)
+        if self.speculative_num_draft_tokens > 0:
+            self.cached_cuda_graph_verify_query_start_loc = torch.arange(
+                0,
+                max_num_tokens + 1,
+                step=self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
             )
-            self.query_start_loc_list.append(
-                torch.empty((i + 2,), dtype=torch.int32, device=self.device)
-            )
-        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
-            0, max_num_tokens + 1, dtype=torch.int32, device=self.device
+
+    def init_forward_metadata_prefill_capture_cuda_graph(
+        self,
+        forward_batch,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ):
+        # For prefill cuda graph capture, build query_start_loc from extend_seq_lens
+        # extend_seq_lens = seq_lens - prefix_lens (tokens to actually process)
+        extend_seq_lens = seq_lens - prefix_lens
+        query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        query_start_loc[1:] = torch.cumsum(extend_seq_lens[:bs], dim=0)
+
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_indices,
         )
-        self.cached_cuda_graph_verify_query_start_loc = torch.arange(
-            0,
-            max_num_tokens + 1,
-            step=verify_step,
-            dtype=torch.int32,
-            device=self.device,
+
+    def init_forward_metadata_replay_prefill_cuda_graph(
+        self,
+        forward_batch,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        # For prefill cuda graph replay, rebuild query_start_loc
+        extend_seq_lens = seq_lens - prefix_lens
+        query_start_loc = torch.zeros(bs + 1, dtype=torch.int32, device=self.device)
+        query_start_loc[1:] = torch.cumsum(extend_seq_lens[:bs], dim=0)
+
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=query_start_loc,
+            mamba_cache_indices=mamba_indices,
         )
 
     def init_forward_metadata_capture_cuda_graph(
@@ -115,13 +151,9 @@ class MambaAttnBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         if forward_mode.is_decode_or_idle():
-            self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
-            )
+            self.query_start_loc_list[bs - 1].copy_(self.cached_cuda_graph_decode_query_start_loc[: bs + 1])
         elif forward_mode.is_target_verify():
-            self.query_start_loc_list[bs - 1].copy_(
-                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-            )
+            self.query_start_loc_list[bs - 1].copy_(self.cached_cuda_graph_verify_query_start_loc[: bs + 1])
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -143,9 +175,7 @@ class MambaAttnBackend(AttentionBackend):
     ):
         req_pool_indices = req_pool_indices[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
-        num_padding = torch.count_nonzero(
-            seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
-        )
+        num_padding = torch.count_nonzero(seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value())
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -153,28 +183,16 @@ class MambaAttnBackend(AttentionBackend):
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
-                )
+                self.query_start_loc_list[bs - 1].copy_(self.cached_cuda_graph_decode_query_start_loc[: bs + 1])
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
-                )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
-                    bs - num_padding
-                )
+                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding])
+                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(bs - num_padding)
         elif forward_mode.is_target_verify():
             if num_padding == 0:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
+                self.query_start_loc_list[bs - 1].copy_(self.cached_cuda_graph_verify_query_start_loc[: bs + 1])
             else:
-                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
-                )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
-                    (bs - num_padding) * spec_info.draft_token_num
-                )
+                self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding])
+                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_((bs - num_padding) * spec_info.draft_token_num)
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
@@ -211,9 +229,7 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
 
-        conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(
-            layer_id
-        )
+        conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(layer_id)
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -279,8 +295,8 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size = kwargs["attention_tp_size"]
         head_k_dim = kwargs["head_k_dim"]
         head_v_dim = kwargs["head_v_dim"]
-        a = kwargs["a"]
-        b = kwargs["b"]
+        a = kwargs["a"].contiguous()
+        b = kwargs["b"].contiguous()
         A_log = kwargs["A_log"]
         dt_bias = kwargs["dt_bias"]
         layer_id = kwargs["layer_id"]
@@ -305,20 +321,14 @@ class MambaAttnBackend(AttentionBackend):
             )
             conv_states_to_use = conv_states.clone()
         else:
-            conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(
-                layer_id
-            )
+            conv_states, ssm_states, *rest = self.req_to_token_pool.get_mamba_params(layer_id)
             has_initial_states = forward_batch.extend_prefix_lens > 0
             conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-                .contiguous()
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(1, 2).contiguous()
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
                 conv_states_to_use,
@@ -328,21 +338,23 @@ class MambaAttnBackend(AttentionBackend):
                 conv_state_indices=cache_indices[:batch_size],
                 intermediate_conv_window=intermediate_conv_window_cache,
             )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
         else:
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv.transpose(0, 1),
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states_to_use,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            mixed_qkv = (
+                causal_conv1d_fn(
+                    mixed_qkv.transpose(0, 1).contiguous(),
+                    conv_weights,
+                    bias,
+                    activation=activation,
+                    conv_states=conv_states_to_use,
+                    has_initial_state=has_initial_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                )
+                .transpose(0, 1)
+                .contiguous()[:seq_len]
+            )
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -361,11 +373,7 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
-        beta = b.sigmoid()
-        g = fused_gdn_gating(A_log, a, dt_bias)
-
-        g = g.unsqueeze(0)
-        beta = beta.unsqueeze(0)
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
 
         if is_target_verify:
             core_attn_out = fused_recurrent_gated_delta_rule_update(
@@ -383,21 +391,18 @@ class MambaAttnBackend(AttentionBackend):
                 cache_steps=forward_batch.spec_info.draft_token_num,
             )
         else:
-            recurrent_state = ssm_states[cache_indices]
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            core_attn_out = chunk_gated_delta_rule(
                 q=query,
                 k=key,
                 v=value,
                 g=g,
                 beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
                 cu_seqlens=query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-            ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -417,6 +422,34 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state_prefill(self, max_bs: int, kv_indices_buf=None):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_cuda_graph_state_prefill(max_bs, kv_indices_buf)
+
+    def init_forward_metadata_prefill_capture_cuda_graph(
+        self,
+        forward_batch,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_prefill_capture_cuda_graph(forward_batch, bs, num_tokens, seq_lens, prefix_lens, req_pool_indices)
+
+    def init_forward_metadata_replay_prefill_cuda_graph(
+        self,
+        forward_batch,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_metadata_replay_prefill_cuda_graph(forward_batch, bs, num_tokens, seq_lens, req_pool_indices, prefix_lens)
 
     def init_cuda_graph_state(self, max_bs: int):
         for attn_backend in self.attn_backend_list:
@@ -465,6 +498,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.attn_backend_list[0].get_cuda_graph_seq_len_fill_value()
 
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        if layer_id not in self.full_attn_layers:
+            return None
+        return self.attn_backend_list[0].get_indexer_metadata(layer_id, forward_batch)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -477,12 +515,8 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         if layer_id in self.full_attn_layers:
-            return self.attn_backend_list[0].forward_decode(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
-        return self.attn_backend_list[1].forward_decode(
-            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-        )
+            return self.attn_backend_list[0].forward_decode(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+        return self.attn_backend_list[1].forward_decode(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
 
     def forward_extend(
         self,
@@ -496,12 +530,8 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         layer_id = layer.layer_id if layer else kwargs["layer_id"]
         if layer_id in self.full_attn_layers:
-            return self.attn_backend_list[0].forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-            )
-        return self.attn_backend_list[1].forward_extend(
-            q, k, v, layer, forward_batch, save_kv_cache, **kwargs
-        )
+            return self.attn_backend_list[0].forward_extend(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
+        return self.attn_backend_list[1].forward_extend(q, k, v, layer, forward_batch, save_kv_cache, **kwargs)
 
     def forward(
         self,
@@ -529,7 +559,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
         else:
-            return self.forward_extend(
+            layer_id = layer.layer_id if layer else kwargs["layer_id"]
+            o = self.forward_extend(
                 q,
                 k,
                 v,
@@ -538,17 +569,16 @@ class HybridLinearAttnBackend(AttentionBackend):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+            if not forward_batch.forward_mode.is_idle() and getattr(self, "step_counter", None) and layer_id in self.full_attn_layers:
+                self.step_counter.record_cache()
+            return o
 
     def update_mamba_state_after_mtp_verify(self, accepted_length, model):
         request_number = accepted_length.shape[0]
 
-        state_indices_tensor = self.attn_backend_list[
-            1
-        ].forward_metadata.mamba_cache_indices[:request_number]
+        state_indices_tensor = self.attn_backend_list[1].forward_metadata.mamba_cache_indices[:request_number]
 
-        mamba_caches = self.attn_backend_list[
-            1
-        ].req_to_token_pool.get_mamba_params_all_layers()
+        mamba_caches = self.attn_backend_list[1].req_to_token_pool.get_mamba_params_all_layers()
 
         (
             conv_states,
@@ -566,14 +596,64 @@ class HybridLinearAttnBackend(AttentionBackend):
         last_steps = last_steps_all[valid_mask].to(torch.int64)  # [N]
 
         # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, valid_state_indices, :] = intermediate_state_cache[
-            :, valid_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
+        ssm_states[:, valid_state_indices, :] = intermediate_state_cache[:, valid_state_indices, last_steps].to(ssm_states.dtype, copy=False)
 
         # Scatter into conv_states at the chosen cache lines
-        conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[
-            :, valid_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        conv_states[:, valid_state_indices, :, :] = intermediate_conv_window_cache[:, valid_state_indices, last_steps].to(
+            conv_states.dtype, copy=False
+        )
+
+
+def _flash_kda_prefill(q, k, v, g, beta, scale, A_log, dt_bias, lower_bound, ssm_states, cache_indices, cu_seqlens):
+    """FlashKDA prefill with copy-based state management.
+
+    Args:
+        q: [1, T, H, K] bf16
+        k: [1, T, H, K] bf16
+        v: [1, T, H, V] bf16
+        g: [1, T, H, K] bf16 (raw, pre-activation)
+        beta: [1, T, H] bf16 (logits, pre-sigmoid)
+        scale: float
+        A_log: [1, 1, H, 1] fp32
+        dt_bias: [H*K] fp32
+        lower_bound: float
+        ssm_states: [pool_size, H, V, K] state pool
+        cache_indices: [N] int32
+        cu_seqlens: [N+1] int32/int64
+    """
+    H, K = q.shape[2], q.shape[3]
+    N = cu_seqlens.shape[0] - 1
+
+    # Reshape A_log: [1,1,H,1] -> [H]
+    A_log_flat = A_log.reshape(-1)
+    # Reshape dt_bias: [H*K] -> [H, K]
+    dt_bias_2d = dt_bias.reshape(H, K)
+
+    # Copy initial state from pool: [N, H, V, K]
+    initial_state = ssm_states[cache_indices[:N]].contiguous()
+    final_state = torch.empty_like(initial_state)
+    out = torch.empty_like(v)  # [1, T, H, V]
+
+    flash_kda.fwd(
+        q.contiguous().to(torch.bfloat16),
+        k.contiguous().to(torch.bfloat16),
+        v.contiguous().to(torch.bfloat16),
+        g.contiguous().to(torch.bfloat16),
+        beta.contiguous().to(torch.bfloat16),
+        scale,
+        out,
+        A_log=A_log_flat,
+        dt_bias=dt_bias_2d,
+        lower_bound=lower_bound,
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu_seqlens.to(torch.int64),
+    )
+
+    # Write back final state to pool
+    ssm_states[cache_indices[:N]] = final_state.to(ssm_states.dtype)
+    return out
+
 
 class KimiLinearAttnBackend(MambaAttnBackend):
     """Attention backend using Mamba kernel."""
@@ -607,6 +687,7 @@ class KimiLinearAttnBackend(MambaAttnBackend):
         hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
+        use_fgb_kda = kwargs.get("use_fgb_kda", False)
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         q_conv_state, k_conv_state, v_conv_state = layer_cache["conv"]
@@ -643,33 +724,48 @@ class KimiLinearAttnBackend(MambaAttnBackend):
             conv_state_indices=cache_indices,
         )
 
-        q, k, v = map(
-            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
-        )
+        q, k, v = map(lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v))
 
-        beta = b_proj(hidden_states)[0].float().sigmoid()
+        if use_fgb_kda:
+            if isinstance(b_proj, torch.nn.Sequential):
+                beta = b_proj[1](b_proj[0](hidden_states)[0])[0].sigmoid()
+            else:
+                beta = b_proj(hidden_states)[0].sigmoid()
+            beta = rearrange(beta, "n (h d) -> 1 n h d", d=head_dim)
+            beta = torch.sqrt(beta + 1e-10)
+            q = F.normalize(q, p=2, dim=-1)
+            k = F.normalize(k, p=2, dim=-1)
+            k = k * beta
+            v = v * beta
+            # Construct dummy b so sigmoid(b)≈1.0 (beta already absorbed into k/v)
+            b_for_kernel = torch.full((*q.shape[:3],), 20.0, dtype=q.dtype, device=q.device)
+            use_qk_l2norm_in_kernel = False
+        else:
+            b_for_kernel = b_proj(hidden_states)[0].unsqueeze(0)  # raw logits (pre-sigmoid)
+            use_qk_l2norm_in_kernel = True
 
         g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
+        g = rearrange(g, "n (h d) -> 1 n h d", d=head_dim)
 
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
+        lower_bound = kwargs.get("lower_bound")
 
-        initial_state = ssm_states[cache_indices].contiguous()
-        (
-            core_attn_out,
-            last_recurrent_state,
-        ) = fused_recurrent_kda(
+        core_attn_out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
             q=q,
             k=k,
             v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            use_qk_l2norm_in_kernel=True,
+            a=g,
+            b=b_for_kernel,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
             cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            is_kda=True,
+            lower_bound=lower_bound,
         )
-        ssm_states[cache_indices] = last_recurrent_state
         return core_attn_out
 
     def forward_extend(
@@ -705,6 +801,7 @@ class KimiLinearAttnBackend(MambaAttnBackend):
         hidden_states = kwargs["hidden_states"]
         head_dim = kwargs["head_dim"]
         layer_id = kwargs["layer_id"]
+        use_fgb_kda = kwargs.get("use_fgb_kda", False)
 
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -760,34 +857,63 @@ class KimiLinearAttnBackend(MambaAttnBackend):
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         ).transpose(0, 1)
 
-        q, k, v = map(
-            lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v)
-        )
+        q, k, v = map(lambda x: rearrange(x, "n (h d) -> 1 n h d", d=head_dim), (q, k, v))
 
-        beta = b_proj(hidden_states)[0].float().sigmoid()
+        lower_bound = kwargs.get("lower_bound")
 
         g = f_b_proj(f_a_proj(hidden_states)[0])[0]
-        g = fused_kda_gate(g, A_log, head_dim, g_bias=dt_bias)
+        g = rearrange(g, "n (h d) -> 1 n h d", d=head_dim)
 
-        beta = beta.unsqueeze(0)
-        g = g.unsqueeze(0)
+        if _FLASH_KDA_ENABLED and not use_fgb_kda and lower_bound is not None:
+            # FlashKDA path: pass raw beta logits (pre-sigmoid)
+            beta_logits = b_proj(hidden_states)[0].unsqueeze(0)  # [1, T, H] bf16
 
-        initial_state = ssm_states[cache_indices].contiguous()
-        (
-            core_attn_out,
-            last_recurrent_state,
-        ) = chunk_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state,
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=query_start_loc,
-        )
-        ssm_states[cache_indices] = last_recurrent_state
+            core_attn_out = _flash_kda_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta_logits,
+                scale=head_dim**-0.5,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+            )
+        else:
+            # Triton fallback
+            if use_fgb_kda:
+                if isinstance(b_proj, torch.nn.Sequential):
+                    beta = b_proj[1](b_proj[0](hidden_states)[0])[0].sigmoid()
+                else:
+                    beta = b_proj(hidden_states)[0].sigmoid()
+                beta = rearrange(beta, "n (h d) -> 1 n h d", d=head_dim)
+                beta = torch.sqrt(beta + 1e-10)
+                q = F.normalize(q, p=2, dim=-1)
+                k = F.normalize(k, p=2, dim=-1)
+                k = k * beta
+                v = v * beta
+                beta = torch.ones(beta.shape[:-1], dtype=beta.dtype, device=beta.device)
+                use_qk_l2norm_in_kernel = False
+            else:
+                beta = b_proj(hidden_states)[0].float().sigmoid().unsqueeze(0)
+                use_qk_l2norm_in_kernel = True
+
+            core_attn_out = chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                cu_seqlens=query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=lower_bound,
+            )
 
         return core_attn_out
-

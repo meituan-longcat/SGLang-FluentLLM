@@ -33,7 +33,7 @@ async def update_weights(
     """
     infer_tp_size = device_mesh[device_mesh_key].mesh.size()[0]
     infer_tp_rank = device_mesh[device_mesh_key].get_local_rank()
-    from sglang.srt.patch_torch import monkey_patch_torch_reductions
+    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
     monkey_patch_torch_reductions()
 
@@ -44,17 +44,12 @@ async def update_weights(
     named_tensors_batch = [
         (
             name,
-            MultiprocessingSerializer.serialize(
-                _preprocess_tensor_for_update_weights(tensor.detach())
-            ),
+            MultiprocessingSerializer.serialize(_preprocess_tensor_for_update_weights(tensor.detach())),
         )
         for name, tensor in params_batch
     ]
 
-    if infer_tp_rank == 0:
-        gathered_serialized_batches = [None for _ in range(infer_tp_size)]
-    else:
-        gathered_serialized_batches = None
+    gathered_serialized_batches = [None for _ in range(infer_tp_size)] if infer_tp_rank == 0 else None
 
     # [
     #   [ (name0, ipc_tensor0_tp0), (name1, ipc_tensor1_tp0) ],
@@ -83,18 +78,13 @@ async def update_weights(
             # ]
             (
                 tensor_group[0][0],
-                LocalSerializedTensor(
-                    values=[rank_part[1] for rank_part in tensor_group]
-                ),
+                LocalSerializedTensor(values=[rank_part[1] for rank_part in tensor_group]),
             )
             for tensor_group in logical_tensors
         ]
 
         update_weights_request = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=[
-                MultiprocessingSerializer.serialize(named_tensors)
-                for _ in range(infer_tp_size)
-            ],
+            serialized_named_tensors=[MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)],
             load_format=load_format,
         )
 

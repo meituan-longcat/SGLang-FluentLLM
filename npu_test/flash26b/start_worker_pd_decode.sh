@@ -1,4 +1,6 @@
 #!/bin/bash
+# Override TRITONSERVER_BIN when it is not available on PATH.
+TRITONSERVER_BIN="${TRITONSERVER_BIN:-tritonserver_real}"
 export MC_GID_INDEX=7
 export MC_IB_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 
@@ -9,16 +11,19 @@ declare -px > "${SERVING_DOCKER_LOGS_DIR}/mlp_env.sh"
 
 ps -axu | grep "sglang::" | awk '{ print $2 }' | xargs kill -9
 pkill -9 sglang
-ps -axu | grep "/opt/tritonserver/bin/tritonserver_real" | awk '{ print $2 }' | xargs kill -9
+ps -axu | grep -F -- "${TRITONSERVER_BIN}" | awk '{ print $2 }' | xargs kill -9
 sleep 3
 
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source "${ASCEND_TOOLKIT_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=3000
 
 ulimit -u unlimited
 
-export PYTHONPATH=/home/fluentllm/python:$PYTHONPATH
-export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/Ascend/driver/lib64/driver/:/usr/local/conda/lib:/opt/sglang/fluentllm/router/lib64:$LD_LIBRARY_PATH
+# Default to this checkout; allow a different deployment directory.
+FLUENTLLM_HOME="${FLUENTLLM_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+PYTHON_ENV_ROOT="${VIRTUAL_ENV:-${CONDA_PREFIX:-}}"
+export PYTHONPATH="${FLUENTLLM_HOME}/python${PYTHONPATH:+:${PYTHONPATH}}"
+export LD_LIBRARY_PATH="/usr/local/lib:${ASCEND_DRIVER_PATH:-/usr/local/Ascend/driver}/lib64/driver${PYTHON_ENV_ROOT:+:${PYTHON_ENV_ROOT}/lib}:${FLUENTLLM_HOME}/router/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 export NPROCS_PER_NODE=16
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
@@ -118,7 +123,7 @@ if [ ! -z "${PD_ROLE}" ]; then
   echo "PD_ROLE: ${PD_ROLE}"
 fi
 
-/opt/tritonserver/bin/tritonserver_real \
+"${TRITONSERVER_BIN}" \
 --model-repository=${ARGS_MODEL_REPOSITORY} \
 --model-control-mode explicit \
 --load-model=${ARGS_MODEL_NAME} \

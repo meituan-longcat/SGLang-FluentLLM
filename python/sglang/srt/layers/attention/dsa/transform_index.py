@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Optional
 
 import torch
 import triton
@@ -72,7 +72,7 @@ def transform_index_page_table_decode_fast(
 def transform_index_page_table_prefill_fast(
     page_table: torch.Tensor,
     topk_indices: torch.Tensor,
-    extend_lens_cpu: List[int],
+    extend_lens_cpu: list[int],
     page_size: int = 1,
 ) -> torch.Tensor:
     # TODO(baizhou): can be implemented with another triton kernel
@@ -80,13 +80,13 @@ def transform_index_page_table_prefill_fast(
     result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert len(extend_lens_cpu) == page_table.shape[0]
     offset = 0
-    for i, l in enumerate(extend_lens_cpu):
+    for i, extend_len in enumerate(extend_lens_cpu):
         transform_index_page_table_decode_fast(
-            page_table[i].unsqueeze(0).expand(l, -1),
-            topk_indices[offset : offset + l],
-            result=result[offset : offset + l],
+            page_table[i].unsqueeze(0).expand(extend_len, -1),
+            topk_indices[offset : offset + extend_len],
+            result=result[offset : offset + extend_len],
         )
-        offset += l
+        offset += extend_len
     assert offset == topk_indices.shape[0]
     return result
 
@@ -115,20 +115,20 @@ def transform_index_page_table_decode_ref(
 def transform_index_page_table_prefill_ref(
     page_table: torch.Tensor,
     topk_indices: torch.Tensor,
-    extend_lens_cpu: List[int],
+    extend_lens_cpu: list[int],
     page_size: int = 1,
 ) -> torch.Tensor:
     assert page_size == 1
     result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert len(extend_lens_cpu) == page_table.shape[0]
     offset = 0
-    for i, l in enumerate(extend_lens_cpu):
+    for i, extend_len in enumerate(extend_lens_cpu):
         transform_index_page_table_decode_ref(
-            page_table[i].unsqueeze(0).expand(l, -1),
-            topk_indices[offset : offset + l],
-            result=result[offset : offset + l],
+            page_table[i].unsqueeze(0).expand(extend_len, -1),
+            topk_indices[offset : offset + extend_len],
+            result=result[offset : offset + extend_len],
         )
-        offset += l
+        offset += extend_len
     assert offset == topk_indices.shape[0]
     return result
 

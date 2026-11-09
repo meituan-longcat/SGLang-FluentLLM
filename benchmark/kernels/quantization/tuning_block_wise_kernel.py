@@ -18,7 +18,7 @@ import multiprocessing as mp
 import os
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 import triton
@@ -48,8 +48,8 @@ def w8a8_block_matmul(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: List[int],
-    config: Dict[str, Any],
+    block_size: list[int],
+    config: dict[str, Any],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise quantization.
@@ -227,7 +227,7 @@ def benchmark_config(
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
-    latencies: List[float] = []
+    latencies: list[float] = []
     for i in range(num_iters):
         torch.cuda.synchronize()
         start_event.record()

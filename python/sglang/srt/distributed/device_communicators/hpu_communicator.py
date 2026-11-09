@@ -11,7 +11,6 @@ if is_hpu():
 
 
 class HpuCommunicator:
-
     def __init__(self, group: ProcessGroup):
         if not is_hpu():
             self.disabled = True
@@ -35,15 +34,11 @@ class HpuCommunicator:
             dim += x.dim()
         input_size = x.size()
         # Allocate output tensor.
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=x.dtype, device=x.device
-        )
+        output_tensor = torch.empty((world_size,) + input_size, dtype=x.dtype, device=x.device)
         # All-gather.
         htorch.core.mark_step()
         dist.all_gather_into_tensor(output_tensor, x, group=self.group)
         # Reshape
         output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
+        output_tensor = output_tensor.reshape(input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :])
         return output_tensor

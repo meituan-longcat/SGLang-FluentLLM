@@ -1,19 +1,19 @@
 import json
 from abc import ABC, abstractmethod
-from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from functools import cache
+from typing import Any, Optional
 
 import dill
 import torch
 
 
-@lru_cache(maxsize=None)
+@cache
 def _cache_from_str(json_str: str):
     """Deserialize a json string to a Callable object.
     This function is cached to avoid redundant deserialization.
     """
     data = json.loads(json_str)
-    return dill.loads(bytes.fromhex(data["callable"]))
+    return dill.loads(bytes.fromhex(data["callable"]))  # noqa: S301
 
 
 class CustomLogitProcessor(ABC):
@@ -23,7 +23,7 @@ class CustomLogitProcessor(ABC):
     def __call__(
         self,
         logits: torch.Tensor,
-        custom_param_list: Optional[List[Dict[str, Any]]] = None,
+        custom_param_list: Optional[list[dict[str, Any]]] = None,
     ) -> torch.Tensor:
         """Define the callable behavior."""
         raise NotImplementedError

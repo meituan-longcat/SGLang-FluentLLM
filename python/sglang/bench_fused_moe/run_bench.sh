@@ -1,4 +1,5 @@
-export FLUENTLLM_HOME=/home/wangbo134/fluentllm
+: "${FLUENTLLM_HOME:?Set FLUENTLLM_HOME to the FluentLLM checkout directory before running this script.}"
+export FLUENTLLM_HOME
 export EPS_HOME=${FLUENTLLM_HOME}/3rdparty/eps/
 export PYTHONPATH=${EPS_HOME}/python/:$PYTHONPATH
 export PYTHONPATH=${FLUENTLLM_HOME}/python:${PYTHONPATH}

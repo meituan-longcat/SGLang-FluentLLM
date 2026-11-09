@@ -1,6 +1,5 @@
 import os
 import sys
-from typing import List
 
 try:
     import av
@@ -12,7 +11,7 @@ except ImportError:
 from datasets import load_dataset
 
 
-def find_video_files(video_dir) -> List[str]:
+def find_video_files(video_dir) -> list[str]:
     if os.path.isfile(video_dir):
         return [video_dir]
 
@@ -148,11 +147,6 @@ class NExTQALoader(VideoLoader):
 # main
 if __name__ == "__main__":
     video_dir = "./videos"
-    # video_loader = VideoFileLoader(video_dir, batch_size=16)
-    # for batch in video_loader:
-    #     print(f"Number of videos in batch: {len(batch)}")
-    #     for video_file, num_frames in batch:
-    #         print(f"Video: {video_file} number of frames: {num_frames}")
 
     video_loader = NExTQALoader(video_dir, batch_size=16, dset="test", task="OE")
     for batch in video_loader:
@@ -161,7 +155,3 @@ if __name__ == "__main__":
             print(
                 f"Video: {video_file} number of frames: {num_frames}, prompt: {prompt}"
             )
-        # break
-        # for video_file, prompt in batch:
-        #     print(f"Video: {video_file} prompt: {prompt}")
-        #     break

@@ -8,7 +8,7 @@ from sglang.srt.layers.moe.executors.triton_executor import TritonExecutor
 from sglang.srt.layers.moe.gemms.triton_common import invoke_fused_moe_kernel
 from sglang.srt.layers.moe.gemms.triton_config import try_get_optimal_moe_config
 from sglang.srt.layers.moe.config import DispatcherType
-from sglang.srt.layers.activation import SwigluArg
+from sglang.srt.ops.activation import SwigluArg
 
 
 class TritonGemmWrapper:
@@ -32,10 +32,7 @@ class TritonGemmWrapper:
             block_shape=quant_config.weight_block_size,
             filter_expert=filter_expert,
         )
-        gemm = partial(
-            invoke_fused_moe_kernel,
-            **common
-        )
+        gemm = partial(invoke_fused_moe_kernel, **common)
         self.gate_up_gemm = partial(
             gemm,
             A_scale=None,
@@ -58,7 +55,7 @@ class TritonGemmWrapper:
             (num_local_experts, hidden_size, intermediate_size - padding_size),
             top_k=top_k,
             dtype="fp8_w8a8",
-            block_shape=None,
+            block_shape=quant_config.weight_block_size,
             return_down_config=True,
         )
 

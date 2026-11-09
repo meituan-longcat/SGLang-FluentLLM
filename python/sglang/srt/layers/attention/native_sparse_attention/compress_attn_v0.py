@@ -1,7 +1,9 @@
 import math
+
 import torch
 import triton
 import triton.language as tl
+
 
 @triton.jit
 def _compress_attn_decode(
@@ -12,14 +14,23 @@ def _compress_attn_decode(
     cu_com_blocks,
     score_ptr,
     o_ptr,
-    stride_qb, stride_qh, stride_qd,
-    stride_kl, stride_kh, stride_kd,
-    stride_vl, stride_vh, stride_vd,
-    stride_sco_l, stride_sco_h,
-    stride_ob, stride_oh, stride_od,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_kl,
+    stride_kh,
+    stride_kd,
+    stride_vl,
+    stride_vh,
+    stride_vd,
+    stride_sco_l,
+    stride_sco_h,
+    stride_ob,
+    stride_oh,
+    stride_od,
     sm_scale,
-    BLOCK_D:tl.constexpr = 128,
-    BLOCK_L:tl.constexpr = 64,
+    BLOCK_D: tl.constexpr = 128,
+    BLOCK_L: tl.constexpr = 64,
 ):
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -44,11 +55,7 @@ def _compress_attn_decode(
             mask=(off_n < com_blocks),
             other=0,
         )
-        off_kcache = (
-            kv_loc[:, None] * stride_kl
-            + pid_h * stride_kh
-            + off_d[None, :]
-        )
+        off_kcache = kv_loc[:, None] * stride_kl + pid_h * stride_kh + off_d[None, :]
         k = tl.load(
             kcache_ptr + off_kcache,
             mask=off_n[:, None] < com_blocks,
@@ -64,11 +71,7 @@ def _compress_attn_decode(
         m_ij = tl.maximum(m_i, tl.max(qk, 0))
         p = tl.exp(qk - m_ij)
 
-        off_vcache = (
-            kv_loc[:, None] * stride_vl
-            + pid_h * stride_vh
-            + off_d[None, :]
-        )
+        off_vcache = kv_loc[:, None] * stride_vl + pid_h * stride_vh + off_d[None, :]
         v = tl.load(
             vcache_ptr + off_vcache,
             mask=(off_n[:, None] < com_blocks),
@@ -82,36 +85,41 @@ def _compress_attn_decode(
 
     acc_o = acc_o / l_i
     off_o = pid_b * stride_ob + pid_h * stride_oh + off_d
-    tl.store(o_ptr+off_o, acc_o)
+    tl.store(o_ptr + off_o, acc_o)
     for i in range(loops):
         off_n = i * BLOCK_L + tl.arange(0, BLOCK_L)
         score_off = (com_start_idx + off_n) * stride_sco_l + pid_h * stride_sco_h
-        qk = tl.load(score_ptr+score_off, mask=off_n < com_blocks, other=0)
+        qk = tl.load(score_ptr + score_off, mask=off_n < com_blocks, other=0)
         qk = tl.where(off_n < com_blocks, qk, float("-inf"))
         scores = tl.exp(qk - m_i) / l_i
-        tl.store(score_ptr+score_off, scores, mask=off_n < com_blocks)
-    
+        tl.store(score_ptr + score_off, scores, mask=off_n < com_blocks)
+
 
 def compress_attn_decode_triton(
     q: torch.Tensor,
-    kcache: torch.Tensor, # [total_len, kh, hd]
+    kcache: torch.Tensor,  # [total_len, kh, hd]
     vcache: torch.Tensor,
     cu_com_blocks,
-    compressed_kv_buffer_loc, # []
+    compressed_kv_buffer_loc,  # []
 ):
     bs, qh, hd = q.shape
     flat_com_score = torch.empty(cu_com_blocks[-1].item(), qh, dtype=torch.float32, device=q.device)
     o = torch.zeros_like(q)
     sm_scale = 1 / math.sqrt(hd)
     _compress_attn_decode[(bs, qh)](
-        q, kcache, vcache,
-        compressed_kv_buffer_loc, cu_com_blocks,
+        q,
+        kcache,
+        vcache,
+        compressed_kv_buffer_loc,
+        cu_com_blocks,
         flat_com_score,
         o,
-        *q.stride(), *kcache.stride(), *vcache.stride(),
+        *q.stride(),
+        *kcache.stride(),
+        *vcache.stride(),
         *flat_com_score.stride(),
         *o.stride(),
         sm_scale,
-        BLOCK_D=hd
+        BLOCK_D=hd,
     )
     return o, flat_com_score

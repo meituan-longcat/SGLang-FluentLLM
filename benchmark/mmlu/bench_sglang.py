@@ -6,8 +6,6 @@ import time
 import numpy as np
 import pandas as pd
 import tiktoken
-from tqdm import tqdm
-
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -30,17 +28,15 @@ def format_example(df, idx, include_answer=True):
     prompt = df.iloc[idx, 0]
     k = df.shape[1] - 2
     for j in range(k):
-        prompt += "\n{}. {}".format(choices[j], df.iloc[idx, j + 1])
+        prompt += f"\n{choices[j]}. {df.iloc[idx, j + 1]}"
     prompt += "\nAnswer:"
     if include_answer:
-        prompt += " {}\n\n".format(df.iloc[idx, k + 1])
+        prompt += f" {df.iloc[idx, k + 1]}\n\n"
     return prompt
 
 
 def gen_prompt(train_df, subject, k=-1):
-    prompt = "The following are multiple choice questions (with answers) about{}.\n\n".format(
-        format_subject(subject)
-    )
+    prompt = f"The following are multiple choice questions (with answers) about{format_subject(subject)}.\n\n"
     if k == -1:
         k = train_df.shape[0]
     for i in range(k):
@@ -144,8 +140,8 @@ def main(args):
     weighted_acc = np.mean(cors)
 
     # Print results
-    print("Total latency: {:.3f}".format(latency))
-    print("Average accuracy: {:.3f}".format(weighted_acc))
+    print(f"Total latency: {latency:.3f}")
+    print(f"Average accuracy: {weighted_acc:.3f}")
 
     # Write results
     with open(args.result_file, "a") as fout:

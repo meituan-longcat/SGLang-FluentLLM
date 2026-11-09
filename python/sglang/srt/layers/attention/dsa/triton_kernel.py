@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
@@ -83,9 +83,7 @@ def _act_quant_kernel(
     tl.store(s_ptrs, scale, mask=s_mask)
 
 
-def act_quant(
-    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def act_quant(x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization with Triton.
 
@@ -99,9 +97,7 @@ def act_quant(
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert (
-        x.size(-1) % block_size == 0
-    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    assert x.size(-1) % block_size == 0, f"Last dimension size must be divisible by block_size (block_size={block_size})"
 
     # Flatten all dims except last
     N = x.size(-1)
@@ -136,3 +132,98 @@ def act_quant(
     )
 
     return y, s
+
+
+@triton.jit
+def triton_li_rag_kernel(
+    q_ptr,  # [s, h, d]
+    w_ptr,  # [s, h]
+    k_ptr,  # [l, d]
+    r_ptr,  # [s, l]
+    s_q,
+    s_k,
+    q_stride_s,
+    q_stride_h,
+    q_stride_d,
+    w_stride_s,
+    w_stride_h,
+    k_stride_l,
+    k_stride_d,
+    r_stride_s,
+    r_stride_l,
+    h: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    q_num_per_m: tl.constexpr = BM // h
+
+    off_s = pid * q_num_per_m + tl.arange(0, q_num_per_m)
+    mask_s = off_s < s_q
+    off_h = tl.arange(0, h)
+    off_d = tl.arange(0, BK)
+    # [BK, q_num_per_m, h]
+    q = tl.load(
+        q_ptr + off_s[None, :, None] * q_stride_s + off_h[None, None, :] * q_stride_h + off_d[:, None, None] * q_stride_d,
+        mask=mask_s[None, :, None],
+        other=0.0,
+    )
+    q = tl.reshape(q, (BK, BM))
+    w = tl.load(
+        w_ptr + off_s[:, None] * w_stride_s + off_h[None, :] * w_stride_h,
+        mask=mask_s[:, None],
+        other=0.0,
+    )
+    w = tl.reshape(w, (BM,))
+
+    s_k_loops = tl.cdiv(s_k, BN)
+    off_n = tl.arange(0, BN)
+    for _i in tl.range(s_k_loops, num_stages=3):
+        mask_n = off_n < s_k
+        # [BN, BK]
+        k = tl.load(k_ptr + off_n[:, None] * k_stride_l + off_d[None, :] * k_stride_d, mask=mask_n[:, None], other=0.0)
+        # [BN, BM]
+        s = tl.dot(k, q)
+        s = tl.maximum(s, 0.0)
+        s = s * w[None, :]
+        # [BN, q_num_per_m]
+        r = tl.reshape(s, (BN, q_num_per_m, h)).sum(axis=2)
+        tl.store(r_ptr + off_s[None, :] * r_stride_s + off_n[:, None] * r_stride_l, r, mask=mask_s[None, :] & mask_n[:, None])
+        off_n += BN
+
+
+def indexer_qk_rag(
+    query: torch.Tensor,  # [s, h, d]
+    weights: torch.Tensor,  # [s, h]
+    key: torch.Tensor,  # [l, d]
+    logits: torch.Tensor,  # [s, max_l]
+):
+    s, h, d = query.shape
+    s_, h_ = weights.shape
+    kv_len, d_ = key.shape
+    assert s == s_ and h == h_ and d == d_ and logits.shape[0] == s
+    assert (d > 0) & ((d & (d - 1)) == 0)  # d is power of 2
+    assert (h > 0) & ((h & (h - 1)) == 0)  # h is power of 2
+    BM = 128
+    BN = 128
+    BK = d
+    assert BM % h == 0
+    q_num_per_m = BM // h
+    grid = (triton.cdiv(s, q_num_per_m),)
+    triton_li_rag_kernel[grid](
+        query,
+        weights,
+        key,
+        logits,
+        s,
+        kv_len,
+        *query.stride(),
+        *weights.stride(),
+        *key.stride(),
+        *logits.stride(),
+        h,
+        BM=BM,
+        BN=BN,
+        BK=BK,
+    )

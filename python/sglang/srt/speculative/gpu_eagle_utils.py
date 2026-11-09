@@ -6,32 +6,29 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-
 from flashinfer.sampling import (
+    chain_speculative_sampling_target_only,
     top_k_renorm_prob,
     top_p_renorm_probs,
     verify_chain_greedy,
-    chain_speculative_sampling_target_only,
 )
 
+from sglang.srt.env import global_server_args_dict
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.utils.common import get_device
-from sglang.srt.env import global_server_args_dict
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    pass
 
 
 # ---------------------------------------------------------------------------
 # GPU verification functions (flashinfer-based)
 # ---------------------------------------------------------------------------
 
+
 def gpu_verify_greedy(spec_info, predicts, candidates, target_predict, bs):
     """Greedy verification for GPU using flashinfer."""
-    accept_index = torch.full(
-        (bs, spec_info.spec_steps + 1), -1, dtype=torch.int32, device=get_device()
-    )
+    accept_index = torch.full((bs, spec_info.spec_steps + 1), -1, dtype=torch.int32, device=get_device())
     accept_length = torch.empty((bs,), dtype=torch.int32, device=get_device())
     verify_chain_greedy(
         predicts=predicts,
@@ -40,46 +37,47 @@ def gpu_verify_greedy(spec_info, predicts, candidates, target_predict, bs):
         candidates=candidates.to(torch.int32),
         target_predict=target_predict,
         batch_size=bs,
-        num_draft_tokens=spec_info.draft_token_num
+        num_draft_tokens=spec_info.draft_token_num,
     )
+
+    # 支持 --speculative-force-accept-num 参数：强制接受固定数量 token（用于 debug）
+    force_accept_num = global_server_args_dict.get("speculative_force_accept_num", -1)
+    if force_accept_num >= 0:
+        # 限制在有效范围内：[0, spec_steps]
+        max_draft = spec_info.spec_steps
+        forced = max(0, min(force_accept_num, max_draft))
+        accept_length.fill_(forced)
+        # 重建 accept_index: [0, 1, 2, ..., forced]
+        # 索引 0 是 bonus，1..forced 是强制的 draft token
+        accept_index.fill_(-1)
+        accept_index[:, 0] = 0  # bonus
+        for i in range(1, forced + 1):
+            accept_index[:, i] = i
+
     return predicts, accept_index, accept_length
 
 
 def gpu_verify_sample(spec_info, predicts, candidates, forward_batch, logits_output, bs):
     """Probabilistic sampling verification for GPU using flashinfer."""
-    accept_index = torch.full(
-        (bs, spec_info.spec_steps + 1), -1, dtype=torch.int32, device=get_device()
-    )
+    accept_index = torch.full((bs, spec_info.spec_steps + 1), -1, dtype=torch.int32, device=get_device())
     accept_length = torch.empty((bs,), dtype=torch.int32, device=get_device())
     sampling_info = forward_batch.sampling_info
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, spec_info.draft_token_num, dim=0
-    )
+    expanded_temperature = torch.repeat_interleave(sampling_info.temperatures, spec_info.draft_token_num, dim=0)
 
-    target_probs = F.softmax(
-        logits_output.next_token_logits / expanded_temperature, dim=-1
-    )
+    target_probs = F.softmax(logits_output.next_token_logits / expanded_temperature, dim=-1)
     target_probs = top_k_renorm_prob(
         target_probs,
-        torch.repeat_interleave(
-            sampling_info.top_ks, spec_info.draft_token_num, dim=0
-        ),
+        torch.repeat_interleave(sampling_info.top_ks, spec_info.draft_token_num, dim=0),
     )
     target_probs = top_p_renorm_probs(
         target_probs,
-        torch.repeat_interleave(
-            sampling_info.top_ps, spec_info.draft_token_num, dim=0
-        ),
+        torch.repeat_interleave(sampling_info.top_ps, spec_info.draft_token_num, dim=0),
     )
     target_probs = target_probs.reshape(bs, spec_info.draft_token_num, -1)
 
-    draft_probs = torch.zeros(
-        target_probs.shape, dtype=torch.float32, device=get_device()
-    )
+    draft_probs = torch.zeros(target_probs.shape, dtype=torch.float32, device=get_device())
     coins = torch.rand_like(candidates, dtype=torch.float32, device=get_device())
-    coins_for_final_sampling = torch.rand(
-        (bs,), dtype=torch.float32, device=get_device()
-    )
+    coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=get_device())
     chain_speculative_sampling_target_only(
         predicts=predicts,
         accept_index=accept_index,
@@ -89,14 +87,24 @@ def gpu_verify_sample(spec_info, predicts, candidates, forward_batch, logits_out
         uniform_samples_for_final_sampling=coins_for_final_sampling,
         target_probs=target_probs,
         draft_probs=draft_probs,
-        threshold_single=global_server_args_dict[
-            "speculative_accept_threshold_single"
-        ],
-        threshold_acc=global_server_args_dict[
-            "speculative_accept_threshold_acc"
-        ],
+        threshold_single=global_server_args_dict["speculative_accept_threshold_single"],
+        threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
         deterministic=True,
     )
+
+    # 支持 --speculative-force-accept-num 参数：强制接受固定数量 token（用于 debug）
+    force_accept_num = global_server_args_dict.get("speculative_force_accept_num", -1)
+    if force_accept_num >= 0:
+        # 限制在有效范围内：[0, spec_steps]
+        max_draft = spec_info.spec_steps
+        forced = max(0, min(force_accept_num, max_draft))
+        accept_length.fill_(forced)
+        # 重建 accept_index: [0, 1, 2, ..., forced]
+        accept_index.fill_(-1)
+        accept_index[:, 0] = 0  # bonus
+        for i in range(1, forced + 1):
+            accept_index[:, i] = i
+
     return predicts, accept_index, accept_length
 
 
@@ -112,11 +120,9 @@ def rearrange_accept_index(
     accept_len = tl.load(accept_length_ptr + pid) + 1
     cum_accept_len = 0
     for i in range(pid):
-        cum_accept_len += (tl.load(accept_length_ptr + i) + 1)
+        cum_accept_len += tl.load(accept_length_ptr + i) + 1
     store_offset = tl.arange(0, num_tokens_per_req_upper)
-    accept_index_load_offset = (
-        tl.arange(0, num_tokens_per_req_upper) + pid * accept_index_stride
-    )
+    accept_index_load_offset = tl.arange(0, num_tokens_per_req_upper) + pid * accept_index_stride
     accept_index = tl.load(accept_index_ptr + accept_index_load_offset)
     tl.store(
         output_ptr + store_offset + cum_accept_len,
@@ -131,15 +137,40 @@ def gpu_verify(spec_info, forward_batch, logits_output, candidates, bs):
     predicts = torch.zeros(predict_shape, dtype=torch.int32, device=get_device())
 
     if forward_batch.spec_info.is_all_greedy:
-        target_predict = torch.argmax(
-            logits_output.next_token_logits, dim=-1
-        ).reshape(bs, spec_info.draft_token_num)
+        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).reshape(bs, spec_info.draft_token_num)
         predicts, accept_index, accept_length = gpu_verify_greedy(
-            spec_info, predicts, candidates, target_predict, bs,
+            spec_info,
+            predicts,
+            candidates,
+            target_predict,
+            bs,
         )
     else:
         predicts, accept_index, accept_length = gpu_verify_sample(
-            spec_info, predicts, candidates, forward_batch, logits_output, bs,
+            spec_info,
+            predicts,
+            candidates,
+            forward_batch,
+            logits_output,
+            bs,
+        )
+
+    sampling_info = forward_batch.sampling_info
+    if sampling_info.thinking_budgets is not None:
+        sampling_info.apply_thinking_budgets_spec(
+            forward_batch.seq_lens,
+            predicts,
+            accept_length,
+            spec_info.draft_token_num,
+        )
+
+    sampling_info = forward_batch.sampling_info
+    if sampling_info.thinking_budgets is not None:
+        sampling_info.apply_thinking_budgets_spec(
+            forward_batch.seq_lens,
+            predicts,
+            accept_length,
+            spec_info.draft_token_num,
         )
 
     rearranged_accept_index = torch.zeros_like(predicts)
@@ -160,8 +191,13 @@ def generate_draft_decode_kv_indices(
     req_pool_indices,
     req_to_token,
     paged_kernel_lens,
-    kv_indices,  # shape: [self.speculative_num_steps, forward_batch.batch_size * self.topk * self.max_context_len], records slot address for topk at each position for each step
-    kv_indptr,  # shape: [self.speculative_num_steps, max_batch_size * topk + 1], records starting address of topk for each step
+    # kv_indices shape: [self.speculative_num_steps, forward_batch.batch_size *
+    # self.topk * self.max_context_len], records slot address for topk at each
+    # position for each step
+    kv_indices,
+    # kv_indptr shape: [self.speculative_num_steps, max_batch_size * topk + 1],
+    # records starting address of topk for each step
+    kv_indptr,
     positions,
     num_seqs: int,
     kv_indices_stride: int,
@@ -260,23 +296,20 @@ def generate_attn_arg_v2_kernel(
     tl.store(cum_kv_seq_len_ptr + bx + 1, cum_kv_len)
 
     req_pool_index = tl.load(req_pool_indices_ptr + bx)
-    cur_paged_kernel_len = tl.sum(tl.where(indices==bx, paged_kernel_lens, 0))
-    #kv_indices_offset = cum_kv_len - tl.load(paged_kernel_lens_ptr + bx)
+    cur_paged_kernel_len = tl.sum(tl.where(indices == bx, paged_kernel_lens, 0))
+    # kv_indices_offset = cum_kv_len - tl.load(paged_kernel_lens_ptr + bx)
     kv_indices_offset = cum_kv_len - cur_paged_kernel_len
 
     kv_start = 0
     kv_end = cur_paged_kernel_len
-    #kv_end = tl.load(paged_kernel_lens_ptr + bx)
+    # kv_end = tl.load(paged_kernel_lens_ptr + bx)
 
     num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < kv_end - kv_start
         data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + kv_start
-            + offset,
+            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + kv_start + offset,
             mask=mask,
         )
         tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
@@ -289,7 +322,7 @@ def generate_attn_arg_v2(
     req_to_token: torch.Tensor,
     kv_indices_buf: torch.Tensor,
     is_draft_decode: bool = False,
-    draft_decode_step: int = None
+    draft_decode_step: int = None,
 ):
     batch_size = req_pool_indices.shape[0]
     qo_indptr = torch.empty((batch_size + 1,), device="cuda", dtype=torch.int32)
@@ -306,7 +339,7 @@ def generate_attn_arg_v2(
         draft_token_num=draft_token_num,
         draft_decode_step=draft_decode_step,
         is_draft_decode=is_draft_decode,
-        bs_upper=triton.next_power_of_2(batch_size)
+        bs_upper=triton.next_power_of_2(batch_size),
     )
     return kv_indices_buf, cum_kv_lens, qo_indptr
 
@@ -317,7 +350,7 @@ def generate_attn_arg_prefill(
     paged_kernel_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     kv_indices_buf: torch.Tensor = None,
-    draft_decode_step: int = None
+    draft_decode_step: int = None,
 ):
     batch_size = req_pool_indices.shape[0]
     if draft_decode_step is not None:
@@ -339,10 +372,7 @@ def generate_attn_arg_prefill(
 
     cum_kv_seq_len = torch.zeros((batch_size + 1,), dtype=torch.int32, device="cuda")
 
-    if draft_decode_step is None:
-        paged_kernel_lens = paged_kernel_lens + draft_token_num
-    else:
-        paged_kernel_lens = paged_kernel_lens + draft_decode_step + 1
+    paged_kernel_lens = paged_kernel_lens + draft_token_num if draft_decode_step is None else paged_kernel_lens + draft_decode_step + 1
 
     cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
     if kv_indices_buf is not None:
@@ -361,6 +391,7 @@ def generate_attn_arg_prefill(
     )
     return kv_indices, cum_kv_seq_len, qo_indptr, None
 
+
 @triton.jit
 def update_oe_metadata_kernel(
     oe_out_column_starts_ptr,
@@ -370,7 +401,7 @@ def update_oe_metadata_kernel(
     verified_len_ptr,
     req_pool_indices_ptr,
     draft_decode_step: tl.constexpr,
-    spec_num_steps: tl.constexpr
+    spec_num_steps: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     req_idx = tl.load(req_pool_indices_ptr + pid)

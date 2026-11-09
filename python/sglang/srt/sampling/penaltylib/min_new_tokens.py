@@ -1,7 +1,11 @@
+import weakref
+from typing import TYPE_CHECKING, Optional
+
 import torch
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduling.schedule_batch import ScheduleBatch
 from sglang.srt.sampling.penaltylib.orchestrator import (
-    BatchedPenalizerOrchestrator,
     _BatchedPenalizer,
 )
 
@@ -11,22 +15,34 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     Min new tokens penalizer penalizes tokens based on the length of the output.
     """
 
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self.orchestrator = orchestrator
+    def __init__(self, batch, device, vocab_size):
+        self._batch_ref = weakref.ref(batch)
+        self.device = device
+        self.vocab_size = vocab_size
         self._is_prepared = False
 
+    @property
+    def batch(self) -> "Optional[ScheduleBatch]":
+        return self._batch_ref()
+
+    @batch.setter
+    def batch(self, value: "Optional[ScheduleBatch]"):
+        if value is None:
+            self._batch_ref = lambda: None
+        else:
+            self._batch_ref = weakref.ref(value)
+
+    def reqs(self):
+        return self.batch.reqs
+
     def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.min_new_tokens > 0 for req in self.orchestrator.reqs()
-        )
+        return any(req.sampling_params.min_new_tokens > 0 for req in self.reqs())
 
     def _prepare(self):
         self.min_new_tokens = torch.tensor(
-            data=[
-                req.sampling_params.min_new_tokens for req in self.orchestrator.reqs()
-            ],
+            data=[req.sampling_params.min_new_tokens for req in self.reqs()],
             dtype=torch.int32,
-            device=self.orchestrator.device,
+            device=self.device,
         ).unsqueeze_(1)
 
         padded_stop_token_ids = torch.nn.utils.rnn.pad_sequence(
@@ -40,17 +56,17 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                         )
                     ),
                     dtype=torch.int64,
-                    device=self.orchestrator.device,
+                    device=self.device,
                 )
-                for req in self.orchestrator.reqs()
+                for req in self.reqs()
             ],
             batch_first=True,
-            padding_value=self.orchestrator.vocab_size,
+            padding_value=self.vocab_size,
         )
         self.stop_token_penalties = torch.zeros(
-            size=(len(self.orchestrator.reqs()), self.orchestrator.vocab_size + 1),
+            size=(len(self.reqs()), self.vocab_size + 1),
             dtype=torch.float32,
-            device=self.orchestrator.device,
+            device=self.device,
         ).scatter_add_(
             dim=1,
             index=padded_stop_token_ids,
@@ -58,16 +74,14 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 input=padded_stop_token_ids,
                 dtype=torch.float32,
                 fill_value=float("-inf"),
-                device=self.orchestrator.device,
+                device=self.device,
             ),
-        )[
-            :, : self.orchestrator.vocab_size
-        ]
+        )[:, : self.vocab_size]
 
         self.len_output_tokens = torch.zeros(
-            size=(len(self.orchestrator.reqs()), 1),
+            size=(len(self.reqs()), 1),
             dtype=torch.int32,
-            device=self.orchestrator.device,
+            device=self.device,
         )
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
@@ -83,12 +97,6 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.len_output_tokens = self.len_output_tokens[keep_indices]
 
     def _merge(self, their: "BatchedMinNewTokensPenalizer"):
-        self.min_new_tokens = torch.cat(
-            [self.min_new_tokens, their.min_new_tokens], dim=0
-        )
-        self.stop_token_penalties = torch.cat(
-            [self.stop_token_penalties, their.stop_token_penalties], dim=0
-        )
-        self.len_output_tokens = torch.cat(
-            [self.len_output_tokens, their.len_output_tokens], dim=0
-        )
+        self.min_new_tokens = torch.cat([self.min_new_tokens, their.min_new_tokens], dim=0)
+        self.stop_token_penalties = torch.cat([self.stop_token_penalties, their.stop_token_penalties], dim=0)
+        self.len_output_tokens = torch.cat([self.len_output_tokens, their.len_output_tokens], dim=0)

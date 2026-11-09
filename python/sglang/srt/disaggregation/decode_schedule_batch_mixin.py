@@ -1,24 +1,25 @@
 from __future__ import annotations
 
 import logging
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.disaggregation.utils import prepare_abort
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPoolInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPoolInfo
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.scheduling.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
-
     def prepare_for_prebuilt_extend(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
@@ -39,15 +40,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Fill the tensor in one pass
         offset = 0
-        for i, req in enumerate(reqs):
+        for _i, req in enumerate(reqs):
             req_pool_indices.append(req.req_pool_idx)
 
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
-            ]
-            assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
+            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][: req.extend_input_len]
+            assert offset + req.extend_input_len <= total_size, (
+                f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
+            )
             out_cache_loc[offset : offset + req.extend_input_len] = chunk
             offset += req.extend_input_len
 
@@ -55,12 +54,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
-                assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
+                assert seq_len - pre_len == req.extend_input_len, f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
 
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
+            if not req.retracted_stain:
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
             req.extend_logprob_start_len = 0
@@ -68,12 +66,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
         extend_input_logprob_token_ids = None
 
         # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
-        )
-        self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
-        )
+        self.input_ids = torch.tensor(sum(input_ids, []), dtype=torch.int32, device=self.device)
+        self.req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
@@ -94,9 +88,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
-    def process_prebuilt_extend(
-        self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig
-    ):
+    def process_prebuilt_extend(self: ScheduleBatch, server_args: ServerArgs, model_config: ModelConfig):
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
         for req in self.reqs:
@@ -104,33 +96,54 @@ class ScheduleBatchDisaggregationDecodeMixin:
             alloced_len = len(req.fill_ids) - 1
             self.req_to_token_pool.set_req_pool_info(
                 req.req_pool_idx,
-                ReqToTokenPoolInfo(
-                    alloced_len,
-                    alloced_len,
-                    self.req_to_token_pool.req_to_token[req.req_pool_idx, :alloced_len].clone()
-                )
+                ReqToTokenPoolInfo(alloced_len, alloced_len, self.req_to_token_pool.req_to_token[req.req_pool_idx, :alloced_len].clone()),
             )
-            # Cache the request in tree_cache with full sequence
-            self.tree_cache.cache_unfinished_req(req)
-            if req.grammar is not None:
-                req.grammar.accept_token(req.output_ids[-1])
-                req.grammar.finished = req.finished()
+            # The last output token's KV is computed by the next decode step.
+            # Publishing it now can leave radix referencing a page that a
+            # finish/retract frees before that step runs.
+            self.tree_cache.cache_unfinished_req(req, alloced_len)
+            if req.grammar is not None and not req.retracted_stain:
+                try:
+                    req.grammar.accept_token(req.output_ids[-1])
+                except Exception as e:
+                    logger.error(
+                        f"Grammar accept_token failed on decode side:\n"
+                        f"  rid: {req.rid}\n"
+                        f"  token: {req.output_ids[-1]}\n"
+                        f"  output_ids: {req.output_ids}\n"
+                        f"  error: {e}\n"
+                    )
+                    degrade_fn = getattr(req.grammar, "degrade", None)
+                    if degrade_fn is not None:
+                        # The prefill side may have degraded this grammar (mask
+                        # budget) and sampled an unconstrained first token; it
+                        # has no way to tell us. Follow it instead of aborting.
+                        # Every decode rank sees the same token and grammar
+                        # state, so they all take this branch together.
+                        degrade_fn(f"first token {req.output_ids[-1]} from prefill rejected")
+                        req.grammar.finished = req.finished()
+                    else:
+                        prepare_abort(
+                            req,
+                            f"Grammar accept_token failed: {e}",
+                            status_code=HTTPStatus.BAD_REQUEST,
+                        )
+                else:
+                    req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device, dtype=torch.int32)
 
         # Simulate the eagle run. We add mock data to hidden states for the
         # ease of implementation now meaning the first token will have acc rate
         # of 0.
         if not self.spec_algorithm.is_none():
-
             self.prealloc_for_draft_decode(is_disaggregation_decode=True)
             b, topk = len(self.reqs), server_args.speculative_eagle_topk
             assert topk == 1, "Tree attention is abandoned for now"
-            last_verified_ids, token_list = \
-                self.output_ids, []
-            
+            last_verified_ids, token_list = self.output_ids, []
+
             for _ in range(server_args.speculative_num_steps):
-                topk_index = torch.arange(b * topk, device=self.device, dtype=torch.int32)
-                topk_index = topk_index.reshape(b, topk) # shape: (b, topk)
+                topk_index = torch.zeros(b * topk, device=self.device, dtype=torch.int32)
+                topk_index = topk_index.reshape(b, topk)  # shape: (b, topk)
                 token_list.append(topk_index)
 
             if self.num_continous_decode_steps > 1:

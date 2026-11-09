@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import pathlib
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, TypeAlias, Union
+from typing import TYPE_CHECKING, TypeAlias, Union
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
 
 
-def _make_wrapper(tup: Tuple[str, str]) -> str:
+def _make_wrapper(tup: tuple[str, str]) -> str:
     export_name, kernel_name = tup
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
-@lru_cache()
+@lru_cache
 def _resolve_kernel_path() -> pathlib.Path:
     cur_dir = pathlib.Path(__file__).parent.resolve()
 
@@ -60,14 +60,14 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
 
 def load_jit(
     *args: str,
-    cpp_files: List[str] | None = None,
-    cuda_files: List[str] | None = None,
-    cpp_wrappers: List[Tuple[str, str]] | None = None,
-    cuda_wrappers: List[Tuple[str, str]] | None = None,
-    extra_cflags: List[str] | None = None,
-    extra_cuda_cflags: List[str] | None = None,
-    extra_ldflags: List[str] | None = None,
-    extra_include_paths: List[str] | None = None,
+    cpp_files: list[str] | None = None,
+    cuda_files: list[str] | None = None,
+    cpp_wrappers: list[tuple[str, str]] | None = None,
+    cuda_wrappers: list[tuple[str, str]] | None = None,
+    extra_cflags: list[str] | None = None,
+    extra_cuda_cflags: list[str] | None = None,
+    extra_ldflags: list[str] | None = None,
+    extra_include_paths: list[str] | None = None,
     build_directory: str | None = None,
 ) -> Module:
     from tvm_ffi.cpp import load_inline

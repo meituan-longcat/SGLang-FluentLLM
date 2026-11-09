@@ -9,20 +9,21 @@ import dataclasses
 import signal
 import threading
 from queue import Queue
-from typing import List
 
 import psutil
 import torch
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.scheduling.schedule_batch import ModelWorkerBatch
 from sglang.srt.speculative.eagle_utils import EagleDraftOutput
 from sglang.srt.speculative.pld_worker import PLDWorker
 from sglang.srt.utils import get_colorful_logger
 from sglang.utils import get_exception_traceback
+
 try:
     from flashinfer import resolve_future_tensors
 except ImportError as e:
     import logging
+
     logger = logging.getLogger(__name__)
     logger.error(f"Failed to import resolve_future_tensors from flashinfer: {e}")
     raise
@@ -30,11 +31,12 @@ except ImportError as e:
 
 logger = get_colorful_logger(__name__)
 
+
 def resolve_future_input(
     batch: ModelWorkerBatch,
     spec_steps: int,
     future_last_verified_ids_map: torch.Tensor,
-    future_token_list_map: List[torch.Tensor],
+    future_token_list_map: list[torch.Tensor],
 ) -> EagleDraftOutput:
     """
     Resolve future objects in PLD batch spec_info using CUDA kernel.
@@ -109,6 +111,7 @@ class PLDWorkerOverlapped:
         )
 
         self.device = self.worker.device
+        self.gpu_id = gpu_id
         torch.get_device_module(self.device).set_device(gpu_id)
         self.server_args = server_args
 
@@ -159,6 +162,9 @@ class PLDWorkerOverlapped:
     def forward_thread_func(self):
         """Background thread function with exception handling."""
         try:
+            # device 绑定是线程局部的: 新线程不继承主线程的 set_device, 首次触发
+            # LazySetDevice 会落到 device 0 (同节点多 DP rank 时表现为该卡 OOM)。
+            torch.get_device_module(self.device).set_device(self.gpu_id)
             with torch.get_device_module(self.device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:
@@ -174,7 +180,7 @@ class PLDWorkerOverlapped:
 
         while True:
             queue_item = self.input_queue.get()
-            if queue_item is None: 
+            if queue_item is None:
                 break
 
             batch, future_token_ids_ct = queue_item
@@ -204,25 +210,19 @@ class PLDWorkerOverlapped:
             if not batch.forward_mode.is_idle():
                 actual_bs = new_verified_id.shape[0] if new_verified_id is not None else bs
 
-                self.future_last_verified_ids[
-                    future_token_ids_ct + 1 : future_token_ids_ct + actual_bs + 1
-                ] = new_verified_id[:actual_bs]
+                self.future_last_verified_ids[future_token_ids_ct + 1 : future_token_ids_ct + actual_bs + 1] = new_verified_id[:actual_bs]
 
                 for i in range(len(token_list)):
-                    self.future_token_list[i][
-                        future_token_ids_ct + 1 : future_token_ids_ct + actual_bs + 1
-                    ] = token_list[i][:actual_bs]
+                    self.future_token_list[i][future_token_ids_ct + 1 : future_token_ids_ct + actual_bs + 1] = token_list[i][:actual_bs]
 
                 if logits_output and logits_output.hidden_states is not None:
-                    logits_output.hidden_states = logits_output.hidden_states.to(
-                        "cpu", non_blocking=True
-                    )
+                    logits_output.hidden_states = logits_output.hidden_states.to("cpu", non_blocking=True)
                 if next_token_ids is not None:
                     next_token_ids = next_token_ids.to("cpu", non_blocking=True)
-                if accept_lengths is not None:
-                    accept_lengths_cpu = accept_lengths.to("cpu", non_blocking=True)
-                else:
-                    accept_lengths_cpu = None
+                accept_lengths_cpu = accept_lengths.to("cpu", non_blocking=True) if accept_lengths is not None else None
+                # Transfer logprob tensors to CPU if computed
+                if batch.return_logprob and logits_output:
+                    logits_output.transfer_logprobs_to_cpu()
             else:
                 accept_lengths_cpu = None
 
@@ -236,12 +236,11 @@ class PLDWorkerOverlapped:
                     accept_lengths_cpu,
                     new_verified_id,
                     token_list,
+                    batch.return_logprob,
                 )
             )
 
-    def forward_batch_speculative_generation(
-        self, batch: ModelWorkerBatch, launch_done=None
-    ):
+    def forward_batch_speculative_generation(self, batch: ModelWorkerBatch, launch_done=None):
         """
         Main entry point for speculative generation in overlap mode.
 
@@ -280,9 +279,7 @@ class PLDWorkerOverlapped:
             for _ in range(self.draft_token_num - 1)
         ]
 
-        self.future_token_ids_ct = (
-            self.future_token_ids_ct + bs
-        ) % self.future_token_ids_limit
+        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
 
         return (
             None,  # logits_output (will be resolved later)
@@ -307,6 +304,7 @@ class PLDWorkerOverlapped:
             accept_lengths_cpu,
             new_verified_id,
             token_list,
+            return_logprob,
         ) = self.output_queue.get()
 
         copy_done.synchronize()
@@ -314,6 +312,9 @@ class PLDWorkerOverlapped:
 
         if next_token_ids is not None:
             next_token_ids = next_token_ids.tolist()
+        # Convert logprob tensors to list after GPU→CPU sync
+        if return_logprob and logits_output is not None:
+            logits_output.convert_logprobs_to_python()
 
         return (
             logits_output,
@@ -321,6 +322,7 @@ class PLDWorkerOverlapped:
             accept_lengths_cpu,
             new_verified_id,
             token_list,
+            None,  # grammar_terminated_list (not applicable for PLD)
         )
 
     def shutdown(self):

@@ -1,30 +1,29 @@
 import argparse
 import asyncio
 import json
+
+# Add current directory to sys.path for local imports
+import os
 import queue
 import random
 import sys
 import threading
 import time
 from datetime import datetime
-from typing import Optional
 
 import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
-# Add current directory to sys.path for local imports
-import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from data_processing import sample_fixed_sharegpt_requests
 from sglang.bench_serving import (
     RequestFuncOutput,
     get_tokenizer,
-    remove_prefix,
     sample_random_requests,
 )
-from data_processing import sample_fixed_sharegpt_requests
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -193,7 +192,7 @@ def parse_args():
 async def async_request_sglang_generate(
     payload,
     url,
-    pbar: Optional[tqdm] = None,
+    pbar: tqdm | None = None,
 ):
     """
     Sends a non-streaming request to the server. Returns complete response.
@@ -272,7 +271,7 @@ def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
             file.write(
                 json.dumps(timestamped_data) + "\n"
             )  # Write as a single line in JSONL format
-    except IOError as e:
+    except OSError as e:
         print(f"Error writing to JSONL file: {e}")
 
 

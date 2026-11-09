@@ -1,15 +1,13 @@
 import itertools
 import math
-import os
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
 from sgl_kernel import lightning_attention_decode as sgl_lightning_attention_decode
+from torch import nn
 
 
 @triton.jit
@@ -133,7 +131,7 @@ def next_power_of_2(n):
 
 
 class MiniMaxText01LightningAttention(nn.Module):
-    def __init__(self, config=None, layer_idx: Optional[int] = None, **kwargs):
+    def __init__(self, config=None, layer_idx: int | None = None, **kwargs):
         super().__init__()
         if config is None:
             config = type("Config", (), kwargs)
@@ -163,11 +161,11 @@ class MiniMaxText01LightningAttention(nn.Module):
     def forward(
         self,
         hidden_states,
-        attn_mask: Optional[torch.Tensor] = None,  # (b, h, n, m)
+        attn_mask: torch.Tensor | None = None,  # (b, h, n, m)
         output_attentions: bool = False,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: tuple[torch.Tensor] | None = None,
         use_cache: bool = False,
-        slope_rate: Optional[torch.Tensor] = None,
+        slope_rate: torch.Tensor | None = None,
         **kwargs,
     ):
         if (not self.training) and (not do_eval):
@@ -183,11 +181,11 @@ class MiniMaxText01LightningAttention(nn.Module):
     def inference(
         self,
         x,
-        attn_mask: Optional[torch.Tensor] = None,  # (b, n)
+        attn_mask: torch.Tensor | None = None,  # (b, n)
         output_attentions: bool = False,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: tuple[torch.Tensor] | None = None,
         use_cache: bool = False,
-        slope_rate: Optional[torch.Tensor] = None,  # (h, 1, 1)
+        slope_rate: torch.Tensor | None = None,  # (h, 1, 1)
     ):
         # x: b n d
         b, n, d = x.shape

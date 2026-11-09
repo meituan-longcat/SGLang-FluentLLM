@@ -1,11 +1,12 @@
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/transformers_utils/configs/kimi_linear.py
 import os
+from typing import Optional
+
 import torch
-
 from transformers.configuration_utils import PretrainedConfig
-from typing import Optional, Tuple, List
 
-from sglang.srt.distributed.utils import divide
+from sglang.srt.utils import divide
+
 
 class KimiLinearConfig(PretrainedConfig):
     model_type = "kimi_linear"
@@ -34,7 +35,7 @@ class KimiLinearConfig(PretrainedConfig):
         moe_intermediate_size: Optional[int] = None,
         moe_renormalize: bool = True,
         moe_router_activation_func: str = "sigmoid",
-        num_experts: Optional[int] = None,            
+        num_experts: Optional[int] = None,
         num_experts_per_token: Optional[int] = None,
         num_shared_experts: int = 0,
         routed_scaling_factor: float = 1.0,
@@ -56,9 +57,7 @@ class KimiLinearConfig(PretrainedConfig):
         self.model_type = model_type
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
-        self.head_dim = (
-            head_dim if head_dim is not None else hidden_size // num_attention_heads
-        )
+        self.head_dim = head_dim if head_dim is not None else hidden_size // num_attention_heads
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
@@ -137,10 +136,7 @@ class KimiLinearConfig(PretrainedConfig):
         )
 
     def is_kda_layer(self, layer_idx: int):
-        return (
-            self.linear_attn_config is not None
-            and (layer_idx + 1) in self.linear_attn_config["kda_layers"]
-        )
+        return self.linear_attn_config is not None and (layer_idx + 1) in self.linear_attn_config["kda_layers"]
 
     @property
     def linear_layer_ids(self):
@@ -151,13 +147,14 @@ class KimiLinearConfig(PretrainedConfig):
         return [i for i in range(self.num_hidden_layers) if not self.is_kda_layer(i)]
 
     @property
-    def mamba2_cache_params(self) -> Tuple[List[Tuple[int, int]], Tuple[int, int, int], torch.dtype, torch.dtype, List[int]]:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
+    def mamba2_cache_params(self) -> tuple[list[tuple[int, int]], tuple[int, int, int], torch.dtype, torch.dtype, list[int]]:
+        from sglang.srt.layers.attention.dp_attention import get_attention_tp_size
+
         world_size = get_attention_tp_size()
 
-        num_heads=self.linear_attn_config["num_heads"]
-        head_dim=self.linear_attn_config["head_dim"]
-        conv_kernel_size=self.linear_attn_config["short_conv_kernel_size"]
+        num_heads = self.linear_attn_config["num_heads"]
+        head_dim = self.linear_attn_config["head_dim"]
+        conv_kernel_size = self.linear_attn_config["short_conv_kernel_size"]
         num_k_heads = num_heads
         head_k_dim = head_dim
 
@@ -184,3 +181,10 @@ class KimiLinearConfig(PretrainedConfig):
             ssm_dtype,
             mamba_layers,
         )
+
+    @property
+    def mamba_cache_per_req(self):
+        conv_state_shapes, temporal_state_shape, conv_dtype, ssm_dtype, mamba_layers = self.mamba2_cache_params
+        conv_items = sum(int(torch.tensor(shape).prod().item()) for shape in conv_state_shapes)
+        temporal_items = int(torch.tensor(temporal_state_shape).prod().item())
+        return (conv_items * conv_dtype.itemsize + temporal_items * ssm_dtype.itemsize) * len(mamba_layers)

@@ -44,8 +44,8 @@ class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
 
-class CompressedTensorsWNA16MoELayout():
 
+class CompressedTensorsWNA16MoELayout:
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         # TODO: @dsikka: refactor this to use schemes as other kernels
@@ -70,9 +70,7 @@ class CompressedTensorsWNA16MoELayout():
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
-        extra_weight_attrs.update(
-            {"is_transposed": True, "quant_method": self.strategy}
-        )
+        extra_weight_attrs.update({"is_transposed": True, "quant_method": self.strategy})
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -159,9 +157,7 @@ class CompressedTensorsWNA16MoELayout():
         )  # FIXME
         set_weight_attrs(w2_scale, {"weight_loader": weight_loader})
 
-        w2_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
-        )
+        w2_weight_shape = torch.nn.Parameter(torch.empty(num_experts, 2), requires_grad=False)
         layer.register_parameter("w2_weight_shape", w2_weight_shape)
         set_weight_attrs(w2_weight_shape, extra_weight_attrs)
         weight_loader = partial(
@@ -171,9 +167,7 @@ class CompressedTensorsWNA16MoELayout():
         )  # FIXME
         set_weight_attrs(w2_weight_shape, {"weight_loader": weight_loader})
 
-        w13_weight_shape = torch.nn.Parameter(
-            torch.empty(num_experts, 2), requires_grad=False
-        )
+        w13_weight_shape = torch.nn.Parameter(torch.empty(num_experts, 2), requires_grad=False)
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
         weight_loader = partial(
@@ -275,15 +269,9 @@ class CompressedTensorsWNA16MoELayout():
             w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
 
             for e in range(num_experts):
-                w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_weight_g_idx[e]).to(
-                    torch.int32
-                )
-                w2_g_idx_sort_indices[e] = torch.argsort(layer.w2_weight_g_idx[e]).to(
-                    torch.int32
-                )
-                w13_sorted_g_idx[e] = layer.w13_weight_g_idx[e][
-                    w13_g_idx_sort_indices[e]
-                ]
+                w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_weight_g_idx[e]).to(torch.int32)
+                w2_g_idx_sort_indices[e] = torch.argsort(layer.w2_weight_g_idx[e]).to(torch.int32)
+                w13_sorted_g_idx[e] = layer.w13_weight_g_idx[e][w13_g_idx_sort_indices[e]]
                 w2_sorted_g_idx[e] = layer.w2_weight_g_idx[e][w2_g_idx_sort_indices[e]]
 
             replace_parameter(layer, "w13_weight_g_idx", w13_sorted_g_idx)
@@ -338,8 +326,7 @@ class CompressedTensorsWNA16MoELayout():
 
         marlin_w2_scales = marlin_moe_permute_scales(
             layer.w2_weight_scale,
-            layer.w2_weight_scale.shape[1]
-            * (self.group_size if self.group_size != -1 else self.packed_factor),
+            layer.w2_weight_scale.shape[1] * (self.group_size if self.group_size != -1 else self.packed_factor),
             layer.w2_weight_scale.shape[2],
             self.group_size,
         )

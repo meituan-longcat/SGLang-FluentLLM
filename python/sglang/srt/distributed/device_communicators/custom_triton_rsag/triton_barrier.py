@@ -9,6 +9,7 @@ import triton.language as tl
 from sglang.srt.distributed.device_communicators.custom_triton_rsag.triton_utils import get_flat_bid, get_flat_tid, sync_threads
 from sglang.srt.distributed.device_communicators.custom_triton_rsag.utils import log_triton_kernel
 
+
 @triton.jit
 def send_signal(addrs, sem: tl.constexpr):
     if sem == "relaxed":
@@ -52,6 +53,7 @@ def send_signal(addrs, sem: tl.constexpr):
     else:
         raise RuntimeError(f"Unrecognized sem: {sem}")
 
+
 @triton.jit
 def wait_signal(addrs, sem: tl.constexpr):
     if sem == "relaxed":
@@ -94,6 +96,7 @@ def wait_signal(addrs, sem: tl.constexpr):
         )
     else:
         raise RuntimeError(f"Unrecognized sem: {sem}")
+
 
 @triton.jit
 def blockwise_barrier(
@@ -141,19 +144,16 @@ def blockwise_barrier(
 
     remote_ranks = tl.arange(0, world_size)
     signal_pad_ptrs = signal_pad_ptrs.to(tl.pointer_type(tl.uint64))
-    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(
-        tl.pointer_type(tl.uint32)
-    )
+    remote_signal_pad_addrs = tl.load(signal_pad_ptrs + remote_ranks).to(tl.pointer_type(tl.uint32))
     send_addrs = remote_signal_pad_addrs + block_id * world_size + rank
 
-    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(
-        tl.pointer_type(tl.uint32)
-    )
+    local_signal_pad_addr = tl.load(signal_pad_ptrs + rank).to(tl.pointer_type(tl.uint32))
     wait_addrs = local_signal_pad_addr + block_id * world_size + remote_ranks
 
     if flat_tid < world_size:
         send_signal(send_addrs, sem)
         wait_signal(wait_addrs, sem)
+
 
 @triton.jit
 def barrier_test_kernel(
@@ -163,6 +163,7 @@ def barrier_test_kernel(
 ):
     blockwise_barrier(signal_pad_ptrs, None, rank, world_size, "relaxed")
     sync_threads()
+
 
 def barrier_test(t: torch.Tensor) -> None:
     symm_mem_hdl = symm_mem.rendezvous(t, group=dist.group.WORLD)
@@ -176,6 +177,7 @@ def barrier_test(t: torch.Tensor) -> None:
 
     signal_pad = symm_mem_hdl.get_signal_pad(symm_mem_hdl.rank)
     assert signal_pad.eq(0).all().item()
+
 
 if __name__ == "__main__":
     """

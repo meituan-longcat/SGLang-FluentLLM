@@ -1,14 +1,16 @@
 import dataclasses
+import math
 import signal
 import threading
-import math
 from queue import Queue
 
 import psutil
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.env import ENV
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.scheduling.schedule_batch import ModelWorkerBatch
 from sglang.srt.utils import (
     get_colorful_logger,
     is_npu,
@@ -19,15 +21,13 @@ logger = get_colorful_logger(__name__)
 
 __is_npu__ = is_npu()
 
-import triton
-import triton.language as tl
 
 @triton.jit
 def resolve_future_input_kernel(
-    last_verified_ids_ptr,      # [bs]
-    token_list_ptr,             # [bs, steps]
-    future_last_map_ptr,        # [max_indices]
-    future_tokens_ptr,          # [max_indices, steps]
+    last_verified_ids_ptr,  # [bs]
+    token_list_ptr,  # [bs, steps]
+    future_last_map_ptr,  # [max_indices]
+    future_tokens_ptr,  # [max_indices, steps]
     spec_steps,
     token_list_stride_0,
     future_tokens_stride_0,
@@ -48,6 +48,7 @@ def resolve_future_input_kernel(
                 f_val = tl.load(curr_f_ptr)
                 tl.store(curr_t_ptr, f_val)
 
+
 @triton.jit
 def copy_for_next_launch(
     future_last_verified_id_ptr,
@@ -65,6 +66,7 @@ def copy_for_next_launch(
         t_val = tl.load(token_list_ptr + pid * spec_steps + i)
         offset = row_idx * spec_steps + i
         tl.store(future_token_list_ptr + offset, t_val)
+
 
 def resolve_future_input(
     batch: ModelWorkerBatch,
@@ -113,9 +115,15 @@ class EagleWorkerOverlapped:
     ):
         if server_args.is_multi_head_eagle:
             from sglang.srt.speculative.multi_head_eagle_worker import MultiHeadEAGLEWorker
+
             WorkerCls = MultiHeadEAGLEWorker
+        elif server_args.speculative_algorithm == "DFLASH":
+            from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+            WorkerCls = DFlashWorker
         else:
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
+
             WorkerCls = EAGLEWorker
         self.worker = WorkerCls(
             server_args,
@@ -127,13 +135,13 @@ class EagleWorkerOverlapped:
             global_rank,
         )
 
-        assert (
-            self.worker.server_args.speculative_eagle_topk == 1
-        ), "Currently only support topk == 1 and spec_steps == 1 in Overlap Scheduler"
+        assert self.worker.server_args.speculative_eagle_topk == 1, "Currently only support topk == 1 and spec_steps == 1 in Overlap Scheduler"
 
         self.device = self.worker.device
+        self.gpu_id = gpu_id
         torch.get_device_module(self.device).set_device(gpu_id)
         self.model_runner = self.worker.model_runner
+        self.model_runner_list = self.worker.model_runner_list
 
         context_len = self.worker.model_runner.model_config.context_len
         chunk_size = self.worker.model_runner.server_args.chunked_prefill_size
@@ -166,10 +174,10 @@ class EagleWorkerOverlapped:
         )
         # draft tokens
         self.future_token_list: torch.Tensor = torch.zeros(
-                (future_map_size, self.spec_steps),  # bs, spec_steps
-                device=self.worker.device,
-                dtype=torch.int32,
-            )
+            (future_map_size, self.spec_steps),  # bs, spec_steps
+            device=self.worker.device,
+            dtype=torch.int32,
+        )
 
         self.forward_stream = torch.get_device_module(self.device).Stream()
         if __is_npu__ and ENV.npu_enable_graph:
@@ -181,16 +189,20 @@ class EagleWorkerOverlapped:
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
-        self.scheduler_stream: torch.Stream = torch.get_device_module(
-            self.device
-        ).current_stream()
+        self.scheduler_stream: torch.Stream = torch.get_device_module(self.device).current_stream()
         if __is_npu__:
             torch.npu.set_stream_limit(self.scheduler_stream, 8, 16)
         if self.device == "cpu":
             self.scheduler_stream.synchronize = lambda: None  # No-op for CPU
 
+    def register_hicache_layer_transfer_counter(self, counter):
+        return self.worker.register_hicache_layer_transfer_counter(counter)
+
     def forward_thread_func(self):
         try:
+            # device 绑定是线程局部的: 新线程不继承主线程的 set_device, 首次触发
+            # LazySetDevice 会落到 device 0 (同节点多 DP rank 时表现为该卡 OOM)。
+            torch.get_device_module(self.device).set_device(self.gpu_id)
             with torch.get_device_module(self.device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:
@@ -214,7 +226,7 @@ class EagleWorkerOverlapped:
             batch_pt += 1
 
             launch_done = threading.Event()
-            copy_done = torch.get_device_module(self.worker.device).Event()
+            copy_done = torch.get_device_module(self.worker.device).Event(enable_timing=True)
 
             # Resolve future spec info in the input
             resolve_future_input(
@@ -223,24 +235,45 @@ class EagleWorkerOverlapped:
                 future_last_verifed_ids_map=self.future_last_verified_ids,
                 future_token_list_map=self.future_token_list,
             )
+            # For multi-step decode, disable async vocab mask wait since the scheduler
+            # doesn't compute it between steps. This makes the forward thread compute
+            # vocab_mask inline (same as non-overlap mode).
+            if self.num_continuous_decode_steps > 1 and batch.sampling_info:
+                batch.sampling_info.sampling_info_done = None
             (
                 logits_output,
                 next_token_ids,
                 accept_lengths,
                 new_verified_id,
                 token_list,
+                grammar_terminated_list,
             ) = self.worker.forward_batch_speculative_generation(batch, launch_done)
+
+            if __is_npu__:
+                # NPU forwards a snapshot or an async grammar-update event.
+                # The consumer waits for the event before reading the snapshot.
+                grammar_collect_slot = -1
+            else:
+                # Grammar accept now runs as a host node on the shared grammar stream
+                # for BOTH the graph verify path (SpecDecodeCudaGraphRunner.replay)
+                # and the eager verify path (base_spec_worker._prepare_eager_grammar_
+                # verify). Whichever ran records worker.last_grammar_slot; the forward
+                # thread only carries that slot and the consumer collects the ring
+                # snapshot after copy_done.synchronize().
+                #
+                # Under launch-ahead we MUST NOT collect the snapshot here: that would
+                # read terminated_ring[slot] before the accept host node has run and
+                # force an overlap-breaking sync. Collect on the consumer thread
+                # instead (resolve_batch_result).
+                grammar_terminated_list = None
+                grammar_collect_slot = self.worker.last_grammar_slot
 
             # Trigger D2D copy, prepare for next kernel launch
             bs = len(batch.seq_lens)
             if not batch.forward_mode.is_idle():
                 if __is_npu__:
-                    self.future_last_verified_ids[
-                        future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-                    ] = new_verified_id
-                    self.future_token_list[
-                        future_token_ids_ct + 1 : future_token_ids_ct + bs + 1
-                    ] = token_list
+                    self.future_last_verified_ids[future_token_ids_ct + 1 : future_token_ids_ct + bs + 1] = new_verified_id
+                    self.future_token_list[future_token_ids_ct + 1 : future_token_ids_ct + bs + 1] = token_list
                 else:
                     copy_for_next_launch[(bs,)](
                         future_last_verified_id_ptr=self.future_last_verified_ids,
@@ -248,17 +281,15 @@ class EagleWorkerOverlapped:
                         new_verified_id_ptr=new_verified_id,
                         token_list_ptr=token_list,
                         future_token_ids_ct=future_token_ids_ct,
-                        spec_steps=self.spec_steps
+                        spec_steps=self.spec_steps,
                     )
                 if logits_output.hidden_states is not None:
-                    logits_output.hidden_states = logits_output.hidden_states.to(
-                        "cpu", non_blocking=True
-                    )
+                    logits_output.hidden_states = logits_output.hidden_states.to("cpu", non_blocking=True)
                 next_token_ids = next_token_ids.to("cpu", non_blocking=True)
-                if accept_lengths is not None:
-                    accept_lengths_cpu = accept_lengths.to("cpu", non_blocking=True)
-                else:
-                    accept_lengths_cpu = None
+                accept_lengths_cpu = accept_lengths.to("cpu", non_blocking=True) if accept_lengths is not None else None
+                # Transfer logprob tensors to CPU if computed
+                if batch.return_logprob:
+                    logits_output.transfer_logprobs_to_cpu()
             else:
                 accept_lengths_cpu = None
             copy_done.record()
@@ -272,17 +303,26 @@ class EagleWorkerOverlapped:
                     accept_lengths_cpu,
                     new_verified_id,
                     token_list,
+                    batch.return_logprob,
+                    grammar_terminated_list,
+                    grammar_collect_slot,
                 )
             )
 
-    def forward_batch_speculative_generation(
-        self, batch: ModelWorkerBatch, launch_done=None
-    ):
+    def forward_batch_speculative_generation(self, batch: ModelWorkerBatch, launch_done=None):
         # Create a new copy of sampling_info because it will be updated in-place by the scheduler for the next batch.
         sampling_info = batch.sampling_info
+        # For MTP, ALL grammar operations (per-position vocab-mask DFS and the
+        # permanent accept) happen on this forward thread. So we deliberately set
+        # sampling_info_done=None: the forward thread must NOT wait for the
+        # scheduler to compute a vocab mask (it builds its own and discards the
+        # scheduler's), and the scheduler must NOT read the grammar at all. The
+        # scheduler-side sites that call update_regex_vocab_mask / .set() are
+        # guarded on `sampling_info_done is not None`, so a None event makes them
+        # skip grammar entirely (no cross-thread read/write race on the matcher).
         batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
             sampling_info,
-            sampling_info_done=threading.Event(),
+            sampling_info_done=None,
             penalizer_orchestrator=None,
         )
         # A cuda stream sync here to avoid the cuda illegal memory access error.
@@ -311,15 +351,15 @@ class EagleWorkerOverlapped:
         ]
         future_tokens_list = torch.cat(future_tokens_list, dim=-1)
 
-        self.future_token_ids_ct = (
-            self.future_token_ids_ct + bs
-        ) % self.future_token_ids_limit
+        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
+        grammar_terminated_list = None
         return (
             None,
             None,
             None,
             future_last_verified_ids,
             future_tokens_list,
+            grammar_terminated_list,
         )
 
     def resolve_batch_result(self, bid: int):
@@ -331,12 +371,40 @@ class EagleWorkerOverlapped:
             accept_lengths_cpu,
             new_verified_id,
             token_list,
+            return_logprob,
+            grammar_terminated_list,
+            grammar_collect_slot,
         ) = self.output_queue.get()
         copy_done.synchronize()
+        # Collect the grammar termination snapshot HERE, after copy_done is
+        # synchronized. For both the graph and eager verify paths, copy_done is
+        # recorded after the grammar-stream join (graph end / eager
+        # main_stream.wait_stream), so the accept host node's writes to
+        # terminated_ring[slot] / error_ring[slot] are now visible. Doing it here
+        # (not on the forward thread) keeps launch-ahead intact: the forward
+        # thread never blocks on the grammar result.
+        if grammar_collect_slot >= 0:
+            ctx = self.worker.grammar_ctx
+            accept_lens = accept_lengths_cpu.tolist() if accept_lengths_cpu is not None else []
+            grammar_terminated_list = ctx.collect_terminated(grammar_collect_slot, accept_lens)
+            error = ctx.error_ring[grammar_collect_slot]
+            if bool(error.any().item()):
+                bad = [i for i, e in enumerate(error.tolist()) if e]
+                logger.error(f"[EAGLEWorkerOverlap] in-graph grammar accept failed for batch slots {bad}; their constrained output may be invalid.")
         # Wait here for current batch target kernel launch to complete
         launch_done.wait()
+        if isinstance(grammar_terminated_list, threading.Event):
+            assert __is_npu__, "Only NPU workers support async grammar update"
+            # NPU: the grammar accept loop runs in the worker's grammar-update
+            # thread. Wait here (on the scheduler thread, off the forward
+            # critical path) until the materialized list is ready.
+            grammar_terminated_list.wait()
+            grammar_terminated_list = grammar_terminated_list.grammar_terminated_list
         if next_token_ids is not None:
             next_token_ids = next_token_ids.tolist()
+        # Convert logprob tensors to list after GPU→CPU sync
+        if return_logprob and logits_output is not None:
+            logits_output.convert_logprobs_to_python()
         # Return to enter post-processing, after post-processing schedule next batch, at this time target GPU kernels have not finished running
         # can achieve overlap effect
         return (
@@ -345,6 +413,7 @@ class EagleWorkerOverlapped:
             accept_lengths_cpu,
             new_verified_id,
             token_list,
+            grammar_terminated_list,
         )
 
     def renew_scaling_penalty(self, req_pool_indices: torch.Tensor):

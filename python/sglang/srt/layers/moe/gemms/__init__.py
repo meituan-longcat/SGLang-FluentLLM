@@ -1,7 +1,14 @@
 from sglang.srt.layers.quantization import (
-    CompressedTensorsConfig, Fp8Config, W8A8Fp8Config, W8A8Int8Config,
+    CompressedTensorsConfig,
+    Fp8Config,
+    W8A8Fp8Config,
+    W8A8Int8Config,
 )
-from sglang.srt.layers.moe.gemms.bf16.aok import AokGroupedGemmWrapper
+from sglang.srt.utils import is_sm90_supported
+
+if is_sm90_supported():
+    from sglang.srt.layers.moe.gemms.bf16.aok import AokGroupedGemmWrapper
+
 from sglang.srt.layers.quantization.utils import should_ignore_quant_layer
 
 
@@ -20,13 +27,8 @@ def get_gemm_cls(quant_config, is_ep: bool, prefix: str = ""):
         RuntimeError: If the quantization configuration is not supported
     """
     # Handle ignored layers or no quantization
-    if (quant_config is None or should_ignore_quant_layer(
-        prefix=prefix,
-        ignored_layers=getattr(quant_config, "ignored_layers", [])
-    )):
-        return AokGroupedGemmWrapper if is_ep else (
-            _import_triton_gemm("bf16")
-        )
+    if quant_config is None or should_ignore_quant_layer(prefix=prefix, ignored_layers=getattr(quant_config, "ignored_layers", [])):
+        return AokGroupedGemmWrapper if is_ep and is_sm90_supported() else (_import_triton_gemm("bf16"))
 
     # CompressedTensorsConfig
     if isinstance(quant_config, CompressedTensorsConfig):
@@ -34,17 +36,13 @@ def get_gemm_cls(quant_config, is_ep: bool, prefix: str = ""):
         input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             from sglang.srt.layers.moe.gemms.wna16 import WNA16MoEGemmWrapper
+
             return WNA16MoEGemmWrapper
-        raise RuntimeError(
-            f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
-        )
+        raise RuntimeError(f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}")
 
     # Fp8Config with block quantization
     if isinstance(quant_config, Fp8Config) and quant_config.weight_block_size is not None:
-        return (
-            _import_fire_grouped_gemm() if is_ep
-            else _import_triton_gemm("fp8")
-        )
+        return _import_fire_grouped_gemm() if is_ep else _import_triton_gemm("fp8")
 
     # W8A8 quantization configs
     if isinstance(quant_config, W8A8Fp8Config):
@@ -73,4 +71,5 @@ def _import_triton_gemm(module: str):
 
 def _import_fire_grouped_gemm():
     from sglang.srt.layers.moe.gemms.fp8.fire import FireGroupedGemmWrapper
+
     return FireGroupedGemmWrapper

@@ -10,7 +10,7 @@ import tqdm
 from sglang.srt.constrained.base_grammar_backend import create_grammar_backend
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
-from sglang.srt.hf_transformers_utils import get_tokenizer
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.cuda_graph_runner import (
     get_batch_sizes_to_capture,
     patch_model,
@@ -21,8 +21,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.oe_utils import update_token_table
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.oe_utils import update_token_table
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.pld_worker import PLDWorker
@@ -81,7 +82,7 @@ class PLDCudaGraphRunner:
                 "1. disable cuda graph by --disable-cuda-graph\n"
                 "2. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
                 "3. set --cuda-graph-max-bs to a smaller value (e.g., 32)\n"
-            )
+            ) from e
 
     def _init_cuda_tensors(self):
         """Initialize pre-allocated CUDA tensors for graph capture."""
@@ -107,14 +108,8 @@ class PLDCudaGraphRunner:
                     ),
                     dtype=self.target_worker.model_runner.dtype,
                 )
-            self.scaling_penalties = torch.ones(
-                (self.max_bs,),
-                dtype=torch.float32
-            )
-            self.cumulated_scaling_penalties = torch.ones(
-                (self.max_bs, self.target_worker.model_runner.model_config.vocab_size),
-                dtype=torch.float32
-            )
+            self.scaling_penalties = torch.ones((self.max_bs,), dtype=torch.float32)
+            self.cumulated_scaling_penalties = torch.ones((self.max_bs, self.target_worker.model_runner.model_config.vocab_size), dtype=torch.float32)
             if self.use_over_embedding:
                 self.oe_column_starts = torch.empty([self.max_bs], dtype=torch.int32)
                 self.oe_req_lens = torch.empty([self.max_bs], dtype=torch.int32)
@@ -164,16 +159,10 @@ class PLDCudaGraphRunner:
             )
             max_bsz = int(max_num_tokens / self.draft_token_num)
             is_bs_supported = forward_batch.all_decode_or_idle and (
-                (min_num_tokens == max_num_tokens and max_bsz in self.graphs)
-                if self.disable_padding
-                else max_bsz <= self.max_bs
+                (min_num_tokens == max_num_tokens and max_bsz in self.graphs) if self.disable_padding else max_bsz <= self.max_bs
             )
         else:
-            is_bs_supported = (
-                forward_batch.batch_size in self.graphs
-                if self.disable_padding
-                else forward_batch.batch_size <= self.max_bs
-            )
+            is_bs_supported = forward_batch.batch_size in self.graphs if self.disable_padding else forward_batch.batch_size <= self.max_bs
 
         return is_bs_supported
 
@@ -212,9 +201,7 @@ class PLDCudaGraphRunner:
         assert forward_batch.forward_mode.is_target_verify()
 
         if self.use_over_embedding:
-            forward_batch.oe_column_starts[:raw_bs] = forward_batch.req_to_token_pool.verified_lens[
-                forward_batch.req_pool_indices
-            ]
+            forward_batch.oe_column_starts[:raw_bs] = forward_batch.req_to_token_pool.verified_lens[forward_batch.req_pool_indices]
             forward_batch.oe_req_lens[:raw_bs] = self.draft_token_num
 
         self._copy_inputs_to_graph_tensors(forward_batch, vocab_masks, raw_bs, raw_num_token)
@@ -234,8 +221,7 @@ class PLDCudaGraphRunner:
 
         return out
 
-    def _copy_inputs_to_graph_tensors(self, forward_batch: ForwardBatch, vocab_masks: Optional[torch.Tensor],
-                                    raw_bs: int, raw_num_token: int):
+    def _copy_inputs_to_graph_tensors(self, forward_batch: ForwardBatch, vocab_masks: Optional[torch.Tensor], raw_bs: int, raw_num_token: int):
         """Copy inputs from forward_batch to pre-allocated graph tensors."""
         self.draft_token[:raw_num_token].copy_(forward_batch.spec_info.draft_token)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
@@ -252,8 +238,8 @@ class PLDCudaGraphRunner:
             self.grammar_backend.reset_vocab_masks(self.vocab_masks[:raw_num_token])
 
         sampling_info = forward_batch.sampling_info
-        self.scaling_penalties[: raw_bs].copy_(sampling_info.repetition_penalties)
-        self.cumulated_scaling_penalties[: raw_bs].copy_(forward_batch.spec_info.cumulated_scaling_penalties)
+        self.scaling_penalties[:raw_bs].copy_(sampling_info.repetition_penalties)
+        self.cumulated_scaling_penalties[:raw_bs].copy_(forward_batch.spec_info.cumulated_scaling_penalties)
         if self.capture_sample_graph:
             self.temperature_buffer[:raw_bs].copy_(sampling_info.temperatures)
             self.topk_buffer[:raw_bs].copy_(sampling_info.top_ks)
@@ -279,11 +265,7 @@ class PLDCudaGraphRunner:
 
         with graph_capture() as graph_capture_context:
             self.stream = graph_capture_context.stream
-            capture_range = (
-                tqdm.tqdm(self.capture_bs)
-                if get_tensor_model_parallel_rank() == 0
-                else self.capture_bs
-            )
+            capture_range = tqdm.tqdm(self.capture_bs) if get_tensor_model_parallel_rank() == 0 else self.capture_bs
             for bs in capture_range:
                 with patch_model(
                     self.target_worker.model_runner.model,
@@ -320,9 +302,7 @@ class PLDCudaGraphRunner:
 
             if self.use_over_embedding:
                 # Prewrite verify tokens so OE n-gram for token2 can see token1.
-                self.oe_out_column_starts[:bs] = self.target_worker.model_runner.req_to_token_pool.verified_lens[
-                    forward_batch.req_pool_indices
-                ]
+                self.oe_out_column_starts[:bs] = self.target_worker.model_runner.req_to_token_pool.verified_lens[forward_batch.req_pool_indices]
                 self.oe_out_req_lens[:bs] = self.draft_token_num
                 update_token_table(
                     oe_token_table=forward_batch.oe_token_table,
@@ -332,20 +312,12 @@ class PLDCudaGraphRunner:
                     oe_req_lens=self.oe_out_req_lens[:bs],
                 )
 
-            logits_output = forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch
-            )
+            logits_output = forward(forward_batch.input_ids, forward_batch.positions, forward_batch)
 
-            target_predict, logits_output, accept_length, accept_index = (
-                self.pld_worker.rejection_sampling(forward_batch, logits_output, vocab_masks)
-            )
+            target_predict, logits_output, accept_length, accept_index = self.pld_worker.rejection_sampling(forward_batch, logits_output, vocab_masks)
             if self.use_over_embedding:
                 # Only commit accepted tokens only
-                self.oe_out_column_starts[:bs] = self.target_worker.model_runner.req_to_token_pool.verified_lens[
-                    forward_batch.req_pool_indices
-                ]
+                self.oe_out_column_starts[:bs] = self.target_worker.model_runner.req_to_token_pool.verified_lens[forward_batch.req_pool_indices]
                 self.oe_out_req_lens[:bs] = accept_length
                 update_token_table(
                     oe_token_table=forward_batch.oe_token_table,
@@ -363,9 +335,7 @@ class PLDCudaGraphRunner:
             req_pool_indices = forward_batch.req_pool_indices
             self.target_worker.model_runner.req_to_token_pool.verified_lens[req_pool_indices] += accept_length
 
-            token_list = self.pld_worker.propose(
-                forward_batch, target_predict, accept_length
-            )
+            token_list = self.pld_worker.propose(forward_batch, target_predict, accept_length)
 
             return (
                 logits_output,
@@ -431,10 +401,10 @@ class PLDCudaGraphRunner:
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum(),
             oe_token_table=self.token_table if self.use_over_embedding else None,
-            oe_column_starts=self.oe_column_starts[: bs] if self.use_over_embedding else None,
-            oe_req_lens=self.oe_req_lens[: bs] if self.use_over_embedding else None,
-            oe_out_column_starts=self.oe_out_column_starts[: bs] if self.use_over_embedding else None,
-            oe_out_req_lens=self.oe_out_req_lens[: bs] if self.use_over_embedding else None,
+            oe_column_starts=self.oe_column_starts[:bs] if self.use_over_embedding else None,
+            oe_req_lens=self.oe_req_lens[:bs] if self.use_over_embedding else None,
+            oe_out_column_starts=self.oe_out_column_starts[:bs] if self.use_over_embedding else None,
+            oe_out_req_lens=self.oe_out_req_lens[:bs] if self.use_over_embedding else None,
             return_logprob=False,
             positions=positions,
             global_num_tokens=global_num_tokens,
@@ -455,7 +425,7 @@ class PLDCudaGraphRunner:
             top_ps=self.topp_buffer[:bs],
             min_ps=self.minp_buffer[:bs],
             repetition_penalties=self.scaling_penalties[:bs],
-            is_all_greedy=False if self.capture_sample_graph else True,
+            is_all_greedy=not self.capture_sample_graph,
             need_min_p_sampling=False,
             vocab_size=self.target_worker.model_runner.model_config.vocab_size,
         )
@@ -476,7 +446,7 @@ class PLDCudaGraphRunner:
             draft_token_num=self.draft_token_num,
             spec_steps=self.pld_worker.speculative_num_steps,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            is_all_greedy=False if self.capture_sample_graph else True,
+            is_all_greedy=not self.capture_sample_graph,
             grammar=grammar,
             cumulated_scaling_penalties=self.cumulated_scaling_penalties[:bs, :],
         )
@@ -492,10 +462,13 @@ class PLDCudaGraphRunner:
             token_list,
         ) = out
 
-        # Trim outputs to raw batch size
-        logits_output.next_token_logits = logits_output.next_token_logits[: raw_bs * self.draft_token_num]
-        logits_output.hidden_states = logits_output.hidden_states[: raw_bs * self.draft_token_num]
-        output_ids = output_ids[: raw_bs * self.draft_token_num]
+        n = raw_bs * self.draft_token_num
+        new_logits_output = LogitsProcessorOutput(
+            next_token_logits=logits_output.next_token_logits[:n],
+            hidden_states=logits_output.hidden_states[:n],
+            spec_accept_index=(logits_output.spec_accept_index[:n] if logits_output.spec_accept_index is not None else None),
+        )
+        output_ids = output_ids[:n]
         accept_length = accept_length[:raw_bs]
         new_verified_id = new_verified_id[:raw_bs]
 
@@ -504,7 +477,7 @@ class PLDCudaGraphRunner:
             token_list = [t[:raw_bs] for t in token_list]
 
         return (
-            logits_output,
+            new_logits_output,
             output_ids,
             accept_length,
             new_verified_id,

@@ -1,7 +1,8 @@
-from sglang.srt.utils import get_colorful_logger
 from typing import Optional
 
 import torch
+
+from sglang.srt.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 

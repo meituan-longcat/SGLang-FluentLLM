@@ -1,7 +1,8 @@
+# ruff: noqa: S105
 import json
 import logging
 import re
-from typing import List, Union, Literal
+from typing import Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -40,29 +41,25 @@ class KimiK2Detector(BaseFormatDetector):
         self.tool_call_end_token: str = "<|tool_call_end|>"
 
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
+            re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)"
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w\.-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*\})", re.DOTALL
         )
 
         self._last_arguments = ""
 
         # Robust parser for ids like "functions.search:0" or fallback "search:0"
-        self.tool_call_id_regex = re.compile(
-            r"^(?:functions\.)?(?P<name>[\w\.]+):(?P<index>\d+)$"
-        )
+        self.tool_call_id_regex = re.compile(r"^(?:functions\.)?(?P<name>[\w\.-]+):(?P<index>\d+)$")
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
         return self.bot_token in text
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -111,10 +108,7 @@ class KimiK2Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing tool calls for KimiK2 format.
@@ -123,9 +117,7 @@ class KimiK2Detector(BaseFormatDetector):
         current_text = self._buffer
 
         # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = (
-            self.bot_token in current_text or self.tool_call_start_token in current_text
-        )
+        has_tool_call = self.bot_token in current_text or self.tool_call_start_token in current_text
 
         if not has_tool_call:
             self._buffer = ""
@@ -177,16 +169,11 @@ class KimiK2Detector(BaseFormatDetector):
                         "arguments": {},
                     }
                 else:
-                    argument_diff = (
-                        function_args[len(self._last_arguments) :]
-                        if function_args.startswith(self._last_arguments)
-                        else function_args
-                    )
+                    argument_diff = function_args[len(self._last_arguments) :] if function_args.startswith(self._last_arguments) else function_args
 
                     parsed_args_diff = argument_diff.split("<|tool_call_end|>", 1)[0]
 
                     if parsed_args_diff:
-
                         calls.append(
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
@@ -195,27 +182,19 @@ class KimiK2Detector(BaseFormatDetector):
                             )
                         )
                         self._last_arguments += argument_diff
-                        self.streamed_args_for_tool[
-                            self.current_tool_id
-                        ] += parsed_args_diff
+                        self.streamed_args_for_tool[self.current_tool_id] += parsed_args_diff
 
                     parsed_args = function_args.split("<|tool_call_end|>", 1)[0]
                     if _is_complete_json(parsed_args):
                         try:
                             parsed_args = json.loads(parsed_args)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
+                            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = parsed_args
                         except json.JSONDecodeError:
                             pass
 
                         # Find the end of the current tool call and remove only that part from buffer
-                        tool_call_end_pattern = (
-                            r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
-                        )
-                        match = re.search(
-                            tool_call_end_pattern, current_text, re.DOTALL
-                        )
+                        tool_call_end_pattern = r"<\|tool_call_begin\|>.*?<\|tool_call_end\|>"
+                        match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
                         if match:
                             # Remove the completed tool call from buffer, keep any remaining content
                             self._buffer = current_text[match.end() :]

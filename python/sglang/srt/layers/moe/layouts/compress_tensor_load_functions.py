@@ -1,6 +1,7 @@
 from enum import Enum
 import torch
 
+
 class FusedMoeWeightScaleSupported(Enum):
     TENSOR = "tensor"
     CHANNEL = "channel"
@@ -24,6 +25,7 @@ def _load_per_tensor_weight_scale(
     # If we are in the row parallel case (down_proj)
     elif shard_id == "w2":
         param_data[local_expert_id] = loaded_weight
+
 
 def _load_model_weight_or_group_weight_scale(
     shard_dim: int,
@@ -54,6 +56,7 @@ def _load_model_weight_or_group_weight_scale(
             use_presharded_weights=use_presharded_weights,
         )
 
+
 def _load_per_channel_weight_scale(
     expert_data: torch.Tensor,
     shard_dim: int,
@@ -75,6 +78,7 @@ def _load_per_channel_weight_scale(
             use_presharded_weights=use_presharded_weights,
         )
 
+
 def _load_w13(
     expert_data: torch.Tensor,
     shard_dim: int,
@@ -89,9 +93,7 @@ def _load_w13(
     shard_size = expert_data.shape[shard_dim] // 2
 
     if not use_presharded_weights:
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
-        )
+        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank, shard_size)
 
     # Narrow parameter and load.
     # w1, gate_proj: Load into first logical weight of w13.
@@ -102,6 +104,7 @@ def _load_w13(
         assert shard_id == "w3"
         expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
     expert_data.copy_(loaded_weight)
+
 
 def _load_w2(
     expert_data: torch.Tensor,
@@ -118,20 +121,18 @@ def _load_w2(
     shard_size = expert_data.shape[shard_dim]
 
     if not use_presharded_weights:
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, shard_size * tp_rank, shard_size
-        )
+        loaded_weight = loaded_weight.narrow(shard_dim, shard_size * tp_rank, shard_size)
 
     # w2, down_proj: Load into only logical weight of w2.
     expert_data.copy_(loaded_weight)
 
-def _load_single_value(
-    param: torch.nn.Parameter, loaded_weight: torch.Tensor, local_expert_id: int
-):
+
+def _load_single_value(param: torch.nn.Parameter, loaded_weight: torch.Tensor, local_expert_id: int):
     param_data = param.data
 
     # Input scales can be loaded directly and should be equal.
     param_data[local_expert_id] = loaded_weight
+
 
 def _load_g_idx(
     shard_id: str,
@@ -153,13 +154,9 @@ def _load_g_idx(
         assert shard_id in ("w1", "w3")
         expert_data.copy_(loaded_weight)
 
+
 def load_model_weight(
-    param: torch.nn.Parameter,
-    loaded_weight: torch.Tensor,
-    weight_name: str,
-    shard_id: str,
-    local_expert_id: int,
-    tp_rank: int
+    param: torch.nn.Parameter, loaded_weight: torch.Tensor, weight_name: str, shard_id: str, local_expert_id: int, tp_rank: int
 ) -> None:
     # compressed-tensors checkpoints with packed weights are stored flipped
     # TODO (mgoin): check quant_method.quant_config.quant_format
@@ -167,9 +164,7 @@ def load_model_weight(
     loaded_weight = loaded_weight.t().contiguous()
 
     if shard_id not in ("w1", "w2", "w3"):
-        raise ValueError(
-            f"shard_id must be ['w1','w2','w3'] but " f"got {shard_id}."
-        )
+        raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
 
     WEIGHT_SCALE_SUPPORTED = [e.value for e in FusedMoeWeightScaleSupported]
     # Fetch the dim to shard the parameter/loaded weight
@@ -192,19 +187,10 @@ def load_model_weight(
         # this is needed for compressed-tensors only
         loaded_weight = loaded_weight.to(param.data.device)
 
-        if (
-            param.data[local_expert_id] != 1
-            and (param.data[local_expert_id] - loaded_weight).abs() > 1e-5
-        ):
-            raise ValueError(
-                "input_scales of w1 and w3 of a layer "
-                f"must be equal. But got {param.data[local_expert_id]} "
-                f"vs. {loaded_weight}"
-            )
+        if param.data[local_expert_id] != 1 and (param.data[local_expert_id] - loaded_weight).abs() > 1e-5:
+            raise ValueError(f"input_scales of w1 and w3 of a layer must be equal. But got {param.data[local_expert_id]} vs. {loaded_weight}")
 
-        _load_single_value(
-            param=param, loaded_weight=loaded_weight, local_expert_id=local_expert_id
-        )
+        _load_single_value(param=param, loaded_weight=loaded_weight, local_expert_id=local_expert_id)
         return
 
     # Case g_idx
@@ -253,17 +239,13 @@ def load_model_weight(
                 local_expert_id=local_expert_id,
             )
         else:
-            raise ValueError(
-                f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}"
-            )
+            raise ValueError(f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}")
         return
 
     # Case weight_shape
     if "weight_shape" in weight_name:
         # only required by compressed-tensors
-        _load_single_value(
-            param=param, loaded_weight=loaded_weight, local_expert_id=local_expert_id
-        )
+        _load_single_value(param=param, loaded_weight=loaded_weight, local_expert_id=local_expert_id)
         return
 
     # Case model weights

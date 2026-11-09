@@ -1,22 +1,24 @@
-from typing import Dict, Any
-from torch import nn, Tensor
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.dp_attention import get_attention_tp_rank
-from sglang.srt.utils import get_colorful_logger
 import importlib
+from typing import Any
+
+from torch import Tensor, nn
+
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_rank
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
 
 # Used for Input/Output Processor sharing
 class ContextBase:
-    def __init__(self, base_lm, config_dict: Dict[str, Any]):
+    def __init__(self, base_lm, config_dict: dict[str, Any]):
         pass
 
 
 class InputProcessorBase(nn.Module):
-    def __init__(self, base_lm, ctx, config_dict: Dict[str, Any]):
+    def __init__(self, base_lm, ctx, config_dict: dict[str, Any]):
         super().__init__()
         self.base_lm = base_lm
 
@@ -34,7 +36,7 @@ class InputProcessorBase(nn.Module):
 
 
 class OutputProcessorBase(nn.Module):
-    def __init__(self, base_lm, ctx, config_dict: Dict[str, Any]):
+    def __init__(self, base_lm, ctx, config_dict: dict[str, Any]):
         super().__init__()
         self.base_lm = base_lm
 
@@ -53,7 +55,7 @@ class OutputProcessorBase(nn.Module):
         )
 
 
-_EXT_CLS_REGISTRY: Dict[str, type] = {}
+_EXT_CLS_REGISTRY: dict[str, type] = {}
 
 
 def register_ext_cls(name: str, cls: type) -> None:
@@ -76,14 +78,15 @@ class ExtensibleLM(nn.Module):
     def __init__(
         self,
         base_lm: nn.Module,
-        ext_config: Dict[str, Any],
+        ext_config: dict[str, Any],
     ) -> None:
         super().__init__()
         self.base_lm = base_lm
 
         if "ext_def_file" in ext_config:
             ext_def_file = ext_config["ext_def_file"]
-            import sys, os
+            import os
+            import sys
             from pathlib import Path
 
             ext_def_dir = os.path.dirname(os.path.abspath(ext_def_file))
@@ -137,8 +140,6 @@ class ExtensibleLM(nn.Module):
         )
 
         # output processor: lm hidden states to logits
-        logits_output: LogitsProcessorOutput = self.output_processor(
-            input_ids, positions, forward_batch, out_hidden_states
-        )
+        logits_output: LogitsProcessorOutput = self.output_processor(input_ids, positions, forward_batch, out_hidden_states)
         self.step += 1
         return logits_output

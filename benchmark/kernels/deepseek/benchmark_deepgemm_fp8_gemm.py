@@ -1,20 +1,15 @@
-import itertools
-from typing import Tuple
 
 import deep_gemm
-import numpy as np
 import torch
 import triton
-import triton.language as tl
 from deep_gemm import ceil_div, get_col_major_tma_aligned_tensor
+from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import w8a8_block_fp8_matmul
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     w8a8_block_fp8_matmul as vllm_w8a8_block_fp8_matmul,
 )
 
-from sglang.srt.layers.dense.gemms.fp8.fp8_kernel import w8a8_block_fp8_matmul
 
-
-def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def per_token_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
     m, n = x.shape
     x_view = x.view(m, -1, 128)
@@ -24,7 +19,7 @@ def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     ), (x_amax / 448.0).view(m, -1)
 
 
-def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def per_block_cast_to_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
     x_padded = torch.zeros(

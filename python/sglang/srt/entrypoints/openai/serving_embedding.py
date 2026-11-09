@@ -1,9 +1,8 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.srt.parser.conversation import generate_embedding_convs
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
@@ -16,6 +15,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.parser.conversation import generate_embedding_convs
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):
@@ -55,14 +55,14 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 # List of strings
                 for i, item in enumerate(input):
                     if not isinstance(item, str):
-                        return f"All items in input list must be strings"
+                        return "All items in input list must be strings"
                     if not item.strip():
                         return f"Input at index {i} cannot be empty or whitespace only"
             elif isinstance(first_item, int):
                 # List of integers (token IDs)
                 for i, item in enumerate(input):
                     if not isinstance(item, int):
-                        return f"All items in input list must be integers"
+                        return "All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
         return None
@@ -92,9 +92,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
                 if self.template_manager.chat_template_name is not None:
-                    convs = generate_embedding_convs(
-                        texts, images, self.template_manager.chat_template_name
-                    )
+                    convs = generate_embedding_convs(texts, images, self.template_manager.chat_template_name)
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
                 else:
@@ -132,9 +130,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
     ) -> Union[EmbeddingResponse, ErrorResponse, ORJSONResponse]:
         """Handle the embedding request"""
         try:
-            ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
+            ret = await self.tokenizer_manager.generate_request(adapted_request, raw_request).__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -144,7 +140,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         response = self._build_embedding_response(ret)
         return response
 
-    def _build_embedding_response(self, ret: List[Dict[str, Any]]) -> EmbeddingResponse:
+    def _build_embedding_response(self, ret: list[dict[str, Any]]) -> EmbeddingResponse:
         """Build the embedding response"""
         embedding_objects = []
         prompt_tokens = 0

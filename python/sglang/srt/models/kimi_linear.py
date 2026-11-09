@@ -1,5 +1,6 @@
 # Adapted from: https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/models/kimi_linear.py
 
+import os
 from collections.abc import Iterable
 from typing import Optional
 
@@ -9,27 +10,26 @@ from torch import nn
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
-    divide,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
-from sglang.srt.layers.moe.layer import MoELayer
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.fla.kda import FusedRMSNormGated
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.moe.layer import MoELayer
+from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.managers.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -37,10 +37,68 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
-from sglang.srt.utils import make_layers
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.ops.activation import SiluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.ops.topk import TopK, TopKOutputFormat
+from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils.common import divide
+
+
+class KimiSharedExpertMLP(nn.Module):
+    """Shared expert MLP matching the active MoE parallel strategy."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
+        if global_server_args_dict["enable_ep_moe"]:
+            self.gate_up_proj = ReplicatedLinear(
+                hidden_size,
+                intermediate_size * 2,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+            )
+            self.down_proj = ReplicatedLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size, intermediate_size],
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+                reduce_results=False,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] == 0:
+            return x
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 class KimiMoE(nn.Module):
@@ -64,10 +122,7 @@ class KimiMoE(nn.Module):
         self.alt_stream = alt_stream
 
         if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {config.hidden_act}. Only silu is supported for now.")
 
         # Gate always runs at half / full precision for now.
         self.gate = ReplicatedLinear(
@@ -93,6 +148,7 @@ class KimiMoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
+            layer_id=self.layer_idx,
             use_grouped_topk=config.use_grouped_topk,
             num_expert_group=config.num_expert_group,
             topk_group=config.topk_group,
@@ -106,11 +162,12 @@ class KimiMoE(nn.Module):
 
         if self.num_shared_experts is not None:
             intermediate_size = moe_intermediate_size * self.num_shared_experts
-            self.shared_experts = KimiMLP(
+            self.shared_experts = KimiSharedExpertMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=add_prefix("shared_experts", prefix),
             )
 
     def forward(self, hidden_states: torch.Tensor, num_global_tokens: int, max_num_tokens_per_gpu: int) -> torch.Tensor:
@@ -149,10 +206,7 @@ class KimiMoE(nn.Module):
                 shared_output = self.shared_experts(hidden_states)
             router_logits, _ = self.gate(hidden_states)
             router_logits = router_logits.to(torch.float32)
-            if hidden_states.shape[0] > 0:
-                topk_output = self.topk(hidden_states, router_logits)
-            else:
-                topk_output = self.topk.empty_topk_output(hidden_states.device)
+            topk_output = self.topk(hidden_states, router_logits) if hidden_states.shape[0] > 0 else self.topk.empty_topk_output(hidden_states.device)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
@@ -165,7 +219,7 @@ class KimiMoE(nn.Module):
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-    
+
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
@@ -186,6 +240,11 @@ class KimiDeltaAttention(nn.Module):
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
         self.num_heads = config.linear_attn_config["num_heads"]
+        self.use_fgb_kda = str(getattr(config, "linear_method", "")).upper() == "FGBKDA"
+        # Optional safe-gate bound via env (default None -> standard softplus gate).
+        # Example: FLA_KDA_LOWER_BOUND=-5.0
+        _lb = os.getenv("FLA_KDA_LOWER_BOUND")
+        self.lower_bound = float(_lb) if _lb is not None and _lb != "" else None
         self.layer_idx = layer_idx
         self.prefix = prefix
         assert self.num_heads % self.tp_size == 0
@@ -231,19 +290,36 @@ class KimiDeltaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.f_b_proj",
         )
-        self.dt_bias = nn.Parameter(
-            torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32)
-        )
+        self.dt_bias = nn.Parameter(torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32))
 
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
-        self.b_proj = ColumnParallelLinear(
-            self.hidden_size,
-            self.num_heads,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.b_proj",
-        )
+        if self.use_fgb_kda:
+            projection_size = self.head_dim * self.num_heads
+            self.b_proj = nn.Sequential(
+                ReplicatedLinear(
+                    self.hidden_size,
+                    self.head_dim,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.b_proj.0",
+                ),
+                ColumnParallelLinear(
+                    self.head_dim,
+                    projection_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.b_proj.1",
+                ),
+            )
+        else:
+            self.b_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.b_proj",
+            )
 
         self.q_conv1d = ColumnParallelLinear(
             input_size=self.conv_size,
@@ -274,9 +350,7 @@ class KimiDeltaAttention(nn.Module):
         self.k_conv1d.weight.data = self.k_conv1d.weight.data.unsqueeze(1)
         self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
 
-        self.A_log = nn.Parameter(
-            torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
-        )
+        self.A_log = nn.Parameter(torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32))
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
 
         self.g_a_proj = ReplicatedLinear(
@@ -293,38 +367,32 @@ class KimiDeltaAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.g_b_proj",
         )
-        self.o_norm = FusedRMSNormGated(
-            self.head_dim, eps=rms_norm_eps, activation="sigmoid"
-        )
+        self.o_norm = FusedRMSNormGated(self.head_dim, eps=rms_norm_eps, activation="sigmoid")
         self.o_proj = RowParallelLinear(
-            projection_size,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-            reduce_results=False
+            projection_size, self.hidden_size, bias=False, quant_config=quant_config, prefix=f"{prefix}.o_proj", reduce_results=False
         )
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
         positions: torch.Tensor,
+        hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         comm_manager: Optional[DecoderCommMananger] = None,
+        block_scale: Optional[torch.Tensor] = None,
+        can_run_flashinfer_fusion: bool = False,
     ) -> torch.Tensor:
+        # Align with DeepseekV2AttentionMLA: accept unused MLA fusion kwargs and
+        # do pre_attn_comm inside so callers can use a single attn call path.
+        if comm_manager is not None:
+            hidden_states = comm_manager.pre_attn_comm(hidden_states, forward_batch.tp_num_tokens)
+
         q_proj_states = self.q_proj(hidden_states)[0]
         k_proj_states = self.k_proj(hidden_states)[0]
         v_proj_states = self.v_proj(hidden_states)[0]
 
-        q_conv_weights = self.q_conv1d.weight.view(
-            self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2)
-        )
-        k_conv_weights = self.k_conv1d.weight.view(
-            self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2)
-        )
-        v_conv_weights = self.v_conv1d.weight.view(
-            self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2)
-        )
+        q_conv_weights = self.q_conv1d.weight.view(self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2))
+        k_conv_weights = self.k_conv1d.weight.view(self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2))
+        v_conv_weights = self.v_conv1d.weight.view(self.v_conv1d.weight.size(0), self.v_conv1d.weight.size(2))
 
         kwargs = {
             "q_proj_states": q_proj_states,
@@ -344,7 +412,10 @@ class KimiDeltaAttention(nn.Module):
             "head_dim": self.head_dim,
             "hidden_states": hidden_states,
             "layer_id": self.layer_idx,
+            "use_fgb_kda": self.use_fgb_kda,
         }
+        if self.lower_bound is not None:
+            kwargs["lower_bound"] = self.lower_bound
         core_attn_out = forward_batch.attn_backend.forward(
             q=None,
             k=None,
@@ -399,13 +470,10 @@ class KimiDecoderLayer(nn.Module):
                 q_lora_rank=config.q_lora_rank,
                 kv_lora_rank=config.kv_lora_rank,
                 skip_rope=True,
-                reduce_attn_results=False
+                reduce_attn_results=False,
             )
         self.is_layer_sparse = (
-            self.is_moe
-            and config.num_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % config.moe_layer_freq == 0
+            self.is_moe and config.num_experts is not None and layer_idx >= config.first_k_dense_replace and layer_idx % config.moe_layer_freq == 0
         )
 
         if self.is_layer_sparse:
@@ -426,9 +494,7 @@ class KimiDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.layer_id = layer_idx
 
@@ -438,7 +504,7 @@ class KimiDecoderLayer(nn.Module):
             dense_parallel_strategy=global_server_args_dict["dense_parallel_strategy"],
             moe_parallel_strategy=global_server_args_dict["moe_parallel_strategy"],
             is_moe_layer=self.is_layer_sparse,
-            num_layers=config.num_hidden_layers
+            num_layers=config.num_hidden_layers,
         )
 
     def forward(
@@ -459,44 +525,23 @@ class KimiDecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-            # DeepseekV2AttentionMLA does pre_attn_comm internally
-            if self.is_kda:
-                hidden_states = self.decoder_comm_manager.pre_attn_comm(hidden_states, tp_num_tokens)
-            
             hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                comm_manager=self.decoder_comm_manager
+                positions=positions, hidden_states=hidden_states, forward_batch=forward_batch, comm_manager=self.decoder_comm_manager
             )
 
-            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(
-                hidden_states, residual, tp_num_tokens)
+            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(hidden_states, residual, tp_num_tokens)
 
             # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        hidden_states = self.forward_mlp(
-            hidden_states, residual, forward_batch, num_global_tokens, max_num_tokens_per_gpu, tp_num_tokens
-        )
+        hidden_states = self.forward_mlp(hidden_states, residual, forward_batch, num_global_tokens, max_num_tokens_per_gpu, tp_num_tokens)
         return hidden_states, residual
 
-    def forward_mlp(
-        self,
-        hidden_states, residual,
-        forward_batch, num_global_tokens, max_num_tokens_per_gpu, tp_num_tokens
-    ):
-        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(
-            hidden_states, forward_batch, tp_num_tokens
-        )
-        if self.is_layer_sparse:
-            hidden_states = self.mlp(hidden_states, num_global_tokens, max_num_tokens_per_gpu)
-        else:
-            hidden_states = self.mlp(hidden_states)
+    def forward_mlp(self, hidden_states, residual, forward_batch, num_global_tokens, max_num_tokens_per_gpu, tp_num_tokens):
+        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(hidden_states, forward_batch, tp_num_tokens)
+        hidden_states = self.mlp(hidden_states, num_global_tokens, max_num_tokens_per_gpu) if self.is_layer_sparse else self.mlp(hidden_states)
 
-        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(
-            hidden_states, residual, tp_num_tokens, forward_batch
-        )
+        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(hidden_states, residual, tp_num_tokens, forward_batch)
         if start_idx is not None and end_idx is not None:
             hidden_states = hidden_states[start_idx:end_idx]
         return hidden_states
@@ -538,9 +583,7 @@ class KimiLinearModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         world_size = get_tensor_model_parallel_world_size()
-        assert (
-            config.num_attention_heads % world_size == 0
-        ), "num_attention_heads must be divisible by world_size"
+        assert config.num_attention_heads % world_size == 0, "num_attention_heads must be divisible by world_size"
 
     def forward(
         self,
@@ -549,10 +592,7 @@ class KimiLinearModel(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: torch.Tensor,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            hidden_states = self.embed_tokens(input_ids)
+        hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
         residual = None
 
         tp_num_tokens = hidden_states.shape[0]
@@ -574,8 +614,7 @@ class KimiLinearModel(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-            hidden_states, _ = layer.decoder_comm_manager.post_final_norm_comm \
-                    (hidden_states, residual, tp_num_tokens)
+            hidden_states, _ = layer.decoder_comm_manager.post_final_norm_comm(hidden_states, residual, tp_num_tokens)
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -593,9 +632,7 @@ class KimiLinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = KimiLinearModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = KimiLinearModel(config, quant_config, prefix=add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
@@ -618,10 +655,9 @@ class KimiLinearForCausalLM(nn.Module):
             forward_batch,
             inputs_embeds,
         )
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
+    @torch.no_grad()
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -721,11 +757,7 @@ class KimiLinearForCausalLM(nn.Module):
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
-                if (
-                    name.endswith(".bias")
-                    and name not in params_dict
-                    and not self.config.is_linear_attn
-                ):  # noqa: E501
+                if name.endswith(".bias") and name not in params_dict and not self.config.is_linear_attn:  # noqa: E501
                     continue
                 # Remapping the name of FP8 kv-scale.
                 name = maybe_remap_kv_scale_name(name, params_dict)
@@ -735,22 +767,21 @@ class KimiLinearForCausalLM(nn.Module):
                 #     continue
 
                 param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
         for layer_id in self.config.full_attention_layer_ids:
             self_attn = self.model.layers[layer_id].self_attn
-            w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)).split(
+                [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
+            )
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
-    
+        self.requires_grad_(False)
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         return ModelConfigForExpertLocation(

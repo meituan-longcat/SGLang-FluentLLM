@@ -13,38 +13,38 @@
 # ==============================================================================
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
-from typing import Iterable, Optional, Tuple
+
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
-from torch import nn
-from transformers.configuration_utils import PretrainedConfig
-
-from sglang.srt.utils import add_prefix, bind_or_assign
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
+import torch_npu
+from sglang.srt.configs.model_config import (
+    is_deepseek_nsa,
+)
+from sglang.srt.distributed import get_attn_sp_token_slice_pos, get_attn_tp_group, get_pp_group
+from sglang.srt.env import ENV, global_server_args_dict
+from sglang.srt.layers.embedding.rotary_embedding import RotaryEmbeddingCosSinCache, get_rope_wrapper
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.npu_deepseek_v2 import DeepseekV3ForCausalLM
-from sglang.srt.npu.utils import npu_super_kernel
-from sglang.srt.utils import is_hip
-from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
-
-from sglang.srt.env import ENV
-
 from sglang.srt.models.npu_longcat_flash import NPUFlASHDenseDecoderLayer
-from sglang.srt.layers.rotary_embedding import RotaryEmbeddingCosSinCache
-from sglang.srt.distributed import get_attn_tp_group, get_pp_group
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.utils import add_prefix, bind_or_assign, get_colorful_logger, is_hip
+from torch import nn
+from transformers.configuration_utils import PretrainedConfig
 
 is_hip_ = is_hip()
-import torch_npu
+
+logger = get_colorful_logger(__name__)
 
 
 class FLASHModelNextN(nn.Module):
@@ -58,50 +58,85 @@ class FLASHModelNextN(nn.Module):
         self.vocab_size = config.vocab_size
         if global_server_args_dict["draft_use_oe"]:
             self.use_over_embedding = True
-            self.embed_tokens=None
+            self.embed_tokens = None
         else:
             self.use_over_embedding = False
-            self.vocab_size=config.vocab_size
-            self.hidden_size=config.hidden_size
-            self.embed_tokens=None
+            self.vocab_size = config.vocab_size
+            self.hidden_size = config.hidden_size
+            self.embed_tokens = None
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.eh_proj = ReplicatedLinear(
-            2 * config.hidden_size,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("eh_proj", "")
+            2 * config.hidden_size, config.hidden_size, bias=False, quant_config=quant_config, prefix=add_prefix("eh_proj", "")
         )
-        self.max_position_embeddings=getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling=getattr(config, "rope_scaling", None)
-        if self.rope_scaling!=None:
-            from sglang.srt.layers.rotary_embedding import get_rope
-            assert self.rope_scaling["rope_type"]=="deepseek_yarn"
-            self.rotary_pos_emb=get_rope(config.qk_rope_head_dim,
-                                         rotary_dim=config.qk_rope_head_dim,
-                                         max_position=self.max_position_embeddings,
-                                         base=config.rope_theta,
-                                         rope_scaling=self.rope_scaling,
-                                         is_neox_style=True)
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        self.rope_scaling = getattr(config, "rope_scaling", None)
+        if self.rope_scaling is not None:
+            from sglang.srt.layers.embedding.rotary_embedding import get_rope
+
+            assert self.rope_scaling["rope_type"] == "deepseek_yarn"
+            self.rotary_pos_emb = get_rope(
+                config.qk_rope_head_dim,
+                rotary_dim=config.qk_rope_head_dim,
+                max_position=self.max_position_embeddings,
+                base=config.rope_theta,
+                rope_scaling=self.rope_scaling,
+                is_neox_style=True,
+            )
             self.rotary_pos_emb.prepare_for_npu()
         else:
-            self.rotary_pos_emb=RotaryEmbeddingCosSinCache(
-                config.qk_rope_head_dim, max_position_embeddings=self.max_position_embeddings,
+            self.rotary_pos_emb = RotaryEmbeddingCosSinCache(
+                config.qk_rope_head_dim,
+                max_position_embeddings=self.max_position_embeddings,
                 base=config.rope_theta,
-                device=torch.npu.current_device()
+                device=torch.npu.current_device(),
             )
-        self.decoder=NPUFlASHDenseDecoderLayer(
-            config, 0, quant_config=quant_config, is_nextn=True
+        self.enable_nsa = is_deepseek_nsa(config)
+        self.npu_disable_dsa_head_parallel = (
+            self.enable_nsa
+            and global_server_args_dict["npu_disable_dsa_head_parallel"]
+            and global_server_args_dict["disaggregation_mode"] == "prefill"
         )
+        if self.enable_nsa and global_server_args_dict["disaggregation_mode"] == "prefill":
+            self.nsa_rotary_emb = get_rope_wrapper(
+                config.qk_rope_head_dim,
+                rotary_dim=config.qk_rope_head_dim,
+                max_position=self.max_position_embeddings,
+                base=config.rope_theta,  # type: ignore
+                rope_scaling=self.rope_scaling,
+                is_neox_style=True,
+                device="npu",
+            )
+
+        self.decoder = NPUFlASHDenseDecoderLayer(config, 0, quant_config=quant_config, is_nextn=True)
 
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        if getattr(config, 'use_over_embedding', False):
+        if getattr(config, "use_over_embedding", False):
             self.enable_over_embedding = config.use_over_embedding
         else:
             self.enable_over_embedding = False
+
+    def get_dsa_cos_sin(
+        self,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if self.npu_disable_dsa_head_parallel:
+            slice_start, slice_end = get_attn_sp_token_slice_pos(forward_batch)
+            positions = positions[slice_start:slice_end]
+
+        if hasattr(self.nsa_rotary_emb, "cos_sin_cache"):
+            cos_sin = self.nsa_rotary_emb.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            cos = cos.repeat(1, 2).view(-1, 1, 1, cos.shape[-1])
+            sin = sin.repeat(1, 2).view(-1, 1, 1, sin.shape[-1])
+        else:
+            cos, sin = self.nsa_rotary_emb.cos_cached[positions], self.nsa_rotary_emb.sin_cached[positions]
+            cos = cos.view(-1, 1, 1, cos.shape[-1])
+            sin = sin.view(-1, 1, 1, sin.shape[-1])
+        return (cos, sin)
 
     def forward(
         self,
@@ -110,25 +145,31 @@ class FLASHModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        enable_sp = bool(not forward_batch.all_decode_or_idle)
+
         if input_embeds is None:
             if self.use_over_embedding:
-                hidden_states=self.embed_tokens(input_ids, forward_batch, is_draft=True)
+                hidden_states = self.embed_tokens(input_ids, forward_batch, enable_sp=enable_sp, is_draft=True)
             else:
-                hidden_states=self.embed_tokens(input_ids)
+                hidden_states = self.embed_tokens(input_ids, enable_sp=enable_sp, global_sp_token_num=forward_batch.global_sp_num_tokens)
         else:
-            hidden_states = input_embeds
+            hidden_states = get_attn_tp_group().split_tensor(input_embeds, forward_batch.global_sp_num_tokens) if enable_sp else input_embeds
+
+        if enable_sp:
+            spec_info_hidden_states = get_attn_tp_group().split_tensor(forward_batch.spec_info.hidden_states, forward_batch.global_sp_num_tokens)
+        else:
+            spec_info_hidden_states = forward_batch.spec_info.hidden_states
 
         if hidden_states.shape[0] > 0:
             hidden_states, _ = self.eh_proj(
                 torch.cat(
                     (
                         self.enorm(hidden_states),
-                        self.hnorm(forward_batch.spec_info.hidden_states),
+                        self.hnorm(spec_info_hidden_states),
                     ),
                     dim=-1,
                 )
             )
-
 
         if not forward_batch.forward_mode.is_idle():
             cos, sin = self.rotary_pos_emb.get_cos_sin(hidden_states, self.max_position_embeddings)
@@ -136,18 +177,24 @@ class FLASHModelNextN(nn.Module):
             sin = sin[positions]
             cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
             forward_batch.rotary_pos_emb = (cos, sin)
+            if self.enable_nsa:
+                if global_server_args_dict["disaggregation_mode"] == "prefill":
+                    forward_batch.nsa_rotary_emb = self.get_dsa_cos_sin(positions, forward_batch)
+                else:
+                    forward_batch.nsa_rotary_emb = None
 
-        residual=None
-        hidden_states, residual=self.decoder(
-            positions, hidden_states, forward_batch, residual
-        )
+        residual = None
+        hidden_states, residual = self.decoder(positions, hidden_states, forward_batch, residual)
+
         if not forward_batch.forward_mode.is_idle():
-            hidden_states, _=self.final_layernorm(hidden_states, residual)
+            hidden_states, _ = self.final_layernorm(hidden_states, residual)
+        if enable_sp:
+            hidden_states = get_attn_tp_group().gather_tensor(hidden_states, forward_batch.global_sp_num_tokens)
+
         return hidden_states
 
 
 class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -157,7 +204,7 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
         self.config = config
         self.nextn_use_scmoe = config.nextn_use_scmoe
         self.quant_config = None if "mtp" in getattr(config, "disable_quant_module", []) else quant_config
-        self.pp_skip_mtp=get_pp_group().world_size > 1 and not get_pp_group().is_last_rank
+        self.pp_skip_mtp = get_pp_group().world_size > 1 and not get_pp_group().is_last_rank
         if not self.pp_skip_mtp:
             self.model = FLASHModelNextN(config, self.quant_config)
 
@@ -175,8 +222,27 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                     quant_config=self.quant_config,
                 )
                 self.logits_processor = LogitsProcessor(config)
-        self.attn_start_layer=0
-        self.attn_end_layer=1
+        self.attn_start_layer = 0
+        # Non-final PP stages never execute MTP and must not reserve its KV pool.
+        self.attn_end_layer = 0 if self.pp_skip_mtp and global_server_args_dict.get("disaggregation_mode") == "prefill" else 1
+
+    def set_embed_module_and_head(self, embed_tokens, head):
+        if self.pp_skip_mtp:
+            return
+
+        self.model.embed_tokens = embed_tokens
+
+        del self.lm_head.weight
+        self.lm_head.weight = head
+
+        torch.npu.empty_cache()
+        torch.npu.synchronize()
+
+    def set_embed_and_head(self, embed, head):
+        if isinstance(embed, VocabParallelEmbedding):
+            return self.set_embed_module_and_head(embed, head)
+
+        return super().set_embed_and_head(embed, head)
 
     @torch.no_grad()
     def forward(
@@ -184,13 +250,12 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         if self.pp_skip_mtp:
             return
         if hasattr(self.config, "num_nextn_predict_layers"):
@@ -225,7 +290,7 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
             "enorm",
             "hnorm",
         ]
-        if self.config.model_type == "flash":
+        if self.config.model_type in ("flash", "omni", "pro_v"):
             nextn_spec_weight_names.append("final_layernorm")
 
         new_to_old_names_mapping = {
@@ -238,6 +303,10 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
             "model.mtp.layers.0.input_layernorm.weight": "layers.0.input_layernorm.weight",
             "model.mtp.layers.0.post_attention_layernorm.weight": "layers.0.post_attention_layernorm.weight",
             "model.mtp.layers.0.self_attn.kv_a_layernorm.weight": "layers.0.self_attn.kv_a_layernorm.weight",
+            "model.mtp.layers.0.self_attn.indexer.k_norm.weight": "layers.0.self_attn.indexer.k_norm.weight",
+            "model.mtp.layers.0.self_attn.indexer.weights_proj.weight": "layers.0.self_attn.indexer.weights_proj.weight",
+            "model.mtp.layers.0.self_attn.indexer.wk.weight": "layers.0.self_attn.indexer.wk.weight",
+            "model.mtp.layers.0.self_attn.indexer.wq_b.weight": "layers.0.self_attn.indexer.wq_b.weight",
             "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight": "layers.0.self_attn.kv_a_proj_with_mqa.weight",
             "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv": "layers.0.self_attn.kv_a_proj_with_mqa.weight_scale_inv",
             "model.mtp.layers.0.self_attn.kv_a_proj_with_mqa.weight_scale": "layers.0.self_attn.kv_a_proj_with_mqa.weight_scale",
@@ -313,9 +382,7 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", no_tp_load
-                )
+                weight_loader = getattr(param, "weight_loader", no_tp_load)
                 if begin_size is not None and name.endswith(".weight_scale_inv"):
                     begin_size = begin_size // self.config.quantization_config["weight_block_size"][0]
                 if "fused_qkv_a_proj_with_mqa" in name:
@@ -342,12 +409,10 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    if 'self_attn' not in name:
-                        name = name.replace('weight_scale_inv', 'weight_scale')
+                    if "self_attn" not in name:
+                        name = name.replace("weight_scale_inv", "weight_scale")
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
 
         self.post_load_weights()
@@ -368,16 +433,12 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                 else:
                     w = self_attn.kv_b_proj.weight
 
-                w_kc, w_vc = w.unflatten(
-                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                w_kc, w_vc = w.unflatten(0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)).split(
+                    [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
+                )
 
-                self_attn.w_kc = bind_or_assign(
-                    self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-                )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
+                self_attn.w_kc = bind_or_assign(self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2))
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous().transpose(1, 2))
         else:
             self_attn = self.model.decoder.self_attn
             if hasattr(self.quant_config, "weight_block_size") and self_attn.kv_b_proj.weight.dtype in (
@@ -391,44 +452,45 @@ class FLASHForCausalLMNextN(DeepseekV3ForCausalLM):
                     w = self_attn.kv_b_proj.weight
             else:
                 w = self_attn.kv_b_proj.weight
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = bind_or_assign(
-                self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            w_kc, w_vc = w.unflatten(0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)).split(
+                [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
             )
-            self_attn.w_vc = bind_or_assign(
-                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-            )
+            self_attn.w_kc = bind_or_assign(self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2))
+            self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous().transpose(1, 2))
 
-    def fix_kvp_current_kv_cache(self, forward_batch: ForwardBatch):
-        if global_server_args_dict["npu_kvp_accuracy_fix"]:
+
+    def fix_kvp_current_kv_cache(self, forward_batch: ForwardBatch, skip_keyrope_layers=frozenset(), skip_index_layers=frozenset()):
+        # Host offload only. Offloaded attentions keep their KV on host, so
+        # their current rows need the fused copy below instead of the in-graph
+        # scatter, which npu_mla_backend keeps for every other configuration.
+        if not global_server_args_dict["offload_cache"]:
             return
-        use_kvp = (global_server_args_dict["kvp_size"] > 1)
-        if use_kvp:
-            kvp_group = get_attn_tp_group()
-            kvp_rank = kvp_group.rank_in_group
-            if kvp_rank == 0:
-                for i in range(self.config.num_hidden_layers):
-                    assert ENV.npu_enable_mla_split_kv_kr
-                    cur_kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(i)
-                    k = cur_kv_cache[0]
-                    k_pe = cur_kv_cache[1]
-                    kv_lora_rank = k.shape[-1]
-                    qk_rope_head_dim = k_pe.shape[-1]
-                    k = k.view(-1, kv_lora_rank)
-                    k_pe = k_pe.view(-1, qk_rope_head_dim)
-                    current_k = k[forward_batch.attn_metadata.slot_mapping]
-                    current_k_pe = k_pe[forward_batch.attn_metadata.slot_mapping]
-                    torch_npu.npu_scatter_nd_update_(k, forward_batch.attn_metadata.kvp_current_slots_mapping.reshape(-1, 1), current_k)
-                    torch_npu.npu_scatter_nd_update_(k_pe, forward_batch.attn_metadata.kvp_current_slots_mapping.reshape(-1, 1), current_k_pe)
+        if global_server_args_dict["kvp_size"] <= 1:
+            return
+        if get_attn_tp_group().rank_in_group != 0:
+            return
+        pool = forward_batch.token_to_kv_pool
+        # Native packed SFAD already writes the complete row to its backing
+        # pool, and the indexer writes IndexK, in both graph and eager modes.
+        # The split-KV fixup below must not reinterpret the empty RoPE view.
+        if getattr(pool, "dsa_kv_int8_packed", False):
+            return
+        use_dsa = hasattr(pool, 'get_index_k_with_scale_buffer')
+        slots = forward_batch.attn_metadata.kvp_current_slots_mapping.reshape(-1, 1)
+        source = forward_batch.attn_metadata.slot_mapping
+        assert ENV.npu_enable_mla_split_kv_kr
+        # Dense NextN has one attention layer, unlike the two-attention SCMoE
+        # block. Iterate the actual pool rather than assuming target geometry.
+        for sub in range(pool.layer_num):
+            if sub not in skip_keyrope_layers:
+                k, k_pe = pool.get_kv_buffer(sub)
+                k = k.view(-1, k.shape[-1])
+                k_pe = k_pe.view(-1, k_pe.shape[-1])
+                torch_npu.npu_scatter_nd_update_(k, slots, k[source])
+                torch_npu.npu_scatter_nd_update_(k_pe, slots, k_pe[source])
+            if use_dsa and sub not in skip_index_layers:
+                ik = pool.get_index_k_with_scale_buffer(sub)
+                ik = ik.view(-1, ik.shape[-1])
+                torch_npu.npu_scatter_nd_update_(ik, slots, ik[source])
 
-                    if hasattr(forward_batch.token_to_kv_pool, 'get_index_k_with_scale_buffer'):
-                        cur_kv_cache = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(i)
-                        k = cur_kv_cache
-                        index_head_dim = k.shape[-1]
-                        k = k.view(-1, index_head_dim)
-                        current_k = k[forward_batch.attn_metadata.slot_mapping]
-                        torch_npu.npu_scatter_nd_update_(k, forward_batch.attn_metadata.kvp_current_slots_mapping.reshape(-1, 1), current_k)
-
-EntryClass = [FLASHForCausalLMNextN]
+EntryClass = FLASHForCausalLMNextN

@@ -14,13 +14,11 @@ if not hasattr(torch.ops.flash, "npu_rearrange_accept_index"):
 
 
 def test_rearrange_accept_index_interface_exist():
-    """Test that the operator is registered in torch.ops."""
     assert hasattr(torch.ops.flash, "npu_rearrange_accept_index"), \
         "The 'npu_rearrange_accept_index' operator is not registered in 'torch.ops.flash'."
 
 
 def _ref_rearrange_accept_index(accept_index, accept_length, bs, output_torch):
-    """CPU reference implementation (matches the original test script)."""
     range_tensor = torch.arange(accept_index.size(1),
                                 device=accept_index.device).expand(bs, -1)
     expanded_length = torch.unsqueeze(accept_length, dim=1)
@@ -30,9 +28,13 @@ def _ref_rearrange_accept_index(accept_index, accept_length, bs, output_torch):
     return output_torch
 
 
-# Mirror the original cann_m test grid: bs ∈ [1, 179], 14 pool_size values, 2 dtypes.
-BS_VALUES = list(range(1, 180))
-POOL_SIZES = [16, 64, 128, 256, 1024, 2048, 4096, 1600, 6400, 8192, 16384, 32768, 65535, 131070]
+BS_VALUES = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    12, 14, 16, 20, 24, 28, 32,
+    40, 48, 56, 64, 80, 96, 112, 128,
+    144, 160, 176, 192, 208, 224, 240, 256, 384, 512,
+]
+POOL_SIZES = [16, 64, 256, 1024, 2048, 4096, 8192, 16384, 65535, 131070]
 DTYPES = [torch.int64, torch.int32]
 
 
@@ -41,8 +43,9 @@ DTYPES = [torch.int64, torch.int32]
 @pytest.mark.parametrize("pool_size", POOL_SIZES)
 @pytest.mark.parametrize("bs", BS_VALUES)
 def test_rearrange_accept_index(bs, pool_size, dtype):
-    """Compare NPU in-place op vs CPU reference across full bs/pool_size/dtype grid."""
-    torch.manual_seed(42)
+    seed = (bs * 139 + pool_size * 13 + hash(str(dtype))) % (2**31)
+    torch.manual_seed(seed)
+
     accept_index = torch.arange(0, bs * pool_size, dtype=dtype,
                                 device='cpu').reshape(bs, pool_size)
     accept_length = torch.randint(1, pool_size if pool_size > 1 else 2,

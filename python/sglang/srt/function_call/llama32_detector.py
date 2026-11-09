@@ -1,6 +1,7 @@
+# ruff: noqa: S105
 import json
 import logging
-from typing import List, Union, Literal
+from typing import Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -39,10 +40,7 @@ class Llama32Detector(BaseFormatDetector):
         return "<|python_tag|>" in text or text.startswith("{")
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """Parse function calls from text, handling multiple JSON objects."""
         if "<|python_tag|>" not in text and not text.startswith("{"):
@@ -66,9 +64,7 @@ class Llama32Detector(BaseFormatDetector):
                 safe_idx = idx
             except json.JSONDecodeError as e:
                 # Find where next `{"name"` appears and try again
-                logger.warning(
-                    f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}"
-                )
+                logger.warning(f"Failed to parse JSON part: {action_text[idx:]}, JSON parse error: {str(e)}")
                 next_obj_start = action_text.find('{"name":', idx + 1)
                 if next_obj_start == -1:
                     break
@@ -78,12 +74,8 @@ class Llama32Detector(BaseFormatDetector):
         # Only process if we found valid JSON objects
         calls = self.parse_base_json(all_actions, tools, tool_choice) if all_actions else []
         # Use safe_idx to avoid idx containing the last part of an invalid JSON object
-        trailing_text = (
-            action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
-        )
-        return StreamingParseResult(
-            normal_text=normal_text + trailing_text, calls=calls
-        )
+        trailing_text = action_text[safe_idx:].strip() if safe_idx < action_text_len else ""
+        return StreamingParseResult(normal_text=normal_text + trailing_text, calls=calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

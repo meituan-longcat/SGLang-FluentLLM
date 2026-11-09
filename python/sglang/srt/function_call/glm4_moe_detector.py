@@ -1,8 +1,9 @@
+# ruff: noqa: S105
 import ast
 import json
 import logging
 import re
-from typing import List, Union, Literal
+from typing import Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -28,10 +29,10 @@ def parse_arguments(json_value):
     try:
         try:
             parsed_value = json.loads(json_value)
-        except:
+        except Exception:
             parsed_value = ast.literal_eval(json_value)
         return parsed_value, True
-    except:
+    except Exception:
         return json_value, False
 
 
@@ -55,10 +56,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         return self.bot_token in text
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -102,10 +100,7 @@ class Glm4MoeDetector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing tool calls for GLM-4.5 and GLM-4.6 format.
@@ -132,17 +127,13 @@ class Glm4MoeDetector(BaseFormatDetector):
                 self.prev_tool_call_arr.append({})
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
-            result = self.detect_and_parse(
-                current_text[: end + len(self.eot_token)], tools=tools, tool_choice=tool_choice
-            )
+            result = self.detect_and_parse(current_text[: end + len(self.eot_token)], tools=tools, tool_choice=tool_choice)
             if result.calls:
                 self.prev_tool_call_arr[self.current_tool_id] = {
                     "name": result.calls[0].name,
                     "arguments": json.loads(result.calls[0].parameters),
                 }
-                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
-                    0
-                ].parameters
+                self.streamed_args_for_tool[self.current_tool_id] = result.calls[0].parameters
                 result.calls[0].tool_index = self.current_tool_id
                 self.current_tool_id += 1
             self._buffer = current_text[end + len(self.eot_token) :]

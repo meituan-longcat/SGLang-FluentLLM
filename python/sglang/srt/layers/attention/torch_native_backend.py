@@ -6,6 +6,7 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.utils import is_npu
+
 __is_npu__ = is_npu()
 if __is_npu__:
     import torch_npu
@@ -14,7 +15,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.layers.attention.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -33,7 +34,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         """get or build block_table of forwardbatch"""
         # block_table has been built, return
         if forward_batch.block_table_cache is not None:
-            assert(forward_batch.seq_lens_cpu is not None)
+            assert forward_batch.seq_lens_cpu is not None
             return forward_batch.block_table_cache
 
         # block_table has not been built, build new block_table
@@ -44,11 +45,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         torch.npu.synchronize()
         req_pool_indices_cpu = req_pool_indices_cpu.tolist()
 
-        block_table = torch.full(
-            size=(len(seq_lens), 2048),
-            fill_value=-1,
-            dtype=torch.int32,
-            device="npu")
+        block_table = torch.full(size=(len(seq_lens), 2048), fill_value=-1, dtype=torch.int32, device="npu")
 
         for seq_idx in range(len(seq_lens)):
             req_pool_info = req_to_token_pool.get_req_pool_info(req_pool_indices_cpu[seq_idx])
@@ -62,8 +59,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         return block_table
 
     def _init_casual_mask(self, query: torch.Tensor):
-        self.casual_mask = ~torch.tril(torch.ones((1, 2048, 2048),
-                                dtype=torch.bool, device=query.device))
+        self.casual_mask = ~torch.tril(torch.ones((1, 2048, 2048), dtype=torch.bool, device=query.device))
 
     def _run_sdpa_forward_extend(
         self,
@@ -192,14 +188,27 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         seq_lens_cpu_list = forward_batch.seq_lens_cpu
         extend_seq_lens_cpu_list = forward_batch.extend_seq_lens_cpu
-        req_pool_indices_cpu_list= forward_batch.req_pool_indices_cpu
+        req_pool_indices_cpu_list = forward_batch.req_pool_indices_cpu
 
         batch_size = len(seq_lens_cpu_list)
         max_seq_len = max(seq_lens_cpu_list)
         max_extend_len = max(extend_seq_lens_cpu_list)
 
         if max_seq_len > 1 and max_extend_len == 1:
-            return self._run_sdpa_forward_extend(query, output, k_cache, v_cache, req_to_token, req_pool_indices, seq_lens, extend_prefix_lens, extend_seq_lens, scaling, enable_gqa, causal)
+            return self._run_sdpa_forward_extend(
+                query,
+                output,
+                k_cache,
+                v_cache,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                extend_prefix_lens,
+                extend_seq_lens,
+                scaling,
+                enable_gqa,
+                causal,
+            )
 
         batched_q, batched_k, batched_v = [], [], []
         start_q = 0
@@ -221,16 +230,14 @@ class TorchNativeAttnBackend(AttentionBackend):
             # padding KV by max_seq_len
             if seq_len < max_seq_len:
                 pad_len = max_seq_len - seq_len
-                pad_tensor_kv = torch.zeros((pad_len, k_cache.shape[1], k_cache.shape[2]),
-                                          dtype=k_cache.dtype, device=k_cache.device)
+                pad_tensor_kv = torch.zeros((pad_len, k_cache.shape[1], k_cache.shape[2]), dtype=k_cache.dtype, device=k_cache.device)
                 k_i = torch.cat([k_i, pad_tensor_kv], dim=0)
                 v_i = torch.cat([v_i, pad_tensor_kv], dim=0)
 
             # padding query by max_extend_len（rather than max_seq_len）
             if extend_len < max_extend_len:
                 pad_len = max_extend_len - extend_len
-                pad_tensor_q = torch.zeros((pad_len, query.shape[1], query.shape[2]),
-                                         dtype=query.dtype, device=query.device)
+                pad_tensor_q = torch.zeros((pad_len, query.shape[1], query.shape[2]), dtype=query.dtype, device=query.device)
                 q_i = torch.cat([q_i, pad_tensor_q], dim=0)
 
             batched_q.append(q_i)
@@ -239,9 +246,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             start_q = end_q
 
         # BSND
-        batched_q = torch.stack(batched_q, dim=0) # [B, S, N, D]
-        batched_k = torch.stack(batched_k, dim=0) # [B, S, N, D]
-        batched_v = torch.stack(batched_v, dim=0) # [B, S, N, D]
+        batched_q = torch.stack(batched_q, dim=0)  # [B, S, N, D]
+        batched_k = torch.stack(batched_k, dim=0)  # [B, S, N, D]
+        batched_v = torch.stack(batched_v, dim=0)  # [B, S, N, D]
 
         # get causal attention mask
         atten_mask = None
@@ -251,7 +258,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             atten_mask = self.casual_mask
 
         npu_output, _ = torch_npu.npu_fused_infer_attention_score(
-            batched_q, batched_k, batched_v,
+            batched_q,
+            batched_k,
+            batched_v,
             num_heads=batched_q.shape[2],
             num_key_value_heads=batched_k.shape[2],
             input_layout="BSND",
@@ -383,8 +392,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         q_batch = query.view(batch_size, 1, query.shape[1], query.shape[2])
 
         block_size = 128
-        k_cache = k_cache.view(-1, block_size, k_cache.shape[1]*k_cache.shape[2])
-        v_cache = v_cache.view(-1, block_size, v_cache.shape[1]*v_cache.shape[2])
+        k_cache = k_cache.view(-1, block_size, k_cache.shape[1] * k_cache.shape[2])
+        v_cache = v_cache.view(-1, block_size, v_cache.shape[1] * v_cache.shape[2])
 
         # get block_table to enable PA in npu_fused_infer_attention_score
         block_table = self._get_or_build_block_table(forward_batch, req_to_token_pool, block_size)
@@ -405,7 +414,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             antiquant_mode=0,
             antiquant_scale=None,
             actual_seq_lengths_kv=forward_batch.seq_lens_cpu.tolist(),
-            sparse_mode=0
+            sparse_mode=0,
         )
 
         output.copy_(npu_output.squeeze(2).view(-1, query.shape[1], head_dim))
@@ -421,15 +430,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim)) if layer.qk_head_dim != layer.v_head_dim else torch.empty_like(q)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -482,15 +486,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim)) if layer.qk_head_dim != layer.v_head_dim else torch.empty_like(q)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 

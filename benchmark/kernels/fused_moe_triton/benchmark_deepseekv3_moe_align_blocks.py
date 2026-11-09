@@ -207,8 +207,8 @@ def calculate_diff(batch_size, seq_len):
         print("Triton num_tokens_post_pad:", num_tokens_post_pad_triton)
 
 
-batch_size_range = [2**i for i in range(0, 8)]
-seq_length_range = [2**i for i in range(0, 16)]
+batch_size_range = [2**i for i in range(8)]
+seq_length_range = [2**i for i in range(16)]
 configs = list(itertools.product(batch_size_range, seq_length_range))
 
 

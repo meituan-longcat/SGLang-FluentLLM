@@ -7,11 +7,9 @@ from sglang.srt.layers.quantization.compressed_tensors.fused_moe import fused_ma
 
 logger = logging.getLogger(__name__)
 
+
 class WNA16MoeExecutor:
-    def __init__(
-        self,
-        quant_config
-    ):
+    def __init__(self, quant_config):
         config = quant_config.target_scheme_map["Linear"].get("weights")
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.num_bits = config.num_bits

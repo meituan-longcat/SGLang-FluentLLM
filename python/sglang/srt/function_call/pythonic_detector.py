@@ -2,7 +2,7 @@ import ast
 import json
 import logging
 import re
-from typing import List, Union, Literal
+from typing import Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -49,10 +49,7 @@ class PythonicDetector(BaseFormatDetector):
         return bool(self.tool_call_regex.search(self._text_strip(text.strip())))
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
         text = text.strip()
@@ -78,10 +75,7 @@ class PythonicDetector(BaseFormatDetector):
         try:
             module = ast.parse(tool_call_text)
             parsed = getattr(module.body[0], "value", None)
-            if not (
-                isinstance(parsed, ast.List)
-                and all(isinstance(e, ast.Call) for e in parsed.elts)
-            ):
+            if not (isinstance(parsed, ast.List) and all(isinstance(e, ast.Call) for e in parsed.elts)):
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
             calls = []
@@ -92,9 +86,7 @@ class PythonicDetector(BaseFormatDetector):
                 function_name = call.func.id
                 # Validate that the function exists in the tools
                 if function_name not in tool_indices:
-                    logger.warning(
-                        f"Model attempted to call undefined function: {function_name}"
-                    )
+                    logger.warning(f"Model attempted to call undefined function: {function_name}")
                     continue
                 arguments = {}
                 for keyword in call.keywords:
@@ -159,10 +151,7 @@ class PythonicDetector(BaseFormatDetector):
         return safe_text, ""
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing for pythonic tool calls.
@@ -213,10 +202,7 @@ class PythonicDetector(BaseFormatDetector):
         if isinstance(val, ast.Constant):
             return val.value
         elif isinstance(val, ast.Dict):
-            return {
-                k.value: self._get_parameter_value(v)
-                for k, v in zip(val.keys, val.values)
-            }
+            return {k.value: self._get_parameter_value(v) for k, v in zip(val.keys, val.values)}
         elif isinstance(val, ast.List):
             return [self._get_parameter_value(v) for v in val.elts]
         else:

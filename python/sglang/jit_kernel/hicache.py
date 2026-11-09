@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
+from functools import cache
 from typing import TYPE_CHECKING
 
 from sglang.jit_kernel.utils import load_jit, make_cpp_args
@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 DEFAULT_BLOCK_QUOTA = 2
 
 
-@lru_cache(maxsize=None)
+@cache
 def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> Module:
     num_threads, occupancy = 1024, 1
     args = make_cpp_args(

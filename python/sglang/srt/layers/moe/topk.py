@@ -23,11 +23,11 @@ import torch
 import torch.nn.functional as F
 
 
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.ops.custom_op import CustomOp
 from sglang.srt.utils import get_compiler_backend, get_bool_env_var, is_cuda, is_npu
-from sglang.srt.managers import expert_location_dispatch
-from sglang.srt.managers.expert_location_dispatch import ExpertLocationDispatchInfo, topk_ids_logical_to_physical
-from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers.eplb import expert_location_dispatch
+from sglang.srt.managers.eplb.expert_location_dispatch import ExpertLocationDispatchInfo, topk_ids_logical_to_physical
+from sglang.srt.managers.eplb.expert_distribution import get_global_expert_distribution_recorder
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -47,6 +47,8 @@ _USE_EPS_TOPK_SIGMOID = get_bool_env_var("USE_EPS_TOPK_SIGMOID", "true")
 if _USE_EPS_TOPK_SIGMOID:
     from eps import utils
     _EPS_TOPK_SIGMOID = utils.ops._ops.topk_sigmoid
+
+_RANDOM_ROUTER = get_bool_env_var("RANDOM_ROUTER")
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -683,6 +685,61 @@ def _mask_topk_ids_padded_region(
     topk_ids[indices >= num_token_non_padded, :] = -1
 
 
+def _random_topk_output(
+    router_logits: torch.Tensor,
+    top_k: int,
+    *,
+    num_fused_shared_experts: int = 0,
+    routed_scaling_factor: Optional[float] = None,
+    apply_routed_scaling_factor_on_output: bool = False,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    zero_expert_num: int = 0,
+    topk_indices_dtype: torch.dtype = torch.int32,
+):
+    num_tokens, total_num_experts = router_logits.shape
+    num_real_experts = total_num_experts - zero_expert_num
+    num_routed_experts = top_k - num_fused_shared_experts
+
+    if num_routed_experts <= 0:
+        raise ValueError(f"Invalid routed expert count: {num_routed_experts}")
+    if num_routed_experts > num_real_experts:
+        raise ValueError(
+            f"Cannot randomly choose {num_routed_experts} experts from {num_real_experts} real experts"
+        )
+
+    # Temporary random routing for load-balance debugging.
+    random_scores = torch.rand(
+        num_tokens, num_real_experts, device=router_logits.device
+    )
+    topk_ids = torch.topk(random_scores, k=num_routed_experts, dim=-1, sorted=False)[1]
+
+    if num_fused_shared_experts:
+        shared_ids = torch.randint(
+            low=num_real_experts,
+            high=num_real_experts + num_fused_shared_experts,
+            size=(num_tokens, num_fused_shared_experts),
+            device=router_logits.device,
+            dtype=topk_ids.dtype,
+        )
+        topk_ids = torch.cat([topk_ids, shared_ids], dim=-1)
+
+    topk_weights = torch.full(
+        (num_tokens, top_k),
+        1.0 / top_k,
+        dtype=torch.float32,
+        device=router_logits.device,
+    )
+    if apply_routed_scaling_factor_on_output:
+        assert routed_scaling_factor is not None
+        topk_weights *= routed_scaling_factor
+
+    topk_ids = topk_ids.to(topk_indices_dtype)
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    return topk_weights, topk_ids
+
+
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
@@ -777,6 +834,8 @@ def select_experts(
     apply_routed_scaling_factor_on_output = (
         topk_config.apply_routed_scaling_factor_on_output
     )
+    zero_expert_num = topk_config.zero_expert_num
+    topk_indices_dtype = topk_config.topk_indices_dtype
 
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
@@ -786,8 +845,20 @@ def select_experts(
         )
     )
 
+    if _RANDOM_ROUTER:
+        topk_weights, topk_ids = _random_topk_output(
+            router_logits=router_logits,
+            top_k=top_k,
+            num_fused_shared_experts=num_fused_shared_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+            zero_expert_num=zero_expert_num,
+            topk_indices_dtype=topk_indices_dtype,
+        )
     # DeepSeek V2/V3/R1 series models use grouped_top_k
-    if use_grouped_topk:
+    elif use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:

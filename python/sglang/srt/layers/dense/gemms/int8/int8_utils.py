@@ -22,18 +22,14 @@ def apply_w8a8_block_int8_linear(
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
     q_input, x_scale = per_token_group_quant_int8(input_2d, block_size[1])
-    output = w8a8_block_int8_matmul(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype
-    )
+    output = w8a8_block_int8_matmul(q_input, weight, x_scale, weight_scale, block_size, output_dtype=input.dtype)
 
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)
 
 
-def input_to_int8(
-    x: torch.Tensor, dtype: torch.dtype = torch.int8
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def input_to_int8(x: torch.Tensor, dtype: torch.dtype = torch.int8) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function quantizes input values to int8 values with tensor-wise quantization."""
     iinfo = torch.iinfo(dtype)
     min_val, max_val = x.aminmax()

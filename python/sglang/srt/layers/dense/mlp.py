@@ -5,10 +5,7 @@ from torch import nn
 
 from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
 from sglang.srt.env import global_server_args_dict
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import (
-    get_dense_tp_group
-)
+from sglang.srt.layers.attention.dp_attention import get_dense_tp_group
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -16,6 +13,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import should_ignore_quant_layer
+from sglang.srt.ops.activation import SiluAndMul
 from sglang.srt.utils import add_prefix
 
 
@@ -40,7 +38,7 @@ class ParallelMLP(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
                 outside_tp_group=tp_group,
-                )
+            )
             self.down_proj = RowParallelLinear(
                 intermediate_size,
                 hidden_size,
@@ -59,18 +57,13 @@ class ParallelMLP(nn.Module):
             )
 
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
 
         self.gateup_unquanted = self.gate_up_proj.quant_config is None or should_ignore_quant_layer(
-            prefix=self.gate_up_proj.prefix,
-            ignored_layers=getattr(self.gate_up_proj.quant_config, "ignored_layers", [])
+            prefix=self.gate_up_proj.prefix, ignored_layers=getattr(self.gate_up_proj.quant_config, "ignored_layers", [])
         )
         self.down_unquanted = self.down_proj.quant_config is None or should_ignore_quant_layer(
-            prefix=self.down_proj.prefix,
-            ignored_layers=getattr(self.down_proj.quant_config, "ignored_layers", [])
+            prefix=self.down_proj.prefix, ignored_layers=getattr(self.down_proj.quant_config, "ignored_layers", [])
         )
         self.act_fn = SiluAndMul()
 

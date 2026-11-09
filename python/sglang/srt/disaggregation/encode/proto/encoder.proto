@@ -1,0 +1,59 @@
+syntax = "proto3";
+package encoder;
+
+// EPD Encoder gRPC service
+// Provides ViT encoding for multimodal requests in the Encode-Prefill-Decode architecture.
+service Encoder {
+  // Asynchronous ViT encode: triggers preprocessing + ViT, returns MMMeta immediately.
+  rpc EncodeAsync(EncoderRequest) returns (MMMetaResponse) {}
+
+  // Register delivery address: Prefill TP workers register their ZMQ PULL socket
+  // so Encoder can push MMResult after ViT completes.
+  rpc RegisterDeliveryAddr(DeliveryAddrRequest) returns (RegisterResponse) {}
+
+  // Health check
+  rpc Health(HealthRequest) returns (HealthResponse) {}
+}
+
+message EncoderRequest {
+  string request_id = 1;
+  repeated MultimodalItemData items = 2;
+  string output_format = 3;  // "rvq_indices" / "vit_embedding"
+}
+
+message MultimodalItemData {
+  string modality = 1;  // "image" / "video"
+  string url = 2;       // image url / base64-encoded data
+  // Per-image splitting is done inside Encoder after decoding.
+}
+
+message MMMetaResponse {
+  string request_id = 1;
+  repeated MMItemMetaResponse item_metas = 2;
+  bool vit_pending = 3;  // True if ViT has cache-miss items still computing
+}
+
+message MMItemMetaResponse {
+  int32 item_index = 1;
+  int64 hash = 2;        // deterministic hash based on pixel_values
+  int64 pad_value = 3;   // modality-tagged, content-hash-derived pad value
+  repeated int32 grid_thw = 4;  // [T, H, W]
+  int32 num_tokens = 5;  // T * (H/merge) * (W/merge)
+}
+
+message DeliveryAddrRequest {
+  string request_id = 1;
+  int32 tp_rank = 2;
+  string receive_url = 3;  // e.g. "tcp://10.0.0.1:30001"
+  int32 tp_size = 4;
+}
+
+message RegisterResponse {
+  bool ok = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ok = 1;
+}

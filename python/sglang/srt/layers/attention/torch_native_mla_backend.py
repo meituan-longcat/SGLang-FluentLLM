@@ -9,8 +9,9 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.layers.attention.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
 
 # only support batch_size=1,just for test
 class TorchNativeMlaAttnBackend(AttentionBackend):
@@ -23,13 +24,9 @@ class TorchNativeMlaAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         pass
 
-    def _run_mla_forward_extend(self, query: torch.Tensor,
-                         k: torch.Tensor,
-                         v: torch.Tensor,
-                         seq_lens: torch.Tensor,
-                         scaling=None,
-                         enable_gqa=False,
-                         causal=False):
+    def _run_mla_forward_extend(
+        self, query: torch.Tensor, k: torch.Tensor, v: torch.Tensor, seq_lens: torch.Tensor, scaling=None, enable_gqa=False, causal=False
+    ):
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         assert seq_lens.dim() == 1
 
@@ -97,19 +94,14 @@ class TorchNativeMlaAttnBackend(AttentionBackend):
         save_kv_cache=True,
     ):
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         o = self._run_mla_forward_extend(
-            q_, k, v, forward_batch.seq_lens,
-            scaling=layer.scaling,
-            enable_gqa=use_gqa,
-            causal=not layer.is_cross_attention
+            q_, k, v, forward_batch.seq_lens, scaling=layer.scaling, enable_gqa=use_gqa, causal=not layer.is_cross_attention
         )
         return o
 
@@ -126,9 +118,7 @@ class TorchNativeMlaAttnBackend(AttentionBackend):
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -143,6 +133,6 @@ class TorchNativeMlaAttnBackend(AttentionBackend):
             forward_batch.seq_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
-            causal=False
+            causal=False,
         )
         return o

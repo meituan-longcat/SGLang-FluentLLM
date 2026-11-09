@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
-
-
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -13,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 class MoeA2ABackend(Enum):
-
     NONE = "none"
     DEEPEP = "deepep"
 
@@ -34,7 +31,6 @@ class MoeA2ABackend(Enum):
 
 
 class MoeRunnerBackend(Enum):
-
     AUTO = "auto"
     TRITON = "triton"
     TRITON_KERNEL = "triton_kernel"
@@ -66,7 +62,6 @@ class MoeRunnerBackend(Enum):
 
 
 class DeepEPMode(Enum):
-
     NORMAL = "normal"
     LOW_LATENCY = "low_latency"
     AUTO = "auto"
@@ -96,14 +91,14 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
-MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
-MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
-DEEPEP_MODE: Optional[DeepEPMode] = None
-IS_TBO_ENABLED: Optional[bool] = None
-IS_SBO_ENABLED: Optional[bool] = None
-TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
-DEEPEP_CONFIG: Optional[str] = None
-DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
+MOE_A2A_BACKEND: MoeA2ABackend | None = None
+MOE_RUNNER_BACKEND: MoeRunnerBackend | None = None
+DEEPEP_MODE: DeepEPMode | None = None
+IS_TBO_ENABLED: bool | None = None
+IS_SBO_ENABLED: bool | None = None
+TBO_TOKEN_DISTRIBUTION_THRESHOLD: float | None = None
+DEEPEP_CONFIG: str | None = None
+DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: bool | None = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -123,9 +118,7 @@ def initialize_moe_config(server_args: ServerArgs):
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
-    DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
-        server_args.disable_flashinfer_cutlass_moe_fp4_allgather
-    )
+    DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = server_args.disable_flashinfer_cutlass_moe_fp4_allgather
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -177,9 +170,6 @@ def is_sbo_enabled() -> bool:
 def get_tbo_token_distribution_threshold() -> float:
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     if TBO_TOKEN_DISTRIBUTION_THRESHOLD is None:
-        logger.warning(
-            "TBO_TOKEN_DISTRIBUTION_THRESHOLD is not initialized, using 0.48"
-        )
+        logger.warning("TBO_TOKEN_DISTRIBUTION_THRESHOLD is not initialized, using 0.48")
         TBO_TOKEN_DISTRIBUTION_THRESHOLD = 0.48
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
-

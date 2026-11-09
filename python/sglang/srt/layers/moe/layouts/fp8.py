@@ -88,12 +88,8 @@ class Fp8MoETensorQuantLayout(Fp8MoELayout):
         num_local_experts: int,
         **extra_weight_attrs,
     ):
-        w13_weight_scale = torch.nn.Parameter(
-            torch.ones(num_local_experts, 2, dtype=torch.float32), requires_grad=False
-        )
-        w2_weight_scale = torch.nn.Parameter(
-            torch.ones(num_local_experts, dtype=torch.float32), requires_grad=False
-        )
+        w13_weight_scale = torch.nn.Parameter(torch.ones(num_local_experts, 2, dtype=torch.float32), requires_grad=False)
+        w2_weight_scale = torch.nn.Parameter(torch.ones(num_local_experts, dtype=torch.float32), requires_grad=False)
 
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -112,14 +108,10 @@ class Fp8MoETensorQuantLayout(Fp8MoELayout):
         **extra_weight_attrs,
     ):
         assert self.quant_config.activation_scheme == "static"
-        assert self.quant_config.is_checkpoint_fp8_serialized 
+        assert self.quant_config.is_checkpoint_fp8_serialized
 
-        w13_input_scale = torch.nn.Parameter(
-            torch.ones(num_local_experts, dtype=torch.float32), requires_grad=False
-        )
-        w2_input_scale = torch.nn.Parameter(
-            torch.ones(num_local_experts, dtype=torch.float32), requires_grad=False
-        )
+        w13_input_scale = torch.nn.Parameter(torch.ones(num_local_experts, dtype=torch.float32), requires_grad=False)
+        w2_input_scale = torch.nn.Parameter(torch.ones(num_local_experts, dtype=torch.float32), requires_grad=False)
 
         layer.register_parameter("w13_input_scale", w13_input_scale)
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -136,12 +128,8 @@ class Fp8MoETensorQuantLayout(Fp8MoELayout):
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
             for expert in range(layer.num_local_experts):
-                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
-                )
-                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                    scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
-                )
+                w13_weight[expert, :, :], layer.w13_weight_scale[expert] = scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+                w2_weight[expert, :, :], layer.w2_weight_scale[expert] = scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
             return
@@ -233,11 +221,7 @@ class Fp8MoEBlockQuantLayout(Fp8MoELayout):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         weight_loader = partial(
-            load_model_weight,
-            tp_rank=get_moe_tensor_parallel_rank(),
-            is_bias=False,
-            use_presharded_weights=False,
-            do_transpose=False
+            load_model_weight, tp_rank=get_moe_tensor_parallel_rank(), is_bias=False, use_presharded_weights=False, do_transpose=False
         )  # FIXME
         set_weight_attrs(w13_weight_scale, {"weight_loader": weight_loader})
         set_weight_attrs(w2_weight_scale, {"weight_loader": weight_loader})
@@ -286,33 +270,15 @@ class Fp8MoEBlockQuantUseCutlassLayout(Fp8MoEBlockQuantLayout):
             device=device,
             dtype=torch.int64,
         )
-        self.workspace = torch.empty(
-            90000, device=device, dtype=torch.uint8
-        )
-        self.a_ptr = torch.empty(
-            num_local_experts, device=device, dtype=torch.int64
-        )
-        self.b_ptr = torch.empty(
-            num_local_experts, device=device, dtype=torch.int64
-        )
-        self.out_ptr = torch.empty(
-            num_local_experts, device=device, dtype=torch.int64
-        )
-        self.a_scales_ptr = torch.empty(
-            num_local_experts, device=device, dtype=torch.int64
-        )
-        self.b_scales_ptr = torch.empty(
-            num_local_experts, device=device, dtype=torch.int64
-        )
-        self.expert_offsets = torch.empty(
-            num_local_experts + 1, device=device, dtype=torch.int32
-        )
-        self.problem_sizes1 = torch.empty(
-            num_local_experts, 3, device=device, dtype=torch.int32
-        )
-        self.problem_sizes2 = torch.empty(
-            num_local_experts, 3, device=device, dtype=torch.int32
-        )
+        self.workspace = torch.empty(90000, device=device, dtype=torch.uint8)
+        self.a_ptr = torch.empty(num_local_experts, device=device, dtype=torch.int64)
+        self.b_ptr = torch.empty(num_local_experts, device=device, dtype=torch.int64)
+        self.out_ptr = torch.empty(num_local_experts, device=device, dtype=torch.int64)
+        self.a_scales_ptr = torch.empty(num_local_experts, device=device, dtype=torch.int64)
+        self.b_scales_ptr = torch.empty(num_local_experts, device=device, dtype=torch.int64)
+        self.expert_offsets = torch.empty(num_local_experts + 1, device=device, dtype=torch.int32)
+        self.problem_sizes1 = torch.empty(num_local_experts, 3, device=device, dtype=torch.int32)
+        self.problem_sizes2 = torch.empty(num_local_experts, 3, device=device, dtype=torch.int32)
 
     def create_weights(
         self,

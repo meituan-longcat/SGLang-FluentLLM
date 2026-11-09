@@ -23,10 +23,7 @@ if _is_cuda:
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
-
-    def __init__(
-        self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool
-    ):
+    def __init__(self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool):
         self.strategy = FusedWeightScaleSupported(strategy)
         self.is_static_input_scheme = is_static_input_scheme
         self.input_symmetric = input_symmetric
@@ -65,9 +62,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
         # INPUT SCALE
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
             if self.input_symmetric:
-                layer.input_scale = Parameter(
-                    layer.input_scale.max(), requires_grad=False
-                )
+                layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
             else:
                 input_scale = layer.input_scale
                 input_zero_point = layer.input_zero_point
@@ -119,9 +114,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
         # WEIGHT
         weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=torch.int8
-            ),
+            data=torch.empty(output_size_per_partition, input_size_per_partition, dtype=torch.int8),
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
@@ -146,26 +139,18 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
 
         # INPUT SCALE
         if self.is_static_input_scheme:
-            input_scale = PerTensorScaleParameter(
-                data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader
-            )
+            input_scale = PerTensorScaleParameter(data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader)
             layer.register_parameter("input_scale", input_scale)
 
             if not self.input_symmetric:
                 # Note: compressed-tensors stores the zp using the same dtype
                 # as the weights
                 # AZP loaded as int8 but used as int32
-                input_zero_point = PerTensorScaleParameter(
-                    data=torch.empty(1, dtype=torch.int8), weight_loader=weight_loader
-                )
+                input_zero_point = PerTensorScaleParameter(data=torch.empty(1, dtype=torch.int8), weight_loader=weight_loader)
                 layer.register_parameter("input_zero_point", input_zero_point)
 
-    def apply_weights(
-        self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
-    ) -> torch.Tensor:
+    def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
         x_q, x_scale = per_token_quant_int8(x)
 
-        return int8_scaled_mm(
-            x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias
-        )
+        return int8_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias)

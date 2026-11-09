@@ -1,16 +1,18 @@
 from dataclasses import dataclass
 from typing import Optional
-from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+
 import torch
 import triton
 import triton.language as tl
-
-from sglang.srt.layers.attention.flash_attention_backend import FlashAttentionMetadata
-from sglang.srt.env import global_server_args_dict
 from flash_attn_3.flash_attn_interface import flash_attn_varlen_func
+from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
 
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.flash_attention_backend import FlashAttentionMetadata
 from sglang.srt.utils import get_colorful_logger
+
 logger = get_colorful_logger(__name__)
+
 
 @triton.jit
 def create_chunked_cache_kv_indices(
@@ -38,18 +40,15 @@ def create_chunked_cache_kv_indices(
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < chunk_seq_len
         data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + chunk_start_pos
-            + offset,
+            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + chunk_start_pos + offset,
             mask=mask,
         )
-        tl.store(
-            chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask
-        )
+        tl.store(chunk_kv_indices_ptr + chunk_kv_indices_offset + offset, data, mask=mask)
+
 
 def get_max_chunk_capacity():
     return global_server_args_dict["mla_max_chunk_capacity"]
+
 
 # Here we suppose the length of each chunk is equal
 # For example, if we have 4 sequences with seq length [256, 512, 768, 1024], chunk_len = 256
@@ -65,9 +64,11 @@ chunk1   --   --   --   --
 chunk2   --   --   --   --
 chunk3   --   --   --   --
 """
+
+
 # starts, ends, len_in_chunk, cu_seq_lens, all satisfy the above layout
 @dataclass
-class Chunks(object):
+class Chunks:
     starts: torch.Tensor
     ends: torch.Tensor
     len_in_chunk: torch.Tensor
@@ -81,34 +82,20 @@ class Chunks(object):
             result[:, 1:] = self.len_in_chunk.cumsum(dim=1).to(torch.int32)
             self._cu_seq_lens = result
 
-        return self._cu_seq_lens 
+        return self._cu_seq_lens
 
 
 def chunking(prefix_lens: torch.Tensor, num_chunks, batch_size, chunk_len):
-    starts = (
-        torch.arange(num_chunks, device=prefix_lens.device, dtype=torch.int32)
-        .unsqueeze(1)
-        .expand(-1, batch_size)
-        * chunk_len
-    )
+    starts = torch.arange(num_chunks, device=prefix_lens.device, dtype=torch.int32).unsqueeze(1).expand(-1, batch_size) * chunk_len
     ends = torch.min(prefix_lens.unsqueeze(0), starts + chunk_len).to(torch.int32)
 
-    chunks = Chunks(
-        starts=starts,
-        ends=ends,
-        len_in_chunk=(ends - starts).clamp(min=0).to(torch.int32)
-    )
+    chunks = Chunks(starts=starts, ends=ends, len_in_chunk=(ends - starts).clamp(min=0).to(torch.int32))
     return chunks
 
 
 # Called before each attention module if using chunked kv cache for prefill
 # Some of the codes are adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/common.py
-def get_chunks(
-    prefix_lens, 
-    prefix_lens_cpu, 
-    req_to_token, 
-    req_pool_indices,
-    token_to_kv_pool):
+def get_chunks(prefix_lens, prefix_lens_cpu, req_to_token, req_pool_indices, token_to_kv_pool):
     device: torch.device = prefix_lens.device
     batch_size = len(prefix_lens_cpu)
 
@@ -135,15 +122,10 @@ def get_chunks(
             chunk_kv_indices,
             req_to_token.shape[1],
         )
-        
-        if (
-            hasattr(token_to_kv_pool, 'enable_mla_l1_5_cache')
-            and token_to_kv_pool.enable_mla_l1_5_cache
-        ):
-            mask, local_indices, per_rank_count, perm, inv_perm = (
-                token_to_kv_pool.global_loc_to_local_mapping(
-                    chunk_kv_indices,
-                )
+
+        if hasattr(token_to_kv_pool, "enable_mla_l1_5_cache") and token_to_kv_pool.enable_mla_l1_5_cache:
+            mask, local_indices, per_rank_count, perm, inv_perm = token_to_kv_pool.remap_tokens_for_kvp(
+                chunk_kv_indices,
             )
             chunk_kv_indices = (
                 chunk_kv_indices,
@@ -162,7 +144,8 @@ def get_chunks(
 # Reuse this workspace buffer across all flashinfer wrappers
 global_workspace_buffer = None
 
-class ChunkerBase(object):
+
+class ChunkerBase:
     def __init__(
         self,
         num_qo_heads,
@@ -228,12 +211,8 @@ class ChunkFlashAttn3(ChunkerBase):
         metadata = FlashAttentionMetadata()
         metadata.cache_seqlens_int32 = kv_lens.to(torch.int32)
         metadata.max_seq_len_k = max(kv_lens_cpu)
-        metadata.cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(kv_lens, dim=0, dtype=torch.int32), (1, 0)
-        )
-        metadata.cu_seqlens_q = torch.nn.functional.pad(
-            torch.cumsum(q_lens, dim=0, dtype=torch.int32), (1, 0)
-        )
+        metadata.cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(kv_lens, dim=0, dtype=torch.int32), (1, 0))
+        metadata.cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(q_lens, dim=0, dtype=torch.int32), (1, 0))
         metadata.max_seq_len_q = max(q_lens_cpu)
         self.metadata = metadata
         return self
@@ -288,9 +267,7 @@ class ChunkFlashInferAttn(ChunkerBase):
                 dtype=torch.uint8,
                 device=device,
             )
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            global_workspace_buffer, "NHD"
-        )
+        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(global_workspace_buffer, "NHD")
 
     def plan(self, q_lens, kv_lens, *args, **kwargs):
         bs = len(q_lens)
@@ -312,14 +289,7 @@ class ChunkFlashInferAttn(ChunkerBase):
         )
         return self
 
-    def forward_extend(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        scaling,
-        logits_soft_cap
-    ):
+    def forward_extend(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaling, logits_soft_cap):
         if self.causal and self.step_counter is not None:
             self.step_counter.record_cache()
 
@@ -334,6 +304,7 @@ class ChunkFlashInferAttn(ChunkerBase):
         )
         return o1, s1
 
+
 def get_attns(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, q_lens, chunks: Chunks, chunks_cpu: Chunks, q_lens_cpu):
     attns = []
     backend = global_server_args_dict["chunker_backend"]
@@ -347,16 +318,23 @@ def get_attns(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, q
 
     for chunk_idx in range(chunks.starts.shape[0]):
         attns.append(
-            AttnImpl(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, False, None).plan(q_lens, chunks.len_in_chunk[chunk_idx], q_lens_cpu, chunks_cpu.len_in_chunk[chunk_idx])
+            AttnImpl(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, False, None).plan(
+                q_lens, chunks.len_in_chunk[chunk_idx], q_lens_cpu, chunks_cpu.len_in_chunk[chunk_idx]
+            )
         )
     return attns
+
 
 def get_casual_attn(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, q_lens, kv_lens, step_counter, q_lens_cpu, kv_lens_cpu):
     backend = global_server_args_dict["chunker_backend"]
     if backend == "flashinfer":
-        return ChunkFlashInferAttn(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, True, step_counter).plan(q_lens, kv_lens, q_lens_cpu, kv_lens_cpu)
+        return ChunkFlashInferAttn(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, True, step_counter).plan(
+            q_lens, kv_lens, q_lens_cpu, kv_lens_cpu
+        )
     elif backend == "fa3":
-        return ChunkFlashAttn3(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, True, step_counter).plan(q_lens, kv_lens, q_lens_cpu, kv_lens_cpu)
+        return ChunkFlashAttn3(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, device, True, step_counter).plan(
+            q_lens, kv_lens, q_lens_cpu, kv_lens_cpu
+        )
     else:
         raise RuntimeError(f"Not Supported backend: {backend}")
 
@@ -380,7 +358,7 @@ def create_streamed_cache_kv_indices(
     # find the req pool idx, this is for batch to token
     req_pool_index = tl.load(req_pool_indices_ptr + pid)
     seq_len = tl.load(seq_lens_ptr + pid)
-    streamed_len = tl.load(streamed_lens_ptr + pid)
+    tl.load(streamed_lens_ptr + pid)
     streamed_kv_indices_offset = tl.load(streamed_cu_lens_ptr + pid)
 
     # get the token positions of current stream
@@ -392,35 +370,26 @@ def create_streamed_cache_kv_indices(
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = offset < streamed_sink_bound
         data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + offset,
+            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + offset,
             mask=mask,
         )
-        tl.store(
-            streamed_kv_indices_ptr + streamed_kv_indices_offset + offset, data, mask=mask
-        )
+        tl.store(streamed_kv_indices_ptr + streamed_kv_indices_offset + offset, data, mask=mask)
 
     num_loop = tl.cdiv(seq_len - streamed_recent_bound, BLOCK_SIZE)
     for i in range(num_loop):
         offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
         mask = streamed_recent_bound + offset < seq_len
         data = tl.load(
-            req_to_token_ptr
-            + req_pool_index * req_to_token_ptr_stride
-            + streamed_recent_bound
-            + offset,
+            req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + streamed_recent_bound + offset,
             mask=mask,
         )
-        tl.store(
-            streamed_kv_indices_ptr + streamed_kv_indices_offset + streamed_sink_bound + offset, data, mask=mask
-        )
+        tl.store(streamed_kv_indices_ptr + streamed_kv_indices_offset + streamed_sink_bound + offset, data, mask=mask)
 
 
 def get_streamed_kv_indices(extend_seq_lens, extend_seq_lens_cpu, seq_lens, seq_lens_cpu, req_to_token, req_pool_indices, is_prefill):
-    if is_prefill: # Prefill, early exit to avoid redundant kv indices fetching.
+    if is_prefill:  # Prefill, early exit to avoid redundant kv indices fetching.
         return None, seq_lens
-    
+
     device: torch.device = seq_lens.device
     batch_size = len(seq_lens_cpu)
 
@@ -429,7 +398,7 @@ def get_streamed_kv_indices(extend_seq_lens, extend_seq_lens_cpu, seq_lens, seq_
     streamed_recent_bounds = torch.max(streamed_sink_bounds, ((seq_lens - extend_seq_lens + 127) // 128 - 7) * 128)
     streamed_lens = streamed_sink_bounds + seq_lens - streamed_recent_bounds
     streamed_cu_lens = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
-    streamed_cu_lens[1: ] = streamed_lens.cumsum(dim=0)
+    streamed_cu_lens[1:] = streamed_lens.cumsum(dim=0)
     num_tokens_per_forward = streamed_lens.sum().item()
 
     streamed_kv_indices = torch.empty(num_tokens_per_forward, dtype=torch.int32, device=device)
@@ -448,9 +417,13 @@ def get_streamed_kv_indices(extend_seq_lens, extend_seq_lens_cpu, seq_lens, seq_
 
     return streamed_kv_indices, streamed_lens
 
-from duo_flash_attn_interface import flash_attn_varlen_func as duo_flash_attn_varlen_func
 
-class StreamedFlashAttn(object):
+from duo_flash_attn_interface import (  # noqa: E402
+    flash_attn_varlen_func as duo_flash_attn_varlen_func,
+)
+
+
+class StreamedFlashAttn:
     def __init__(self, num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, q_lens, kv_lens, streaming_info, head_mask_type, step_counter):
         self.num_qo_heads = num_qo_heads
         self.num_kv_heads = num_kv_heads
@@ -461,11 +434,11 @@ class StreamedFlashAttn(object):
         self.max_q_len = torch.max(self.q_lens).item()
         bs = len(q_lens)
         self.cu_q_lens = torch.zeros(bs + 1, device=q_lens.device, dtype=torch.int32)
-        self.cu_q_lens[1: ] = torch.cumsum(q_lens, dim=0)
+        self.cu_q_lens[1:] = torch.cumsum(q_lens, dim=0)
         self.kv_lens = kv_lens
         self.max_kv_len = torch.max(self.kv_lens).item()
         self.cu_kv_lens = torch.zeros(bs + 1, device=kv_lens.device, dtype=torch.int32)
-        self.cu_kv_lens[1: ] = torch.cumsum(kv_lens, dim=0)
+        self.cu_kv_lens[1:] = torch.cumsum(kv_lens, dim=0)
         self.streaming_info = streaming_info
         self.head_mask_type = head_mask_type
         self.step_counter = step_counter
@@ -495,7 +468,7 @@ class StreamedFlashAttn(object):
             causal=True,
         )
         return o
-    
+
 
 def get_streamed_attn(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, q_lens, kv_lens, streaming_info, head_mask_type, step_counter):
     return StreamedFlashAttn(num_qo_heads, num_kv_heads, head_dim, v_head_dim, dtype, q_lens, kv_lens, streaming_info, head_mask_type, step_counter)

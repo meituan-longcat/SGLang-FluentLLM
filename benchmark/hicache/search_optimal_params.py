@@ -13,13 +13,13 @@ HiCache 最优参数搜索脚本 - 改进版本
 
 import argparse
 import json
-import os
 import subprocess
-import time
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any
+
 
 # 颜色输出
 class Colors:
@@ -133,7 +133,7 @@ class ImprovedParameterSearch:
         
         log_info(f"全局配置已保存到: {config_file}")
     
-    def create_param_directory(self, params: Dict[str, str]) -> Path:
+    def create_param_directory(self, params: dict[str, str]) -> Path:
         """创建参数目录"""
         # 使用更清晰的目录名
         param_parts = []
@@ -187,7 +187,7 @@ class ImprovedParameterSearch:
         # 等待进程结束
         time.sleep(5)
     
-    def launch_service(self, params: Dict[str, str]) -> bool:
+    def launch_service(self, params: dict[str, str]) -> bool:
         """启动 HiCache 服务"""
         log_info("=" * 60)
         log_info("启动 HiCache 服务...")
@@ -271,7 +271,7 @@ class ImprovedParameterSearch:
         # 至少需要两个服务健康
         return healthy_count >= 2
     
-    def run_benchmarks(self, params: Dict[str, str], output_dir: Path) -> Optional[Dict[str, Any]]:
+    def run_benchmarks(self, params: dict[str, str], output_dir: Path) -> dict[str, Any] | None:
         """运行基准测试"""
         log_info("=" * 60)
         log_info("运行基准测试...")
@@ -346,7 +346,7 @@ class ImprovedParameterSearch:
                 "params": params.copy()
             }
     
-    def collect_metrics(self, output_dir: Path) -> Dict[str, Any]:
+    def collect_metrics(self, output_dir: Path) -> dict[str, Any]:
         """从输出目录收集指标"""
         metrics = {
             "summary": {},
@@ -394,7 +394,7 @@ class ImprovedParameterSearch:
         
         return metrics
     
-    def calculate_summary_metrics(self, metrics: Dict[str, Any]):
+    def calculate_summary_metrics(self, metrics: dict[str, Any]):
         """计算汇总指标"""
         summary = {
             "total_tests": 0,
@@ -449,7 +449,7 @@ class ImprovedParameterSearch:
         
         metrics["summary"] = summary
     
-    def calculate_score(self, metrics: Dict[str, Any]) -> float:
+    def calculate_score(self, metrics: dict[str, Any]) -> float:
         """计算性能分数"""
         if "summary" not in metrics:
             return 0.0
@@ -611,7 +611,7 @@ class ImprovedParameterSearch:
         
         return best_value
     
-    def run(self) -> Dict[str, Any]:
+    def run(self) -> dict[str, Any]:
         """运行完整的参数搜索"""
         log_info("=" * 60)
         log_info("HiCache 最优参数搜索 (改进版本)")
@@ -679,8 +679,7 @@ class ImprovedParameterSearch:
             f.write("=" * 60 + "\n")
             f.write("最优参数组合\n")
             f.write("=" * 60 + "\n")
-            for param, value in self.current_best_params.items():
-                f.write(f"  {param}: {value}\n")
+            f.writelines(f"  {param}: {value}\n" for param, value in self.current_best_params.items())
             f.write("\n")
             
             f.write("=" * 60 + "\n")

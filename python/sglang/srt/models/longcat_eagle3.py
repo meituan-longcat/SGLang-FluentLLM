@@ -14,30 +14,31 @@
 
 """Inference-only Longcat-EAGLE3 model compatible with HuggingFace weights."""
 
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2AttentionMLA, DeepseekV3ForCausalLM, DecoderCommMananger
-from sglang.srt.utils import add_prefix
-from sglang.srt.env import global_server_args_dict
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from sglang.srt.layers.dp_attention import get_attention_tp_group, get_attention_tp_size, get_attention_tp_rank
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_group, get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_v2 import DecoderCommMananger, DeepseekV2AttentionMLA, DeepseekV2MLP, DeepseekV3ForCausalLM
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.utils import add_prefix
 
 
 class LongcatDecoderLayerEagle3NextN(nn.Module):
@@ -93,9 +94,7 @@ class LongcatDecoderLayerEagle3NextN(nn.Module):
         # Layer norms
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.attn_tp_group = get_attention_tp_group()
         self.attn_tp_size = get_attention_tp_size()
@@ -107,7 +106,7 @@ class LongcatDecoderLayerEagle3NextN(nn.Module):
             dense_parallel_strategy=global_server_args_dict["dense_parallel_strategy"],
             moe_parallel_strategy=global_server_args_dict["moe_parallel_strategy"],
             is_moe_layer=False,
-            num_layers=1  # EAGLE-3 has only 1 layer
+            num_layers=1,  # EAGLE-3 has only 1 layer
         )
 
     def forward(
@@ -117,7 +116,7 @@ class LongcatDecoderLayerEagle3NextN(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             positions: Position indices
@@ -135,25 +134,17 @@ class LongcatDecoderLayerEagle3NextN(nn.Module):
 
         # Self Attention
         hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            comm_manager=self.decoder_comm_manager
+            positions=positions, hidden_states=hidden_states, forward_batch=forward_batch, comm_manager=self.decoder_comm_manager
         )
 
-        hidden_states, residual = self.decoder_comm_manager.post_attn_comm(
-            hidden_states, residual, hidden_states.shape[0])
+        hidden_states, residual = self.decoder_comm_manager.post_attn_comm(hidden_states, residual, hidden_states.shape[0])
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         # Fully Connected
-        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(
-            hidden_states, forward_batch, hidden_states.shape[0]
-        )
+        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(hidden_states, forward_batch, hidden_states.shape[0])
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(
-            hidden_states, residual, hidden_states.shape[0], forward_batch
-        )
+        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(hidden_states, residual, hidden_states.shape[0], forward_batch)
         if start_idx is not None and end_idx is not None:
             hidden_states = hidden_states[start_idx:end_idx]
 
@@ -179,19 +170,11 @@ class LongcatModelEagle3NextN(nn.Module):
         # Projection layer for concatenated hidden states (3 layers -> 1 layer)
         if hasattr(config, "target_hidden_size"):
             self.fc = ReplicatedLinear(
-                config.target_hidden_size * 3,
-                config.hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("fc", prefix)
+                config.target_hidden_size * 3, config.hidden_size, bias=False, quant_config=quant_config, prefix=add_prefix("fc", prefix)
             )
         else:
             self.fc = ReplicatedLinear(
-                config.hidden_size * 3,
-                config.hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("fc", prefix)
+                config.hidden_size * 3, config.hidden_size, bias=False, quant_config=quant_config, prefix=add_prefix("fc", prefix)
             )
 
         self.midlayer = LongcatDecoderLayerEagle3NextN(config, 0, quant_config, prefix)
@@ -205,10 +188,7 @@ class LongcatModelEagle3NextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
-        else:
-            embeds = input_embeds
+        embeds = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
 
         # Get hidden states from spec_info and project them
         hidden_states = forward_batch.spec_info.hidden_states
@@ -224,9 +204,7 @@ class LongcatModelEagle3NextN(nn.Module):
             residual,
         )
 
-        hidden_states_to_logits, hidden_states_to_aux = self.norm(
-            hidden_states, residual
-        )
+        hidden_states_to_logits, hidden_states_to_aux = self.norm(hidden_states, residual)
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
@@ -252,9 +230,7 @@ class LongcatForCausalLMEagle3NextN(DeepseekV3ForCausalLM):
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
 
-        self.model = LongcatModelEagle3NextN(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = LongcatModelEagle3NextN(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
 
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
@@ -271,7 +247,7 @@ class LongcatForCausalLMEagle3NextN(DeepseekV3ForCausalLM):
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = True
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights from checkpoint, handling name mapping and vocab buffers."""
         for name, loaded_weight in weights:
             if "d2t" in name:

@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.disaggregation.utils import StepCounter
+    from sglang.srt.layers.attention.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.disaggregation.utils import StepCounter
 
 
 class AttentionBackend(ABC):
@@ -19,6 +19,37 @@ class AttentionBackend(ABC):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
+
+    def init_cuda_graph_state_prefill(self, max_bs: int, kv_indices_buf=None):
+        """Init the global shared states for prefill cuda graph.
+        Default no-op; backends that support prefill cuda graphs should override."""
+        pass
+
+    def init_forward_metadata_prefill_capture_cuda_graph(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ):
+        """Init the metadata for a prefill forward pass for capturing a cuda graph.
+        Default no-op; backends that support prefill cuda graphs should override."""
+        pass
+
+    def init_forward_metadata_replay_prefill_cuda_graph(
+        self,
+        forward_batch: ForwardBatch,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+    ):
+        """Init the metadata for a prefill forward pass for replaying a cuda graph.
+        Default no-op; backends that support prefill cuda graphs should override."""
+        pass
 
     def init_cuda_graph_state(self, max_bs: int):
         """Init the global shared states for cuda graph."""
@@ -31,7 +62,7 @@ class AttentionBackend(ABC):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: EagleDraftInput | EagleVerifyInput | None,
     ):
         """Init the metadata for a forward pass for capturing a cuda graph."""
         raise NotImplementedError()
@@ -43,7 +74,7 @@ class AttentionBackend(ABC):
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: EagleDraftInput | EagleVerifyInput | None,
     ):
         """Init the metadata for a forward pass for replying a cuda graph."""
         raise NotImplementedError()
@@ -77,10 +108,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
         else:
-            if (not forward_batch.forward_mode.is_idle()
-                and getattr(self, "step_counter", None)
-                and not save_kv_cache
-            ):
+            if not forward_batch.forward_mode.is_idle() and getattr(self, "step_counter", None) and not save_kv_cache:
                 self.step_counter.record_cache()
 
             ret = self.forward_extend(
@@ -93,10 +121,7 @@ class AttentionBackend(ABC):
                 **kwargs,
             )
 
-            if (not forward_batch.forward_mode.is_idle()
-                and getattr(self, "step_counter", None)
-                and save_kv_cache
-            ):
+            if not forward_batch.forward_mode.is_idle() and getattr(self, "step_counter", None) and save_kv_cache:
                 self.step_counter.record_cache()
             return ret
 

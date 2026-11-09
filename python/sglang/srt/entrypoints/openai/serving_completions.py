@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, List, Union
+from collections.abc import AsyncGenerator
+from typing import Any, Union
 
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.parser.code_completion_parser import generate_completion_prompt_from_request
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -15,7 +15,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionStreamResponse,
     ErrorResponse,
 )
-from sglang.srt.managers.req import ABORT_CODE
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -23,8 +22,10 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.req import AbortCode
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager, tokenizer_decode_task
+from sglang.srt.parser.code_completion_parser import generate_completion_prompt_from_request
 
 logger = logging.getLogger(__name__)
 
@@ -50,28 +51,20 @@ class OpenAIServingCompletion(OpenAIServingBase):
         """Convert OpenAI completion request to internal format"""
         # NOTE: with openai API, the prompt's logprobs are always not computed
         if request.echo and request.logprobs:
-            logger.warning(
-                "Echo is not compatible with logprobs. "
-                "To compute logprobs of input prompt, please use the native /generate API."
-            )
+            logger.warning("Echo is not compatible with logprobs. To compute logprobs of input prompt, please use the native /generate API.")
         # Process prompt
         prompt = request.prompt
         if self.template_manager.completion_template_name is not None:
             prompt = generate_completion_prompt_from_request(request)
 
         # Set logprob start length based on echo and logprobs
-        if request.echo and request.logprobs:
-            logprob_start_len = 0
-        else:
-            logprob_start_len = -1
+        logprob_start_len = 0 if request.echo and request.logprobs else -1
 
         # Build sampling parameters
         sampling_params = self._build_sampling_params(request)
 
         # Determine prompt format
-        if isinstance(prompt, str) or (
-            isinstance(prompt, list) and isinstance(prompt[0], str)
-        ):
+        if isinstance(prompt, str) or (isinstance(prompt, list) and isinstance(prompt[0], str)):
             prompt_kwargs = {"text": prompt}
         else:
             prompt_kwargs = {"input_ids": prompt}
@@ -93,7 +86,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         return adapted_request, request
 
-    def _build_sampling_params(self, request: CompletionRequest) -> Dict[str, Any]:
+    def _build_sampling_params(self, request: CompletionRequest) -> dict[str, Any]:
         """Build sampling parameters for the request"""
         # Start with common parameters
         sampling_params = {
@@ -148,12 +141,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # Usage tracking
         prompt_tokens = {}
+        reasoning_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
         spec_verify_tokens = {}
         hidden_states = {}
 
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
+        if not self.tokenizer_manager.server_args.enable_return_logprobs:
             adapted_request.return_logprob = None
             adapted_request.top_logprobs_num = None
             request.logprobs = None
@@ -161,14 +155,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 raw_request.logprobs = None
 
         try:
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in self.tokenizer_manager.generate_request(adapted_request, raw_request):
                 index = content.get("index", 0)
 
                 text = content["text"]
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                reasoning_tokens[index] = content["meta_info"].get("reasoning_tokens", 0)
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 spec_verify_tokens[index] = content["meta_info"].get("spec_verify_ct", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
@@ -185,9 +178,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 if request.logprobs is not None:
                     # The first chunk and echo is enabled.
                     if not stream_buffer and request.echo:
-                        input_token_logprobs = content["meta_info"][
-                            "input_token_logprobs"
-                        ]
+                        input_token_logprobs = content["meta_info"]["input_token_logprobs"]
                         input_top_logprobs = content["meta_info"]["input_top_logprobs"]
                     else:
                         input_token_logprobs = None
@@ -197,16 +188,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     logprobs = to_openai_style_logprobs(
                         input_token_logprobs=input_token_logprobs,
                         input_top_logprobs=input_top_logprobs,
-                        output_token_logprobs=content["meta_info"][
-                            "output_token_logprobs"
-                        ][n_prev_token:],
-                        output_top_logprobs=content["meta_info"]["output_top_logprobs"][
-                            n_prev_token:
-                        ],
+                        output_token_logprobs=content["meta_info"]["output_token_logprobs"][n_prev_token:],
+                        output_top_logprobs=content["meta_info"]["output_top_logprobs"][n_prev_token:],
                     )
-                    n_prev_tokens[index] = len(
-                        content["meta_info"]["output_token_logprobs"]
-                    )
+                    n_prev_tokens[index] = len(content["meta_info"]["output_token_logprobs"])
 
                 # Generate delta
                 delta = text[len(stream_buffer) :]
@@ -216,33 +201,29 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
-                if finish_reason_type:
-                    if finish_reason_type == "abort" \
-                        and finish_reason["err_type"] in [ABORT_CODE.TransferFailed]:
-                        error = self.create_streaming_error_response(
-                            message = finish_reason['message'],
-                            err_type = finish_reason['err_type'].name,
-                            status_code = finish_reason['err_type'].value,
-                        )
-                        yield f"data: {error}\n\n"
-                        break
+                if finish_reason_type and finish_reason_type == "abort" and finish_reason["err_type"] in [AbortCode.TransferFailed]:
+                    error = self.create_streaming_error_response(
+                        message=finish_reason["message"],
+                        err_type=finish_reason["err_type"].name,
+                        status_code=finish_reason["err_type"].value,
+                    )
+                    yield f"data: {error}\n\n"
+                    break
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
                     logprobs=logprobs,
                     finish_reason=finish_reason["type"] if finish_reason else None,
-                    matched_stop=(
-                        finish_reason["matched"]
-                        if finish_reason and "matched" in finish_reason
-                        else None
-                    ),
+                    matched_stop=(finish_reason["matched"] if finish_reason and "matched" in finish_reason else None),
                 )
-                usage=None
+                usage = None
                 if finish_reason_type:
-                    # Internal streaming interface requires finish_reason && usage in same package return, also keep logic for subsequent usage separate return
-                    usage=UsageProcessor.calculate_streaming_usage(
+                    # Internal streaming interface requires finish_reason && usage in same package return,
+                    # also keep logic for subsequent usage separate return
+                    usage = UsageProcessor.calculate_streaming_usage(
                         prompt_tokens,
+                        reasoning_tokens,
                         completion_tokens,
                         cached_tokens,
                         spec_verify_tokens,
@@ -263,11 +244,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
-                        last_token_hidden_states = (
-                            choice_hidden_states[-1]
-                            if len(choice_hidden_states) > 1
-                            else []
-                        )
+                        last_token_hidden_states = choice_hidden_states[-1] if len(choice_hidden_states) > 1 else []
                         hidden_states_chunk = CompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             created=created,
@@ -288,6 +265,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
+                    reasoning_tokens,
                     completion_tokens,
                     cached_tokens,
                     spec_verify_tokens,
@@ -317,7 +295,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
         """Handle non-streaming completion request"""
-        if self.tokenizer_manager.server_args.speculative_algorithm is not None:
+        if not self.tokenizer_manager.server_args.enable_return_logprobs:
             adapted_request.return_logprob = None
             adapted_request.top_logprobs_num = None
             request.logprobs = None
@@ -325,9 +303,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 raw_request.logprobs = None
 
         try:
-            generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            )
+            generator = self.tokenizer_manager.generate_request(adapted_request, raw_request)
             ret = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
@@ -346,7 +322,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
     async def _build_completion_response(
         self,
         request: CompletionRequest,
-        ret: List[Dict[str, Any]],
+        ret: list[dict[str, Any]],
         created: int,
     ) -> CompletionResponse:
         """Build completion response from generation results"""
@@ -380,9 +356,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = to_openai_style_logprobs(
                     input_token_logprobs=input_token_logprobs,
                     input_top_logprobs=input_top_logprobs,
-                    output_token_logprobs=ret_item["meta_info"][
-                        "output_token_logprobs"
-                    ],
+                    output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
                     output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
                 )
 
@@ -391,12 +365,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             finish_reason_type = finish_reason["type"] if finish_reason else None
-            if finish_reason_type and finish_reason_type == "abort" \
-                and finish_reason["err_type"] in [ABORT_CODE.TransferFailed]:
+            if finish_reason_type and finish_reason_type == "abort" and finish_reason["err_type"] in [AbortCode.TransferFailed]:
                 error = self.create_error_response(
-                    message = finish_reason['message'],
-                    err_type = finish_reason['err_type'].name,
-                    status_code = finish_reason['err_type'].value,
+                    message=finish_reason["message"],
+                    err_type=finish_reason["err_type"].name,
+                    status_code=finish_reason["err_type"].value,
                 )
                 return error
 
@@ -405,20 +378,14 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 text=text,
                 logprobs=logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,
-                matched_stop=(
-                    finish_reason["matched"]
-                    if finish_reason and "matched" in finish_reason
-                    else None
-                ),
+                matched_stop=(finish_reason["matched"] if finish_reason and "matched" in finish_reason else None),
                 hidden_states=hidden_states,
             )
             choices.append(choice_data)
 
         # Calculate usage
         cache_report = self.tokenizer_manager.server_args.enable_cache_report
-        usage = UsageProcessor.calculate_response_usage(
-            ret, n_choices=request.n, enable_cache_report=cache_report
-        )
+        usage = UsageProcessor.calculate_response_usage(ret, n_choices=request.n, enable_cache_report=cache_report)
 
         return CompletionResponse(
             id=ret[0]["meta_info"]["id"],
@@ -439,21 +406,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 return request.prompt[index // request.n]
             elif isinstance(request.prompt[0], int):
                 # for the case of single token ids prompt
-                return await self.tokenizer_manager.run_tokenizer_task(
-                    tokenizer_decode_task,
-                    request.prompt,
-                    {"skip_special_tokens": True})
-            elif isinstance(request.prompt[0], list) and isinstance(
-                request.prompt[0][0], int
-            ):
+                return await self.tokenizer_manager.run_tokenizer_task(tokenizer_decode_task, request.prompt, {"skip_special_tokens": True})
+            elif isinstance(request.prompt[0], list) and isinstance(request.prompt[0][0], int):
                 # for the case of multiple token ids prompts
                 return await self.tokenizer_manager.run_tokenizer_task(
-                    tokenizer_decode_task,
-                    request.prompt[index // request.n],
-                    {"skip_special_tokens": True})
+                    tokenizer_decode_task, request.prompt[index // request.n], {"skip_special_tokens": True}
+                )
         return ""
 
-    async def _prepare_echo_prompts(self, request: CompletionRequest) -> List[str]:
+    async def _prepare_echo_prompts(self, request: CompletionRequest) -> list[str]:
         """Prepare echo prompts for non-streaming response"""
         # TODO: handle the case prompt is token ids
         if isinstance(request.prompt, list) and isinstance(request.prompt[0], str):
@@ -461,18 +422,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return request.prompt
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], list):
             # for the case of multiple token ids prompts
-            return await asyncio.gather(*(
-                self.tokenizer_manager.run_tokenizer_task(tokenizer_decode_task, prompt, {"skip_special_tokens": True})
-                for prompt in request.prompt
-            ))
+            return await asyncio.gather(
+                *(
+                    self.tokenizer_manager.run_tokenizer_task(tokenizer_decode_task, prompt, {"skip_special_tokens": True})
+                    for prompt in request.prompt
+                )
+            )
         elif isinstance(request.prompt, list) and isinstance(request.prompt[0], int):
             # for the case of single token ids prompt
-            return [
-                await self.tokenizer_manager.run_tokenizer_task(
-                    tokenizer_decode_task,
-                    request.prompt,
-                    {"skip_special_tokens": True})
-            ]
+            return [await self.tokenizer_manager.run_tokenizer_task(tokenizer_decode_task, request.prompt, {"skip_special_tokens": True})]
         else:
             # for the case of single str prompt
             return [request.prompt]

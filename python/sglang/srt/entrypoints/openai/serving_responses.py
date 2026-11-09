@@ -2,19 +2,23 @@
 # Adapted from vLLM's OpenAIServingResponses
 """Handler for /v1/responses requests"""
 
+# ruff: noqa: F821
 import asyncio
 import copy
 import json
 import logging
 import time
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import AsyncExitStack
 from http import HTTPStatus
-from typing import Any, AsyncGenerator, AsyncIterator, Optional, Union
+from typing import Any, Optional, Union
 
 import jinja2
-import openai.types.responses as openai_responses_types
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
+from openai_harmony import Message as OpenAIMessage
+
+import openai.types.responses as openai_responses_types
 from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
@@ -24,8 +28,6 @@ from openai.types.responses.response_function_tool_call import ResponseFunctionT
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
-from openai_harmony import Message as OpenAIMessage
-
 from sglang.srt.entrypoints.context import (
     ConversationContext,
     HarmonyContext,
@@ -45,6 +47,7 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    CompletionTokensDetails,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
@@ -84,26 +87,18 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Get default sampling params from model config if available
         self.default_sampling_params = {}
 
-        self.supports_browsing = (
-            tool_server.has_tool("browser") if tool_server else False
-        )
-        self.supports_code_interpreter = (
-            tool_server.has_tool("python") if tool_server else False
-        )
+        self.supports_browsing = tool_server.has_tool("browser") if tool_server else False
+        self.supports_code_interpreter = tool_server.has_tool("python") if tool_server else False
         self.tool_server = tool_server
         # Get from model config
-        self.use_harmony = (
-            self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
-        )
+        self.use_harmony = self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
 
         if self.use_harmony:
             # OpenAI models have two EOS-like tokens: <|return|> and <|call|>.
             # We need to add them to the stop token ids.
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []
-            self.default_sampling_params["stop_token_ids"].extend(
-                get_stop_tokens_for_assistant_actions()
-            )
+            self.default_sampling_params["stop_token_ids"].extend(get_stop_tokens_for_assistant_actions())
 
         # Response storage for background and retrieval operations
         # Note: In production, this should use a proper storage backend (Redis, database)
@@ -114,9 +109,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Message storage for conversation continuity
         # Note: In production, this should use a proper storage backend (Redis, database)
         # with TTL/expiration to prevent memory leaks
-        self.msg_store: dict[
-            str, Union[list[ChatCompletionMessageParam], list["OpenAIMessage"]]
-        ] = {}
+        self.msg_store: dict[str, Union[list[ChatCompletionMessageParam], list[OpenAIMessage]]] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
@@ -151,9 +144,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             model_name = request.model
 
             if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
-                    self._make_request_with_harmony(request, prev_response)
-                )
+                messages, request_prompts, engine_prompts = self._make_request_with_harmony(request, prev_response)
             else:
                 messages, request_prompts, engine_prompts = await self._make_request(request, prev_response)
 
@@ -170,15 +161,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             and isinstance(self.tool_server, MCPToolServer)
             and (request.background or request.stream)
             and request.tools
-            and any(
-                tool.type in ["web_search_preview", "code_interpreter"]
-                for tool in request.tools
-            )
+            and any(tool.type in ["web_search_preview", "code_interpreter"] for tool in request.tools)
         ):
-            return self.create_error_response(
-                "MCP tool server is not supported in background mode and "
-                "streaming mode"
-            )
+            return self.create_error_response("MCP tool server is not supported in background mode and streaming mode")
 
         # Schedule the request and get the result generator
         generators: list[AsyncGenerator[Any, None]] = []
@@ -192,10 +177,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             try:
                 if self.tool_server is not None:
                     tool_session_ctxs: dict[str, Any] = {
-                        tool_name: exit_stack.enter_async_context(
-                            self.tool_server.get_tool_session(tool_name)
-                        )
-                        for tool_name in tool_list
+                        tool_name: exit_stack.enter_async_context(self.tool_server.get_tool_session(tool_name)) for tool_name in tool_list
                     }
                     tool_sessions = {}
                     for tool_name in tool_list:
@@ -205,31 +187,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
                     # Calculate default max tokens from context length minus prompt length
-                    if hasattr(engine_prompt, "__len__"):
-                        prompt_length = len(engine_prompt)
-                    elif isinstance(engine_prompt, list):
-                        prompt_length = len(engine_prompt)
-                    else:
-                        prompt_length = 0
+                    prompt_length = len(engine_prompt) if hasattr(engine_prompt, "__len__") or isinstance(engine_prompt, list) else 0
 
                     context_len = (
-                        self.tokenizer_manager.model_config.context_len
-                        if hasattr(self.tokenizer_manager.model_config, "context_len")
-                        else 4096
+                        self.tokenizer_manager.model_config.context_len if hasattr(self.tokenizer_manager.model_config, "context_len") else 4096
                     )
-                    default_max_tokens = max(
-                        context_len - prompt_length, 512
-                    )  # Ensure minimum 512 tokens
-                    sampling_params = request.to_sampling_params(
-                        default_max_tokens, self.default_sampling_params
-                    )
+                    default_max_tokens = max(context_len - prompt_length, 512)  # Ensure minimum 512 tokens
+                    sampling_params = request.to_sampling_params(default_max_tokens, self.default_sampling_params)
 
                     context: ConversationContext
                     if self.use_harmony:
-                        if request.stream:
-                            context = StreamingHarmonyContext(messages, tool_sessions)
-                        else:
-                            context = HarmonyContext(messages, tool_sessions)
+                        context = StreamingHarmonyContext(messages, tool_sessions) if request.stream else HarmonyContext(messages, tool_sessions)
                     else:
                         context = SimpleContext()
 
@@ -293,9 +261,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                 # For cleanup
                 self.background_tasks[response.id] = task
-                task.add_done_callback(
-                    lambda _: self.background_tasks.pop(response.id, None)
-                )
+                task.add_done_callback(lambda _: self.background_tasks.pop(response.id, None))
                 return response
 
             if request.stream:
@@ -309,16 +275,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                     request_metadata,
                 )
             try:
-                result: Union[ORJSONResponse, ResponsesResponse] = (
-                    await self.responses_full_generator(
-                        request,
-                        sampling_params,
-                        result_generator,
-                        context,
-                        model_name,
-                        tokenizer,
-                        request_metadata,
-                    )
+                result: Union[ORJSONResponse, ResponsesResponse] = await self.responses_full_generator(
+                    request,
+                    sampling_params,
+                    result_generator,
+                    context,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
                 )
                 return result
             except Exception as e:
@@ -374,9 +338,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         prev_response: Optional[ResponsesResponse],
     ):
         if request.tool_choice != "auto":
-            raise NotImplementedError(
-                "Only 'auto' tool_choice is supported in " "response API"
-            )
+            raise NotImplementedError("Only 'auto' tool_choice is supported in response API")
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
         engine_prompt = prompt_token_ids
@@ -417,29 +379,20 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
-            output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
-            )
+            output = self._make_response_output_items(request, final_res["text"], tokenizer)
 
             # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
+            if isinstance(final_res, dict) and "meta_info" in final_res:
+                meta_info = final_res["meta_info"]
+                num_prompt_tokens = meta_info.get("prompt_tokens", 0)
+                num_generated_tokens = meta_info.get("completion_tokens", 0)
+                num_cached_tokens = meta_info.get("cached_tokens", 0)
+                num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
+            elif hasattr(final_res, "meta_info"):
                 num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
-            elif hasattr(final_res, "prompt_token_ids") and hasattr(
-                final_res, "outputs"
-            ):
-                # Fallback calculation if meta_info not available
-                num_prompt_tokens = (
-                    len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0
-                )
-                num_generated_tokens = (
-                    len(final_res.outputs[0].token_ids)
-                    if final_res.outputs and final_res.outputs[0].token_ids
-                    else 0
-                )
-                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
-                num_reasoning_tokens = 0
+                num_reasoning_tokens = final_res.meta_info.get("reasoning_tokens", 0)
             else:
                 # Final fallback
                 num_prompt_tokens = 0
@@ -447,16 +400,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
+        completion_details = None
+        if num_reasoning_tokens:
+            completion_details = CompletionTokensDetails(
+                reasoning_tokens=num_reasoning_tokens,
+            )
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
-            reasoning_tokens=num_reasoning_tokens,
+            completion_tokens_details=completion_details,
         )
         if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=num_cached_tokens
-            )
+            usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=num_cached_tokens)
         request_metadata.final_usage_info = usage
 
         response = ResponsesResponse.from_request(
@@ -487,9 +443,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Handle reasoning parsing if enabled
         if self.reasoning_parser:
             # Use standard reasoning parser (openai maps to T4Detector internally)
-            reasoning_parser = ReasoningParser(
-                model_type=self.reasoning_parser, stream_reasoning=False
-            )
+            reasoning_parser = ReasoningParser(model_type=self.reasoning_parser, stream_reasoning=False)
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
             reasoning_content = None
@@ -502,9 +456,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="reasoning",
                 summary=[],
                 content=[
-                    ResponseReasoningTextContent(
-                        type="reasoning_text", text=reasoning_content
-                    ),
+                    ResponseReasoningTextContent(type="reasoning_text", text=reasoning_content),
                 ],
                 status=None,
             )
@@ -565,7 +517,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # NOTE: We skip the reasoning output of the previous response
                 if isinstance(output_item, ResponseReasoningItem):
                     continue
-                for content in output_item.content:
+                for _content in output_item.content:
                     messages.append(
                         {
                             "role": "system",
@@ -586,29 +538,17 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         prev_response: Optional[ResponsesResponse],
     ) -> list["OpenAIMessage"]:
-        messages: list["OpenAIMessage"] = []
+        messages: list[OpenAIMessage] = []
         if prev_response is None:
             # New conversation.
             reasoning_effort = request.reasoning.effort if request.reasoning else None
             tool_types = [tool.type for tool in request.tools]
-            enable_browser = (
-                "web_search_preview" in tool_types and self.tool_server is not None
-            )
-            enable_code_interpreter = (
-                "code_interpreter" in tool_types and self.tool_server is not None
-            )
+            enable_browser = "web_search_preview" in tool_types and self.tool_server is not None
+            enable_code_interpreter = "code_interpreter" in tool_types and self.tool_server is not None
             sys_msg = get_system_message(
                 reasoning_effort=reasoning_effort,
-                browser_description=(
-                    self.tool_server.get_tool_description("browser")
-                    if self.tool_server and enable_browser
-                    else None
-                ),
-                python_description=(
-                    self.tool_server.get_tool_description("python")
-                    if self.tool_server and enable_code_interpreter
-                    else None
-                ),
+                browser_description=(self.tool_server.get_tool_description("browser") if self.tool_server and enable_browser else None),
+                python_description=(self.tool_server.get_tool_description("python") if self.tool_server and enable_code_interpreter else None),
             )
             messages.append(sys_msg)
             dev_msg = get_developer_message(request.instructions, request.tools)
@@ -620,25 +560,16 @@ class OpenAIServingResponses(OpenAIServingChat):
             prev_msgs = self.msg_store[prev_response.id]
             # Remove the previous chain-of-thoughts if there is a new "final"
             # message.
-            if (
-                len(prev_msgs) > 0
-                and hasattr(prev_msgs[-1], "channel")
-                and prev_msgs[-1].channel == "final"
-            ):  # type: ignore[union-attr]
+            if len(prev_msgs) > 0 and hasattr(prev_msgs[-1], "channel") and prev_msgs[-1].channel == "final":  # type: ignore[union-attr]
                 prev_final_msg_idx = -1
                 for i in range(len(prev_msgs) - 2, -1, -1):
-                    if (
-                        hasattr(prev_msgs[i], "channel")
-                        and prev_msgs[i].channel == "final"
-                    ):  # type: ignore[union-attr]
+                    if hasattr(prev_msgs[i], "channel") and prev_msgs[i].channel == "final":  # type: ignore[union-attr]
                         prev_final_msg_idx = i
                         break
                 recent_turn_msgs = prev_msgs[prev_final_msg_idx + 1 :]
                 del prev_msgs[prev_final_msg_idx + 1 :]
                 for msg in recent_turn_msgs:
-                    if (
-                        hasattr(msg, "channel") and msg.channel != "analysis"
-                    ):  # type: ignore[union-attr]
+                    if hasattr(msg, "channel") and msg.channel != "analysis":  # type: ignore[union-attr]
                         prev_msgs.append(msg)
             messages.extend(prev_msgs)
         # Append the new input.
@@ -646,10 +577,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append(get_user_message(request.input))
         else:
-            if prev_response is not None:
-                prev_outputs = copy(prev_response.output)
-            else:
-                prev_outputs = []
+            prev_outputs = copy(prev_response.output) if prev_response is not None else []
             for response_msg in request.input:
                 messages.append(parse_response_input(response_msg, prev_outputs))
                 if isinstance(response_msg, ResponseFunctionToolCall):
@@ -748,10 +676,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     def _make_invalid_id_error(self, response_id: str):
         return self.create_error_response(
-            message=(
-                f"Invalid 'response_id': '{response_id}'. "
-                "Expected an ID that begins with 'resp'."
-            ),
+            message=(f"Invalid 'response_id': '{response_id}'. Expected an ID that begins with 'resp'."),
             err_type="invalid_request_error",
             param="response_id",
         )
@@ -790,10 +715,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             sequence_number += 1
             # Get event type from the event's type field if it exists
             event_type = getattr(event, "type", "unknown")
-            return (
-                f"event: {event_type}\n"
-                f"data: {event.model_dump_json(indent=None)}\n\n"
-            )
+            return f"event: {event_type}\ndata: {event.model_dump_json(indent=None)}\n\n"
 
         current_content_index = 0
         current_output_index = 0
@@ -825,7 +747,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         async for ctx in result_generator:
-
             if ctx.is_expecting_start():
                 current_output_index += 1
                 sent_output_item_added = False
@@ -909,10 +830,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
 
             if ctx.parser.last_content_delta:
-                if (
-                    ctx.parser.current_channel == "final"
-                    and ctx.parser.current_recipient is None
-                ):
+                if ctx.parser.current_channel == "final" and ctx.parser.current_recipient is None:
                     if not sent_output_item_added:
                         sent_output_item_added = True
                         yield _send_event(
@@ -956,10 +874,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             logprobs=[],
                         )
                     )
-                elif (
-                    ctx.parser.current_channel == "analysis"
-                    and ctx.parser.current_recipient is None
-                ):
+                elif ctx.parser.current_channel == "analysis" and ctx.parser.current_recipient is None:
                     if not sent_output_item_added:
                         sent_output_item_added = True
                         yield _send_event(
@@ -1006,11 +921,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             if ctx.is_assistant_action_turn() and len(ctx.parser.messages) > 0:
                 previous_item = ctx.parser.messages[-1]
-                if (
-                    self.supports_browsing
-                    and previous_item.recipient is not None
-                    and previous_item.recipient.startswith("browser.")
-                ):
+                if self.supports_browsing and previous_item.recipient is not None and previous_item.recipient.startswith("browser."):
                     function_name = previous_item.recipient[len("browser.") :]
                     action = None
                     parsed_args = json.loads(previous_item.content[0].text)
@@ -1089,11 +1000,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                     )
 
-                if (
-                    self.supports_code_interpreter
-                    and previous_item.recipient is not None
-                    and previous_item.recipient.startswith("python")
-                ):
+                if self.supports_code_interpreter and previous_item.recipient is not None and previous_item.recipient.startswith("python"):
                     yield _send_event(
                         openai_responses_types.ResponseOutputItemAddedEvent(
                             type="response.output_item.added",
@@ -1182,13 +1089,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             usage_info = response_dict["usage"]
             response_dict["usage"] = {
                 "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
+                "input_tokens_details": {"cached_tokens": usage_info.get("cached_tokens", 0)},
                 "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
+                "output_tokens_details": {"reasoning_tokens": usage_info.get("reasoning_tokens", 0)},
                 "total_tokens": usage_info.get("total_tokens", 0),
             }
 
@@ -1216,9 +1119,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         while True:
             # Generate using SGLang's tokenizer manager
-            generator = self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            )
+            generator = self.tokenizer_manager.generate_request(adapted_request, raw_request)
 
             async for res in generator:
                 context.append_output(res)
@@ -1252,12 +1153,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             )
 
             # Update sampling params with reduced max_tokens
-            if hasattr(sampling_params, "max_new_tokens") or isinstance(
-                sampling_params, dict
-            ):
-                context_len = getattr(
-                    self.tokenizer_manager.model_config, "context_len", 4096
-                )
+            if hasattr(sampling_params, "max_new_tokens") or isinstance(sampling_params, dict):
+                context_len = getattr(self.tokenizer_manager.model_config, "context_len", 4096)
                 remaining_tokens = context_len - len(prompt_token_ids) - 1
 
                 if isinstance(sampling_params, dict):

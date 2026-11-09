@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2025 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """
 Configure the logging settings of a server.
 
@@ -21,6 +19,8 @@ python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000
 """
 
 import argparse
+import os
+import tempfile
 
 import requests
 
@@ -30,7 +30,9 @@ if __name__ == "__main__":
     parser.add_argument("--log-requests", action="store_true")
     parser.add_argument("--log-requests-level", type=int, default=2)
     parser.add_argument(
-        "--dump-requests-folder", type=str, default="/tmp/sglang_request_dump"
+        "--dump-requests-folder",
+        type=str,
+        default=os.path.join(tempfile.gettempdir(), "sglang_request_dump"),
     )
     parser.add_argument("--dump-requests-threshold", type=int, default=1000)
     args = parser.parse_args()
@@ -43,5 +45,6 @@ if __name__ == "__main__":
             "dump_requests_folder": args.dump_requests_folder,
             "dump_requests_threshold": args.dump_requests_threshold,
         },
+        timeout=30,
     )
     assert response.status_code == 200

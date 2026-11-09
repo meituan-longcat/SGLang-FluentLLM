@@ -21,9 +21,10 @@ import time
 import traceback
 import warnings
 from argparse import ArgumentParser
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any
 
 import aiohttp
 import numpy as np
@@ -33,10 +34,9 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_processing import MsgContent, SampleOutput, get_dataset
+from sglang.bench_serving import get_tokenizer, remove_prefix, set_ulimit
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
-
-from sglang.bench_serving import get_tokenizer, remove_prefix, set_ulimit
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
 
@@ -45,25 +45,25 @@ global args
 
 @dataclass
 class RequestFuncInput:
-    prompts: List[Tuple[MsgContent, int, int]]
+    prompts: list[tuple[MsgContent, int, int]]
     api_url: str
     model: str
     lora_name: str
-    extra_request_body: Dict[str, Any]
+    extra_request_body: dict[str, Any]
 
     # For multiturn chat, store the context
-    prev_messages: List = field(default_factory=list)
+    prev_messages: list = field(default_factory=list)
     finished_prompts: int = 0
 
 
 @dataclass
 class RequestFuncOutput:
-    generated_text: List[str] = field(default_factory=list)
-    prompt_len: List[int] = field(default_factory=list)
-    output_len: List[int] = field(default_factory=list)
-    latency: List[float] = field(default_factory=list)
-    ttft: List[float] = field(default_factory=list)
-    itl: List[float] = field(default_factory=list)  # List of inter-token latencies
+    generated_text: list[str] = field(default_factory=list)
+    prompt_len: list[int] = field(default_factory=list)
+    output_len: list[int] = field(default_factory=list)
+    latency: list[float] = field(default_factory=list)
+    ttft: list[float] = field(default_factory=list)
+    itl: list[float] = field(default_factory=list)  # List of inter-token latencies
 
     success: bool = False
     error: str = ""
@@ -74,7 +74,7 @@ async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
     queue: asyncio.Queue,
     tokenizer: PreTrainedTokenizerBase,
-    pbar: Optional[tqdm] = None,
+    pbar: tqdm | None = None,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith(
@@ -118,7 +118,6 @@ async def async_request_openai_completions(
         payload["max_tokens"] = max_tokens
 
         # output.prompt_len = request_func_input.prompt_len
-        # print(payload)
 
         generated_text = ""
         ttft = 0.0
@@ -286,19 +285,19 @@ async def get_requests(
 
 
 def calculate_metrics(
-    outputs: List[RequestFuncOutput],
+    outputs: list[RequestFuncOutput],
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
-) -> Tuple[BenchmarkMetrics, List[int]]:
-    output_lens: List[int] = []
-    retokenized_output_lens: List[int] = []
+) -> tuple[BenchmarkMetrics, list[int]]:
+    output_lens: list[int] = []
+    retokenized_output_lens: list[int] = []
     total_input = 0
     completed = 0
-    itls: List[float] = []
-    tpots: List[float] = []
-    ttfts: List[float] = []
-    e2e_latencies: List[float] = []
+    itls: list[float] = []
+    tpots: list[float] = []
+    ttfts: list[float] = []
+    e2e_latencies: list[float] = []
     output_success = 0
     for i in range(len(outputs)):
         if outputs[i].success:
@@ -381,10 +380,10 @@ async def benchmark(
     tokenizer: PreTrainedTokenizerBase,
     input_requests: SampleOutput,
     request_rate: float,
-    max_concurrency: Optional[int],
+    max_concurrency: int | None,
     disable_tqdm: bool,
     lora_name: str,
-    extra_request_body: Dict[str, Any],
+    extra_request_body: dict[str, Any],
     profile: bool,
     enable_shared_prefix: bool,
 ):
@@ -478,7 +477,7 @@ async def benchmark(
     pbar = None if disable_tqdm else tqdm(total=num_actual_requests)
 
     benchmark_start_time = time.perf_counter()
-    tasks: List[asyncio.Task] = []
+    tasks: list[asyncio.Task] = []
     async for request in get_requests(
         inputs_requests_queue, request_rate, num_actual_requests
     ):
@@ -492,7 +491,7 @@ async def benchmark(
                 )
             )
         )
-    outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     # Stop profiler
     if profile:
@@ -849,7 +848,7 @@ def run_benchmark(args_: argparse.Namespace):
         
         # Wait between tests to let system stabilize
         if rate != request_rates[-1]:
-            print(f"\nWaiting 5 seconds before next test...")
+            print("\nWaiting 5 seconds before next test...")
             time.sleep(5)
     
     # Print summary of all results

@@ -24,7 +24,6 @@ logger = get_colorful_logger(__name__)
 
 
 class PyNcclCommunicator:
-
     def __init__(
         self,
         group: Union[ProcessGroup, StatelessProcessGroup],
@@ -44,9 +43,7 @@ class PyNcclCommunicator:
         """
         if not isinstance(group, StatelessProcessGroup):
             assert dist.is_initialized()
-            assert (
-                dist.get_backend(group) != dist.Backend.NCCL
-            ), "PyNcclCommunicator should be attached to a non-NCCL group."
+            assert dist.get_backend(group) != dist.Backend.NCCL, "PyNcclCommunicator should be attached to a non-NCCL group."
             # note: this rank is the rank in the group
             self.rank = dist.get_rank(group)
             self.world_size = dist.get_world_size(group)
@@ -105,9 +102,7 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                self.world_size, self.unique_id, self.rank
-            )
+            self.comm: ncclComm_t = self.nccl.ncclCommInitRank(self.world_size, self.unique_id, self.rank)
             self.stream = torch.cuda.Stream()
 
             # A small all_reduce for warmup.
@@ -121,18 +116,13 @@ class PyNcclCommunicator:
         # when we are using CUDA graph.
         self.disabled = True
 
-    def all_reduce(
-        self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
-    ):
+    def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None):
         if self.disabled:
             return
         # nccl communicator created on a specific device
         # will only work on tensors on the same device
         # otherwise it will cause "illegal memory access"
-        assert tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {tensor.device}"
-        )
+        assert tensor.device == self.device, f"this nccl communicator is created to work on {self.device}, but the input tensor is on {tensor.device}"
         if stream is None:
             stream = self.stream
         self.nccl.ncclAllReduce(
@@ -145,17 +135,14 @@ class PyNcclCommunicator:
             cudaStream_t(stream.cuda_stream),
         )
 
-    def all_gather(
-        self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, stream=None
-    ):
+    def all_gather(self, output_tensor: torch.Tensor, input_tensor: torch.Tensor, stream=None):
         if self.disabled:
             return
         # nccl communicator created on a specific device
         # will only work on tensors on the same device
         # otherwise it will cause "illegal memory access"
         assert input_tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {input_tensor.device}"
+            f"this nccl communicator is created to work on {self.device}, but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
             stream = self.stream
@@ -181,8 +168,7 @@ class PyNcclCommunicator:
         # will only work on tensors on the same device
         # otherwise it will cause "illegal memory access"
         assert input_tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {input_tensor.device}"
+            f"this nccl communicator is created to work on {self.device}, but the input tensor is on {input_tensor.device}"
         )
         if stream is None:
             stream = self.stream
@@ -199,10 +185,7 @@ class PyNcclCommunicator:
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
             return
-        assert tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {tensor.device}"
-        )
+        assert tensor.device == self.device, f"this nccl communicator is created to work on {self.device}, but the input tensor is on {tensor.device}"
         if stream is None:
             stream = self.stream
         self.nccl.ncclSend(
@@ -217,10 +200,7 @@ class PyNcclCommunicator:
     def recv(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
             return
-        assert tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {tensor.device}"
-        )
+        assert tensor.device == self.device, f"this nccl communicator is created to work on {self.device}, but the input tensor is on {tensor.device}"
         if stream is None:
             stream = self.stream
         self.nccl.ncclRecv(
@@ -235,10 +215,7 @@ class PyNcclCommunicator:
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
             return
-        assert tensor.device == self.device, (
-            f"this nccl communicator is created to work on {self.device}, "
-            f"but the input tensor is on {tensor.device}"
-        )
+        assert tensor.device == self.device, f"this nccl communicator is created to work on {self.device}, but the input tensor is on {tensor.device}"
         if stream is None:
             stream = self.stream
         if src == self.rank:
@@ -259,9 +236,7 @@ class PyNcclCommunicator:
         )
 
     @contextmanager
-    def change_state(
-        self, enable: Optional[bool] = None, stream: Optional[torch.cuda.Stream] = None
-    ):
+    def change_state(self, enable: Optional[bool] = None, stream: Optional[torch.cuda.Stream] = None):
         """
         A context manager to change the state of the communicator.
         """

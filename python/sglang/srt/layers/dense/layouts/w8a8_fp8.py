@@ -26,7 +26,6 @@ _is_fp8_fnuz = is_fp8_fnuz()
 
 
 class W8A8Fp8LinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: W8A8Fp8Config):
         self.quantization_config = quantization_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
@@ -38,9 +37,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             weight_scale = layer.weight_scale.detach()
             # If checkpoint offline quantized with w8a8_fp8, load the weight and weight_scale directly.
             if _is_fp8_fnuz:
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=weight_scale
-                )
+                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(weight=weight, weight_scale=weight_scale)
 
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
@@ -49,9 +46,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             if self.cutlass_fp8_supported:
                 # if cutlass supported, we use cutlass_scaled_mm
                 # which requires per-channel quantization on weight
-                qweight, weight_scale = per_token_group_quant_fp8(
-                    layer.weight, layer.weight.shape[-1]
-                )
+                qweight, weight_scale = per_token_group_quant_fp8(layer.weight, layer.weight.shape[-1])
                 weight_scale = weight_scale.t().contiguous()
             else:
                 # if cutlass not supported, we fall back to use torch._scaled_mm
@@ -73,11 +68,7 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        weight_dtype = (
-            torch.float8_e4m3fn
-            if self.quantization_config.is_checkpoint_fp8_serialized
-            else params_dtype
-        )
+        weight_dtype = torch.float8_e4m3fn if self.quantization_config.is_checkpoint_fp8_serialized else params_dtype
 
         weight_loader = extra_weight_attrs.get("weight_loader")
         self.logical_widths = output_partition_sizes

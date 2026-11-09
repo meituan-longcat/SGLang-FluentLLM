@@ -1,7 +1,11 @@
+import weakref
+from typing import TYPE_CHECKING, Optional
+
 import torch
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduling.schedule_batch import ScheduleBatch
 from sglang.srt.sampling.penaltylib.orchestrator import (
-    BatchedPenalizerOrchestrator,
     _BatchedPenalizer,
 )
 
@@ -11,31 +15,41 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
     Presence penalizer penalizes tokens based on their presence in the output.
     """
 
-    def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self.orchestrator = orchestrator
+    def __init__(self, batch, device, vocab_size):
+        self._batch_ref = weakref.ref(batch)
+        self.device = device
+        self.vocab_size = vocab_size
         self._is_prepared = False
 
+    @property
+    def batch(self) -> "Optional[ScheduleBatch]":
+        return self._batch_ref()
+
+    @batch.setter
+    def batch(self, value: "Optional[ScheduleBatch]"):
+        if value is None:
+            self._batch_ref = lambda: None
+        else:
+            self._batch_ref = weakref.ref(value)
+
+    def reqs(self):
+        return self.batch.reqs
+
     def _is_required(self) -> bool:
-        return any(
-            req.sampling_params.presence_penalty != 0.0
-            for req in self.orchestrator.reqs()
-        )
+        return any(req.sampling_params.presence_penalty != 0.0 for req in self.reqs())
 
     def _prepare(self):
         self.cumulated_presence_penalties = torch.zeros(
-            (len(self.orchestrator.reqs()), self.orchestrator.vocab_size),
+            (len(self.reqs()), self.vocab_size),
             dtype=torch.float32,
-            device=self.orchestrator.device,
+            device=self.device,
         )
 
         self.presence_penalties = (
             torch.tensor(
-                data=[
-                    req.sampling_params.presence_penalty
-                    for req in self.orchestrator.reqs()
-                ],
+                data=[req.sampling_params.presence_penalty for req in self.reqs()],
                 dtype=torch.float32,
-                device=self.orchestrator.device,
+                device=self.device,
             )
         ).unsqueeze_(1)
 
@@ -52,14 +66,10 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
 
     def _filter(self, keep_indices: torch.Tensor):
         self.presence_penalties = self.presence_penalties[keep_indices]
-        self.cumulated_presence_penalties = self.cumulated_presence_penalties[
-            keep_indices
-        ]
+        self.cumulated_presence_penalties = self.cumulated_presence_penalties[keep_indices]
 
     def _merge(self, their: "BatchedPresencePenalizer"):
-        self.presence_penalties = torch.cat(
-            [self.presence_penalties, their.presence_penalties], dim=0
-        )
+        self.presence_penalties = torch.cat([self.presence_penalties, their.presence_penalties], dim=0)
         self.cumulated_presence_penalties = torch.cat(
             [self.cumulated_presence_penalties, their.cumulated_presence_penalties],
             dim=0,

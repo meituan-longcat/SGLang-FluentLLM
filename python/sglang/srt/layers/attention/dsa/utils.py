@@ -1,7 +1,8 @@
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.layers.dp_attention import get_attention_tp_group
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_group
+
 # temp NSA debugging environ
 from sglang.srt.utils import get_bool_env_var
 
@@ -9,9 +10,7 @@ NSA_USE_REAL_INDEXER = get_bool_env_var("SGLANG_NSA_USE_REAL_INDEXER", "true")
 NSA_DUAL_STREAM = get_bool_env_var("SGLANG_NSA_DUAL_STREAM", "true")
 NSA_FUSE_TOPK = get_bool_env_var("SGLANG_NSA_FUSE_TOPK", "true")
 
-NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = get_bool_env_var(
-    "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8", "true"
-)
+NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = get_bool_env_var("SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8", "true")
 NSA_QUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_QUANT_K_CACHE_FAST", "true")
 NSA_DEQUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_DEQUANT_K_CACHE_FAST", "true")
 
@@ -27,9 +26,8 @@ def print_nsa_bool_env_vars():
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
     return original_seq_lens.clamp(max=nsa_index_topk)
 
-def cp_attn_tp_all_gather_reorganazied_into_tensor(
-    input_: torch.Tensor, total_len, attn_tp_size, forward_batch, stream_op
-):
+
+def cp_attn_tp_all_gather_reorganazied_into_tensor(input_: torch.Tensor, total_len, attn_tp_size, forward_batch, stream_op):
     """
     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
     This implementation mainly consists of three parts:
@@ -49,23 +47,15 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
         dtype=input_.dtype,
     )
     # step2
-    get_attention_tp_group().cp_all_gather_into_tensor_async(
-        input_tensor_all, input_, stream_op
-    )
+    get_attention_tp_group().cp_all_gather_into_tensor_async(input_tensor_all, input_, stream_op)
     # step3
-    outputs_list_max = list(
-        torch.split(input_tensor_all, forward_batch.nsa_cp_metadata.max_rank_len, dim=0)
-    )
+    outputs_list_max = list(torch.split(input_tensor_all, forward_batch.nsa_cp_metadata.max_rank_len, dim=0))
     outputs = torch.cat(
-        [
-            outputs_list_max[index][:per_rank_len]
-            for index, per_rank_len in enumerate(
-                forward_batch.nsa_cp_metadata.per_rank_actual_token
-            )
-        ],
+        [outputs_list_max[index][:per_rank_len] for index, per_rank_len in enumerate(forward_batch.nsa_cp_metadata.per_rank_actual_token)],
         dim=0,
     )
     return outputs
+
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
@@ -90,13 +80,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         forward_batch,
         stream,
     )
-    outputs_list = list(
-        torch.split(
-            output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
-        )
-    )
-    output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
-    )
+    outputs_list = list(torch.split(output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0))
+    output_tensor = torch.cat([outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0)
     output_tensor = output_tensor.view(-1, hidden_size)
     return output_tensor

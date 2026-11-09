@@ -1,15 +1,16 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional
+
 import torch
-from torch import nn
 import torch_npu
+from torch import nn
 from torch.nn import Parameter
 
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    RowParallelLinear
-)
 from sglang.srt.distributed import get_mlp_tp_group
+from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import add_prefix, get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 
 class NPUParallelMLP(nn.Module):
@@ -20,6 +21,7 @@ class NPUParallelMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
         self.quant_config = quant_config
@@ -31,6 +33,7 @@ class NPUParallelMLP(nn.Module):
             gather_output=False,
             quant_config=quant_config,
             outside_tp_group=self.mlp_tp_group,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -40,38 +43,40 @@ class NPUParallelMLP(nn.Module):
             reduce_results=False,
             quant_config=quant_config,
             outside_tp_group=self.mlp_tp_group,
+            prefix=add_prefix("down_proj", prefix),
         )
 
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.gate_up_proj.throw_dequant = True
 
     def act_fn(self, x):
-        if self.quant_config is not None and isinstance(x, (List, Tuple)):
-            x, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(x[0], weight_scale=self.gate_up_proj.weight_scale.to(torch.float),
-                                                            group_index=None, activation_scale=x[1], activate_left=True, quant_mode=1,
-                                                            quant_scale=self.down_proj.smooth_scale)
+        if self.quant_config is not None and isinstance(x, (list, tuple)):
+            x, pertoken_scale = torch_npu.npu_dequant_swiglu_quant(
+                x[0],
+                weight_scale=self.gate_up_proj.weight_scale.to(torch.float),
+                group_index=None,
+                activation_scale=x[1],
+                activate_left=True,
+                quant_mode=1,
+                quant_scale=self.down_proj.smooth_scale,
+            )
             return x, pertoken_scale
         else:
             return torch_npu.npu_swiglu(x, dim=-1)
 
     def prefetch_gateup(self, dependency):
-        torch_npu.npu_prefetch(self.gate_up_proj.weight, dependency,
-                               self.gate_up_proj.weight.numel() * self.gate_up_proj.weight.element_size())
+        torch_npu.npu_prefetch(self.gate_up_proj.weight, dependency, self.gate_up_proj.weight.numel() * self.gate_up_proj.weight.element_size())
 
     def prefetch_down(self, dependency):
-        torch_npu.npu_prefetch(self.down_proj.weight, dependency,
-                               self.down_proj.weight.numel() * self.down_proj.weight.element_size())
+        torch_npu.npu_prefetch(self.down_proj.weight, dependency, self.down_proj.weight.numel() * self.down_proj.weight.element_size())
 
     def pre_comm(self, hidden_states, output_split_sizes=None):
         output = []
         tensors = hidden_states if isinstance(hidden_states, (list, tuple)) else [hidden_states]
         for tensor in tensors:
             tensor = tensor.view(-1, tensor.size(-1)) if len(tensor.size()) > 2 else tensor
-            out_tensor=self.mlp_tp_group.all_gather(tensor, dim=0, output_split_sizes=output_split_sizes)
+            out_tensor = self.mlp_tp_group.all_gather(tensor, dim=0, output_split_sizes=output_split_sizes)
             output.append(out_tensor)
         output = output if isinstance(hidden_states, (list, tuple)) else output[0]
         return output
@@ -79,16 +84,18 @@ class NPUParallelMLP(nn.Module):
     def pre_quant(self, hidden_states):
         return torch_npu.npu_dynamic_quant(hidden_states, smooth_scales=self.gate_up_proj.smooth_scale)
 
-    def pre_compact_allgather(self, hidden_states, world_len_list, comm_tensor: torch.Tensor=None):
+    def pre_compact_allgather(self, hidden_states, world_len_list, comm_tensor: torch.Tensor = None):
         # for query len with large range in dp prefill, cooperate with post_compact_reduce_scatter
         pass
 
-    def forward(self,
-                hidden_states,
-                pertoken_scale=None,
-                reduce_type=None,  # 'skip', 'all_reduce' or 'reduce_scatter', default is 'all_reduce'
-                return_ctrl=False,
-                input_split_sizes=None):
+    def forward(
+        self,
+        hidden_states,
+        pertoken_scale=None,
+        reduce_type=None,  # 'skip', 'all_reduce' or 'reduce_scatter', default is 'all_reduce'
+        return_ctrl=False,
+        input_split_sizes=None,
+    ):
         if pertoken_scale is not None:
             gate_up, _ = self.gate_up_proj((hidden_states, pertoken_scale))
         else:
@@ -98,33 +105,38 @@ class NPUParallelMLP(nn.Module):
         output = self.post_comm(gate_down, reduce_type, input_split_sizes)
         if return_ctrl:
             # second/third out for prefetch weight dependency
-            return output, gate_up[0] if isinstance(gate_up, (List, Tuple)) else gate_up, gate_down
+            return output, gate_up[0] if isinstance(gate_up, (list, tuple)) else gate_up, gate_down
         return output
 
+    def forward_sp(self, hidden_states, mlp_sp_token_num, with_quant=False):
+        if with_quant:
+            hidden_states = self.pre_quant(hidden_states)
+        hidden_states = self.pre_comm(hidden_states, output_split_sizes=mlp_sp_token_num)
+        return self.forward(hidden_states, reduce_type="reduce_scatter", input_split_sizes=mlp_sp_token_num)
+
     def post_comm(self, hidden_states, reduce_type=None, input_split_sizes=None):
-        if reduce_type == 'skip':
+        if reduce_type == "skip":
             return hidden_states
-        reduce_type = reduce_type or 'all_reduce'
-        assert reduce_type in ['all_reduce', 'reduce_scatter']
+        reduce_type = reduce_type or "all_reduce"
+        assert reduce_type in ["all_reduce", "reduce_scatter"]
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
-        if reduce_type == 'reduce_scatter':
+        if reduce_type == "reduce_scatter":
             return self.mlp_tp_group.reduce_scatter(hidden_states, input_split_sizes=input_split_sizes)
         else:
             # not used
             return self.mlp_tp_group.all_reduce(hidden_states)
 
-    def post_compact_reduce_scatter(self, hidden_states, world_len_list, comm_tensor: torch.Tensor=None):
+    def post_compact_reduce_scatter(self, hidden_states, world_len_list, comm_tensor: torch.Tensor = None):
         # for query len with large range in dp prefill, cooperate with pre_compact_allgather
         pass
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         if self.quant_config is not None:
-            if hasattr(self.down_proj, 'smooth_scale'):
+            if hasattr(self.down_proj, "smooth_scale"):
                 self.down_proj.smooth_scale = Parameter(self.down_proj.smooth_scale.reshape(1, -1), requires_grad=False)
             else:
                 self.down_proj.smooth_scale = None
-            if hasattr(self.gate_up_proj, 'smooth_scale'):
-                self.gate_up_proj.smooth_scale = Parameter(self.gate_up_proj.smooth_scale.data.to(torch.bfloat16),
-                                                           requires_grad=False)
+            if hasattr(self.gate_up_proj, "smooth_scale"):
+                self.gate_up_proj.smooth_scale = Parameter(self.gate_up_proj.smooth_scale.data.to(torch.bfloat16), requires_grad=False)
             else:
                 self.gate_up_proj.smooth_scale = None

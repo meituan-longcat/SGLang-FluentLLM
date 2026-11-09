@@ -16,45 +16,44 @@
 """Inference-only GptOss model compatible with HuggingFace weights."""
 
 from collections.abc import Iterable
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.managers.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.moe.layer import MoELayer
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.dp_attention import (
+from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.layer import MoELayer
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.managers.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.managers.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ops.layernorm import RMSNorm
+from sglang.srt.ops.topk import TopK, TopKOutputFormat
 from sglang.srt.utils import add_prefix, get_colorful_logger, make_layers
-from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
 
 
 class GptOssConfig(PretrainedConfig):
@@ -103,10 +102,7 @@ class GptOssSparseMoeBlock(nn.Module):
         self.num_experts = num_experts + global_server_args_dict["ep_num_redundant_experts"]
         self.quant_config = quant_config
         if self.tp_size > config.num_local_experts:
-            raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.num_local_experts}."
-            )
+            raise ValueError(f"Tensor parallel size {self.tp_size} is greater than the number of experts {config.num_local_experts}.")
 
         self.experts = MoELayer(
             top_k=top_k,
@@ -119,14 +115,15 @@ class GptOssSparseMoeBlock(nn.Module):
             activation="swiglu",
             activation_alpha=self.activation_alpha,
             swiglu_limit=self.swiglu_limit,
-            with_bias=True
+            with_bias=True,
         )
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=self.layer_index,
             custom_routing_function=routing_function,
             output_format=TopKOutputFormat.STANDARD,
-            topk_indices_dtype=torch.int64 if global_server_args_dict["enable_deep_ep"] else torch.int32
+            topk_indices_dtype=torch.int64 if global_server_args_dict["enable_deep_ep"] else torch.int32,
         )
 
         self.router = ReplicatedLinear(
@@ -138,18 +135,13 @@ class GptOssSparseMoeBlock(nn.Module):
             params_dtype=config.torch_dtype,
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor, num_global_tokens: int, max_num_tokens_per_gpu: int
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, num_global_tokens: int, max_num_tokens_per_gpu: int) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.router(hidden_states)
-        if hidden_states.shape[0] > 0:
-            topk_output = self.topk(hidden_states, router_logits)
-        else:
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
+        topk_output = self.topk(hidden_states, router_logits) if hidden_states.shape[0] > 0 else self.topk.empty_topk_output(hidden_states.device)
 
         routed_expert_output = self.experts(
             hidden_states=hidden_states,
@@ -161,11 +153,7 @@ class GptOssSparseMoeBlock(nn.Module):
         return routed_expert_output.view(num_tokens, hidden_dim)
 
     def get_moe_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
-        ]
+        return [x.data for name, x in self.experts.named_parameters() if name not in ["correction_bias"]]
 
 
 class GptOssAttention(nn.Module):
@@ -176,7 +164,7 @@ class GptOssAttention(nn.Module):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         head_dim: Optional[int] = None,
         rms_norm_eps: float = 1e-06,
@@ -228,9 +216,7 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        self.sinks = nn.Parameter(
-            torch.empty(self.num_heads, dtype=params_dtype), requires_grad=False
-        )
+        self.sinks = nn.Parameter(torch.empty(self.num_heads, dtype=params_dtype), requires_grad=False)
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -315,9 +301,7 @@ class GptOssDecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         rms_norm_eps = config.rms_norm_eps
         attention_bias = config.attention_bias
 
@@ -351,13 +335,11 @@ class GptOssDecoderLayer(nn.Module):
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
             layer_index=layer_id,
-            prefix=add_prefix(f"mlp", prefix)
+            prefix=add_prefix("mlp", prefix),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.attn_tp_group = get_attention_tp_group()
         self.attn_tp_size = get_attention_tp_size()
@@ -369,16 +351,11 @@ class GptOssDecoderLayer(nn.Module):
             dense_parallel_strategy=global_server_args_dict["dense_parallel_strategy"],
             moe_parallel_strategy=global_server_args_dict["moe_parallel_strategy"],
             is_moe_layer=True,
-            num_layers=config.num_hidden_layers
+            num_layers=config.num_hidden_layers,
         )
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        tp_num_tokens: int
+        self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch, residual: Optional[torch.Tensor], tp_num_tokens: int
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = forward_batch.get_num_tokens(tp_num_tokens)
 
@@ -395,12 +372,9 @@ class GptOssDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(
-                hidden_states, residual, tp_num_tokens)
+            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(hidden_states, residual, tp_num_tokens)
 
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
             hidden_states = self.forward_mlp(
                 hidden_states,
@@ -430,15 +404,11 @@ class GptOssDecoderLayer(nn.Module):
         max_num_tokens_per_gpu,
         tp_num_tokens,
     ):
-        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(
-            hidden_states, forward_batch, tp_num_tokens
-        )
+        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(hidden_states, forward_batch, tp_num_tokens)
 
         hidden_states = self.mlp(hidden_states, num_global_tokens, max_num_tokens_per_gpu)
 
-        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(
-            hidden_states, residual, tp_num_tokens, forward_batch
-        )
+        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(hidden_states, residual, tp_num_tokens, forward_batch)
         if start_idx is not None and end_idx is not None:
             hidden_states = hidden_states[start_idx:end_idx]
         return hidden_states
@@ -490,9 +460,7 @@ class GptOssModel(nn.Module):
         for i in range(len(self.layers)):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens
-                )
+                hidden_states, residual = layer(positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens)
         if not forward_batch.forward_mode.is_idle():
             assert residual is not None
             hidden_states, _ = self.norm(hidden_states, residual)
@@ -512,9 +480,7 @@ class GptOssForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = GptOssModel(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = GptOssModel(config, quant_config, prefix=add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -552,73 +518,37 @@ class GptOssForCausalLM(nn.Module):
         weight_mapping["unembedding.weight"] = "lm_head.weight"
         weight_mapping["norm.scale"] = "model.norm.weight"
         for layer_id in range(self.config.num_hidden_layers):
-            weight_mapping[f"block.{layer_id}.attn.q_proj.weight"] = (
-                f"model.layers.{layer_id}.self_attn.q_proj.weight"
-            )
-            weight_mapping[f"block.{layer_id}.attn.q_proj.bias"] = (
-                f"model.layers.{layer_id}.self_attn.q_proj.bias"
-            )
+            weight_mapping[f"block.{layer_id}.attn.q_proj.weight"] = f"model.layers.{layer_id}.self_attn.q_proj.weight"
+            weight_mapping[f"block.{layer_id}.attn.q_proj.bias"] = f"model.layers.{layer_id}.self_attn.q_proj.bias"
 
-            weight_mapping[f"block.{layer_id}.attn.k_proj.weight"] = (
-                f"model.layers.{layer_id}.self_attn.k_proj.weight"
-            )
-            weight_mapping[f"block.{layer_id}.attn.k_proj.bias"] = (
-                f"model.layers.{layer_id}.self_attn.k_proj.bias"
-            )
+            weight_mapping[f"block.{layer_id}.attn.k_proj.weight"] = f"model.layers.{layer_id}.self_attn.k_proj.weight"
+            weight_mapping[f"block.{layer_id}.attn.k_proj.bias"] = f"model.layers.{layer_id}.self_attn.k_proj.bias"
 
-            weight_mapping[f"block.{layer_id}.attn.v_proj.weight"] = (
-                f"model.layers.{layer_id}.self_attn.v_proj.weight"
-            )
-            weight_mapping[f"block.{layer_id}.attn.v_proj.bias"] = (
-                f"model.layers.{layer_id}.self_attn.v_proj.bias"
-            )
+            weight_mapping[f"block.{layer_id}.attn.v_proj.weight"] = f"model.layers.{layer_id}.self_attn.v_proj.weight"
+            weight_mapping[f"block.{layer_id}.attn.v_proj.bias"] = f"model.layers.{layer_id}.self_attn.v_proj.bias"
 
-            weight_mapping[f"block.{layer_id}.attn.out.weight"] = (
-                f"model.layers.{layer_id}.self_attn.o_proj.weight"
-            )
-            weight_mapping[f"block.{layer_id}.attn.out.bias"] = (
-                f"model.layers.{layer_id}.self_attn.o_proj.bias"
-            )
-            weight_mapping[f"block.{layer_id}.attn.sinks"] = (
-                f"model.layers.{layer_id}.self_attn.sinks"
-            )
-            weight_mapping[f"block.{layer_id}.attn.norm.scale"] = (
-                f"model.layers.{layer_id}.input_layernorm.weight"
-            )
+            weight_mapping[f"block.{layer_id}.attn.out.weight"] = f"model.layers.{layer_id}.self_attn.o_proj.weight"
+            weight_mapping[f"block.{layer_id}.attn.out.bias"] = f"model.layers.{layer_id}.self_attn.o_proj.bias"
+            weight_mapping[f"block.{layer_id}.attn.sinks"] = f"model.layers.{layer_id}.self_attn.sinks"
+            weight_mapping[f"block.{layer_id}.attn.norm.scale"] = f"model.layers.{layer_id}.input_layernorm.weight"
 
-            weight_mapping[f"block.{layer_id}.mlp.gate.weight"] = (
-                f"model.layers.{layer_id}.mlp.router.weight"
-            )
-            weight_mapping[f"block.{layer_id}.mlp.gate.bias"] = (
-                f"model.layers.{layer_id}.mlp.router.bias"
-            )
-            weight_mapping[f"block.{layer_id}.mlp.norm.scale"] = (
-                f"model.layers.{layer_id}.post_attention_layernorm.weight"
-            )
-            weight_mapping[f"block.{layer_id}.mlp.experts.gate_up_proj"] = (
-                f"model.layers.{layer_id}.mlp.experts.gate_up_proj"
-            )
-            weight_mapping[f"block.{layer_id}.mlp.gate_up_proj_bias"] = (
-                f"model.layers.{layer_id}.mlp.experts.gate_up_proj_bias"
-            )
-            weight_mapping[f"block.{layer_id}.mlp.down_proj"] = (
-                f"model.layers.{layer_id}.mlp.experts.mlp2_weight"
-            )
-            weight_mapping[f"block.{layer_id}.mlp.down_proj_bias"] = (
-                f"model.layers.{layer_id}.mlp.experts.mlp2_bias"
-            )
+            weight_mapping[f"block.{layer_id}.mlp.gate.weight"] = f"model.layers.{layer_id}.mlp.router.weight"
+            weight_mapping[f"block.{layer_id}.mlp.gate.bias"] = f"model.layers.{layer_id}.mlp.router.bias"
+            weight_mapping[f"block.{layer_id}.mlp.norm.scale"] = f"model.layers.{layer_id}.post_attention_layernorm.weight"
+            weight_mapping[f"block.{layer_id}.mlp.experts.gate_up_proj"] = f"model.layers.{layer_id}.mlp.experts.gate_up_proj"
+            weight_mapping[f"block.{layer_id}.mlp.gate_up_proj_bias"] = f"model.layers.{layer_id}.mlp.experts.gate_up_proj_bias"
+            weight_mapping[f"block.{layer_id}.mlp.down_proj"] = f"model.layers.{layer_id}.mlp.experts.mlp2_weight"
+            weight_mapping[f"block.{layer_id}.mlp.down_proj_bias"] = f"model.layers.{layer_id}.mlp.experts.mlp2_bias"
 
         return weight_mapping
 
     def load_weights(
         self,
-        weights: Iterable[Tuple[str, torch.Tensor]],
+        weights: Iterable[tuple[str, torch.Tensor]],
         is_nextn: bool = False,
         weight_name_mapping: dict = None,
     ):
-        quant_config_name = (
-            self.quant_config.get_name() if self.quant_config is not None else None
-        )
+        quant_config_name = self.quant_config.get_name() if self.quant_config is not None else None
         assert quant_config_name != "mxfp4"
         assert not is_nextn
 
@@ -626,7 +556,7 @@ class GptOssForCausalLM(nn.Module):
 
     def _load_normal_weights(
         self,
-        weights,    # It's an iterator, pay attention to whether the iterator is invalidated.
+        weights,  # It's an iterator, pay attention to whether the iterator is invalidated.
         weight_name_mapping: dict,
     ):
         tp_rank = get_tensor_model_parallel_rank()
@@ -664,13 +594,12 @@ class GptOssForCausalLM(nn.Module):
                 ("experts.w2_weight", f"experts.{ckpt_down_proj_name}", "w2"),
                 ("experts.w2_weight_bias", f"experts.{ckpt_down_proj_bias_name}", "w2"),
             ]
-        expert_params_mapping = (
-            make_expert_params_mapping_fused(
-                ckpt_gate_up_proj_name="gate_up_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
-                ckpt_down_proj_bias_name="down_proj_bias",
-            )
+
+        expert_params_mapping = make_expert_params_mapping_fused(
+            ckpt_gate_up_proj_name="gate_up_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_gate_up_proj_bias_name="gate_up_proj_bias",
+            ckpt_down_proj_bias_name="down_proj_bias",
         )
 
         params_dict = dict(self.named_parameters())
@@ -687,7 +616,6 @@ class GptOssForCausalLM(nn.Module):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-
                 if weight_name not in name:
                     continue
                 if "mlp.experts" in name:
@@ -721,7 +649,7 @@ class GptOssForCausalLM(nn.Module):
                     # Only support EP
                     local_num_experts = param.shape[0]
                     assert local_num_experts * get_tensor_model_parallel_world_size() == loaded_weight.shape[0]
-                    local_experts = loaded_weight[local_num_experts * tp_rank: local_num_experts * (tp_rank + 1)]
+                    local_experts = loaded_weight[local_num_experts * tp_rank : local_num_experts * (tp_rank + 1)]
                     if loaded_weight.dtype == torch.float8_e5m2:
                         default_weight_loader(param, local_experts.to(torch.bfloat16))
                     else:
@@ -733,17 +661,13 @@ class GptOssForCausalLM(nn.Module):
                         continue
                     if name not in params_dict:
                         continue
-                    if name in params_dict.keys():
+                    if name in params_dict:
                         param = params_dict[name]
                         if "sinks" in name:
                             start = tp_rank * param.numel()
-                            param.data.copy_(
-                                loaded_weight[start : start + param.numel()]
-                            )
+                            param.data.copy_(loaded_weight[start : start + param.numel()])
                         else:
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
+                            weight_loader = getattr(param, "weight_loader", default_weight_loader)
                             weight_loader(param, loaded_weight)
                         params_checker[name] = True
                     else:
@@ -763,8 +687,7 @@ class GptOssForCausalLM(nn.Module):
                 logger.info("All parameters loaded successfully.")
 
         self.routed_experts_weights_of_layer = {
-            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-            for layer_id in range(len(self.model.layers))
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights() for layer_id in range(len(self.model.layers))
         }
 
     def get_embed_and_head(self):

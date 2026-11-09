@@ -1,7 +1,8 @@
-import re
+# ruff: noqa: S105
 import json
 import logging
-from typing import List, Union, Literal
+import re
+from typing import Literal, Union
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -84,9 +85,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
 
-        if invoke_content_stripped.startswith("{") and invoke_content_stripped.endswith(
-            "}"
-        ):
+        if invoke_content_stripped.startswith("{") and invoke_content_stripped.endswith("}"):
             try:
                 parameters = json.loads(invoke_content_stripped)
                 if isinstance(parameters, dict):
@@ -111,10 +110,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return parameters
 
     def detect_and_parse(
-        self,
-        text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -141,12 +137,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            invoke_pattern = (
-                r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
-            )
-            invoke_matches = re.findall(
-                invoke_pattern, function_calls_content, re.DOTALL
-            )
+            invoke_pattern = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
+            invoke_matches = re.findall(invoke_pattern, function_calls_content, re.DOTALL)
 
             for func_name, invoke_content in invoke_matches:
                 # Parse parameters from XML format
@@ -162,10 +154,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=text)
 
     def parse_streaming_increment(
-        self,
-        new_text: str,
-        tools: List[Tool],
-        tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
+        self, new_text: str, tools: list[Tool], tool_choice: Union[ToolChoice, Literal["auto", "required", "none", "bypass_check"]]
     ) -> StreamingParseResult:
         """
         Streaming incremental parsing tool calls for DeepSeekV32 format.
@@ -177,9 +166,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # Check if we have a tool call or any DSML-related content
         # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
         # If we see these markers anywhere, we should keep buffering
-        has_tool_call = (
-            self.bot_token in current_text or "<｜DSML｜invoke" in current_text
-        )
+        has_tool_call = self.bot_token in current_text or "<｜DSML｜invoke" in current_text
 
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
@@ -188,9 +175,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         # Also check if text ends with start of a tag (to handle "<" arriving separately)
         dsml_prefixes = ["<", "<｜", "</", "</｜"]
-        ends_with_prefix = any(
-            current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
-        )
+        ends_with_prefix = any(current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes)
 
         if not has_tool_call and not potentially_dsml and not ends_with_prefix:
             self._buffer = ""
@@ -278,9 +263,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": current_params,
                     }
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        current_args_json
-                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = current_args_json
 
                     # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]

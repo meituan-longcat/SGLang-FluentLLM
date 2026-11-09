@@ -16,59 +16,51 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
-from typing import Any, Dict, Iterable, Optional, Tuple
 import math
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
-from sglang.srt.layers.moe.npu_moe.layer import NpuEPMoE
-from sglang.srt.configs.model_config import (
-    is_dsa
-)
-from sglang.srt.layers.utils import (
-    get_layer_id,
-    FLLM_IS_CP, CP_METADATA, cp_split_and_rebuild_data, cp_all_gather_rerange_output
-)
-
+from sglang.srt.configs.model_config import is_dsa
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm, FusedRMSNorm
+from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
+from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
+from sglang.srt.env import global_server_args_dict
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_group, get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
-
+from sglang.srt.layers.moe.layouts.mapping import make_expert_params_mapping
+from sglang.srt.layers.moe.npu_moe.layer import NpuEPMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.managers.expert_location import ModelConfigForExpertLocation
-from sglang.srt.utils import add_prefix, LazyValue, get_available_gpu_memory
-from sglang.srt.distributed.parallel_strategy import DenseParallelStategy
-from sglang.srt.layers.dp_attention import get_attention_tp_group, get_attention_tp_size, get_attention_tp_rank
-from sglang.srt.distributed.decoder_comm_manager import DecoderCommMananger
-from sglang.srt.managers.expert_distribution import (
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.layers.utils import CP_METADATA, cp_all_gather_rerange_output, cp_split_and_rebuild_data, get_layer_id
+from sglang.srt.managers.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
+from sglang.srt.managers.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v32 import DeepseekV32MLA
-
-from sglang.srt.utils import get_colorful_logger
+from sglang.srt.ops.activation import SiluAndMul
+from sglang.srt.ops.layernorm import FusedRMSNorm, RMSNorm
+from sglang.srt.utils import LazyValue, add_prefix, get_available_gpu_memory, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
@@ -81,12 +73,14 @@ class DeepseekV2MLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        is_shared_expert: bool = False
+        is_shared_expert: bool = False,
     ) -> None:
         super().__init__()
         self.layout = global_server_args_dict["dense_parallel_strategy"]
         # For TP MOE, shared expert uses TP
-        if (is_shared_expert and not global_server_args_dict["enable_ep_moe"]) or (not is_shared_expert and self.layout == DenseParallelStategy.TENSOR_PARALLEL):
+        if (is_shared_expert and not global_server_args_dict["enable_ep_moe"]) or (
+            not is_shared_expert and self.layout == DenseParallelStategy.TENSOR_PARALLEL
+        ):
             # TODO npu support torch. all_gather_torch and reduce_scatter_torch
             self.tp_group = get_tp_group()
             self.gate_up_proj = MergedColumnParallelLinear(
@@ -123,10 +117,7 @@ class DeepseekV2MLP(nn.Module):
             )
 
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -141,19 +132,16 @@ class DeepseekV2MLP(nn.Module):
 class MoEGate(nn.Module):
     def __init__(self, config, prefix: str = ""):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
-        )
+        self.weight = nn.Parameter(torch.empty((config.n_routed_experts, config.hidden_size)))
         if config.topk_method == "noaux_tc":
-            self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=torch.float32)
-            )
+            self.e_score_correction_bias = nn.Parameter(torch.empty((config.n_routed_experts), dtype=torch.float32))
         else:
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states, comm_manager=None):
         logits = F.linear(hidden_states, self.weight, None)
         return logits.to(torch.bfloat16)
+
 
 class NpuDeepseekV2MoE(nn.Module):
     def __init__(self, config: PretrainedConfig, quant_config: Optional[QuantizationConfig] = None, layer_index: int = -1):
@@ -163,16 +151,10 @@ class NpuDeepseekV2MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts
         self.routed_scaling_factor = config.routed_scaling_factor
         if self.ep_size > config.n_routed_experts:
-            raise ValueError(
-                f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {config.n_routed_experts}."
-            )
+            raise ValueError(f"Tensor parallel size {self.tp_size} is greater than the number of experts {config.n_routed_experts}.")
 
         if config.hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {config.hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {config.hidden_act}. Only silu is supported for now.")
 
         if not global_server_args_dict["enable_ep_moe"]:
             raise ValueError("NPU only support EP MoE now")
@@ -186,7 +168,7 @@ class NpuDeepseekV2MoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                is_shared_expert=True
+                is_shared_expert=True,
             )
 
         self.experts = NpuEPMoE(
@@ -218,8 +200,8 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
 
-class DeepseekV2AttentionMLA(nn.Module):
 
+class DeepseekV2AttentionMLA(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -231,7 +213,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_lora_rank: int,
         kv_lora_rank: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id=None,
@@ -249,13 +231,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.num_heads = num_heads
-        if FLLM_IS_CP:
-            self.attn_tp_group = None
-            self.num_local_heads = num_heads
-        else:
-            self.attn_tp_group = get_attention_tp_group()
-            assert num_heads % self.attn_tp_group.world_size == 0
-            self.num_local_heads = num_heads // self.attn_tp_group.world_size
+        self.is_qcp = global_server_args_dict["enable_dsa_qcp"]
+        self.attn_tp_group = get_attention_tp_group()
+        assert num_heads % self.attn_tp_group.world_size == 0
+        self.num_local_heads = num_heads // self.attn_tp_group.world_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -292,7 +271,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("q_b_proj", prefix),
                 outside_tp_group=self.attn_tp_group,
-                disable_parallel=FLLM_IS_CP,
+                disable_parallel=self.is_qcp,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -302,7 +281,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("q_proj", prefix),
                 outside_tp_group=self.attn_tp_group,
-                disable_parallel=FLLM_IS_CP,
+                disable_parallel=self.is_qcp,
             )
 
             self.kv_a_proj_with_mqa = ReplicatedLinear(
@@ -320,7 +299,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("kv_b_proj", prefix),
             outside_tp_group=self.attn_tp_group,
-            disable_parallel=FLLM_IS_CP,
+            disable_parallel=self.is_qcp,
         )
         # O projection.
         self.o_proj = RowParallelLinear(
@@ -331,7 +310,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
             outside_tp_group=self.attn_tp_group,
-            disable_parallel=FLLM_IS_CP,
+            disable_parallel=self.is_qcp,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -362,10 +341,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             self.rotary_emb = None
 
-        if global_server_args_dict["enable_mla_l1_5_cache"]:
-            num_q_heads = self.num_heads
-        else:
-            num_q_heads = self.num_local_heads
+        num_q_heads = self.num_heads if global_server_args_dict["enable_mla_l1_5_cache"] else self.num_local_heads
         self.attn_mqa = RadixAttention(
             num_q_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -388,18 +364,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.w_vc = None
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        comm_manager: DecoderCommMananger
+        self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch, comm_manager: DecoderCommMananger
     ) -> torch.Tensor:
         def no_absorb() -> bool:
             # TODO: support mla
-            if forward_batch.forward_mode.is_decode():
-                return False
-            else:
-                return True
+            return not forward_batch.forward_mode.is_decode()
 
         if no_absorb():
             return self.forward_normal_npu(positions, hidden_states, forward_batch)
@@ -417,9 +386,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -441,9 +408,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-        )
+        forward_batch.token_to_kv_pool.set_kv_buffer(self.attn_mha, forward_batch.out_cache_loc, latent_cache, None)
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -456,17 +421,13 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         q_len = hidden_states.shape[0]
-        q_input = hidden_states.new_empty(
-            q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim
-        )
+        q_input = hidden_states.new_empty(q_len, self.num_local_heads, self.kv_lora_rank + self.qk_rope_head_dim)
         if self.q_lora_rank is not None:
             q = self.q_a_proj(hidden_states)[0]
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
+            q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
@@ -478,11 +439,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
         k_input[..., : self.kv_lora_rank] = v_input
-        k_pe = k_input[..., self.kv_lora_rank:]
+        k_pe = k_input[..., self.kv_lora_rank :]
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
-        q_input[..., self.kv_lora_rank:] = q_pe
-        k_input[..., self.kv_lora_rank:] = k_pe
+        q_input[..., self.kv_lora_rank :] = q_pe
+        k_input[..., self.kv_lora_rank :] = k_pe
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -495,7 +456,6 @@ class DeepseekV2AttentionMLA(nn.Module):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -511,11 +471,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
 
-        if is_nextn or (
-            config.n_routed_experts is not None
-            and layer_id >= config.first_k_dense_replace
-            and layer_id % config.moe_layer_freq == 0
-        ):
+        if is_nextn or (config.n_routed_experts is not None and layer_id >= config.first_k_dense_replace and layer_id % config.moe_layer_freq == 0):
             self.is_moe_layer = True
         else:
             self.is_moe_layer = False
@@ -528,9 +484,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             qk_nope_head_dim=config.qk_nope_head_dim,
             qk_rope_head_dim=config.qk_rope_head_dim,
             v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
+            q_lora_rank=(config.q_lora_rank if hasattr(config, "q_lora_rank") else None),
             kv_lora_rank=config.kv_lora_rank,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
@@ -552,9 +506,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.attn_tp_group = get_attention_tp_group()
         self.attn_tp_size = get_attention_tp_size()
@@ -566,16 +518,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             dense_parallel_strategy=global_server_args_dict["dense_parallel_strategy"],
             moe_parallel_strategy=global_server_args_dict["moe_parallel_strategy"],
             is_moe_layer=self.is_moe_layer,
-            num_layers=config.num_hidden_layers
+            num_layers=config.num_hidden_layers,
         )
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-        tp_num_tokens: int
+        self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch, residual: Optional[torch.Tensor], tp_num_tokens: int
     ) -> torch.Tensor:
 
         num_global_tokens, max_num_tokens_per_gpu = forward_batch.get_num_tokens(tp_num_tokens)
@@ -587,17 +534,11 @@ class DeepseekV2DecoderLayer(nn.Module):
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
             hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                comm_manager=self.decoder_comm_manager
+                positions=positions, hidden_states=hidden_states, forward_batch=forward_batch, comm_manager=self.decoder_comm_manager
             )
-            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(
-                hidden_states, residual, tp_num_tokens)
+            hidden_states, residual = self.decoder_comm_manager.post_attn_comm(hidden_states, residual, tp_num_tokens)
 
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
@@ -638,20 +579,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.mlp(hidden_states, max_num_tokens_per_gpu)
             return hidden_states
 
-        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(
-            hidden_states, forward_batch, tp_num_tokens
-        )
+        hidden_states, start_idx, end_idx = self.decoder_comm_manager.pre_mlp_comm(hidden_states, forward_batch, tp_num_tokens)
         hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(
-            hidden_states, residual, tp_num_tokens, forward_batch
-        )
+        hidden_states, residual = self.decoder_comm_manager.post_mlp_comm(hidden_states, residual, tp_num_tokens, forward_batch)
         if start_idx is not None and end_idx is not None:
             hidden_states = hidden_states[start_idx:end_idx]
         return hidden_states
 
 
 class DeepseekV2Model(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -669,9 +605,6 @@ class DeepseekV2Model(nn.Module):
             config.hidden_size,
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
-        if FLLM_IS_CP:
-            self.cp_size = get_attention_tp_size()
-            self.cp_rank = get_attention_tp_rank()
         # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
@@ -702,20 +635,16 @@ class DeepseekV2Model(nn.Module):
         for i in range(len(self.layers)):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens
-                )
+                hidden_states, residual = layer(positions, hidden_states, forward_batch, residual, tp_num_tokens=tp_num_tokens)
         if not forward_batch.forward_mode.is_idle():
             hidden_states, _ = self.norm(hidden_states, residual)
-            if not FLLM_IS_CP:
-                hidden_states, _ = layer.decoder_comm_manager.post_final_norm_comm(hidden_states, residual, tp_num_tokens)
+            hidden_states, _ = layer.decoder_comm_manager.post_final_norm_comm(hidden_states, residual, tp_num_tokens)
         if CP_METADATA:
             hidden_states = cp_all_gather_rerange_output(hidden_states, CP_METADATA.value, layer.decoder_comm_manager.attn_rsag)
         return hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -726,9 +655,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = model if model is not None else DeepseekV2Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = model if model is not None else DeepseekV2Model(config, quant_config, prefix=add_prefix("model", prefix))
         if global_server_args_dict["enable_dp_attention"]:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
@@ -746,9 +673,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             )
             self.logits_processor = LogitsProcessor(config)
 
-        self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {}
-        )
+        self._routed_experts_weights_of_layer = LazyValue(lambda: {})
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -762,9 +687,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def get_param(self, params_dict, name):
         if name in params_dict:
@@ -778,7 +701,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         logger.warning(f"The {name} is not in the model.")
         return None
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -794,22 +717,13 @@ class DeepseekV2ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts,
         )
 
-        # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
-        fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
-            self.config.q_lora_rank is not None
-        )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
-
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
+                and (layer_id < self.model.start_layer or layer_id >= self.model.end_layer)
             ):
                 continue
             # TODO(HandH1998): Modify it when nextn is supported.
@@ -817,10 +731,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 if num_nextn_layers > 0 and name.startswith("model.layers"):
                     name_list = name.split(".")
-                    if (
-                        len(name_list) >= 3
-                        and int(name_list[2]) >= self.config.num_hidden_layers
-                    ):
+                    if len(name_list) >= 3 and int(name_list[2]) >= self.config.num_hidden_layers:
                         continue
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -874,13 +785,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                     param = self.get_param(params_dict, name)
                     if param is None:
                         continue
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
 
         self.post_load_weights()
-
 
     def post_load_weights(self):
         for layer_id in range(self.config.num_hidden_layers):
@@ -895,9 +803,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 w = self_attn.kv_b_proj.weight
 
-            w_kc, w_vc = w.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            w_kc, w_vc = w.unflatten(0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)).split(
+                [self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1
+            )
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
 
@@ -910,9 +818,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         gpu_id = torch.npu.current_device()
         device = "npu"
         logger.info(
-            f"release mtp's embedding weight start. "
-            f"type={type(self.model).__name__}, "
-            f"avail mem={get_available_gpu_memory(device, gpu_id):.2f} GB"
+            f"release mtp's embedding weight start. type={type(self.model).__name__}, avail mem={get_available_gpu_memory(device, gpu_id):.2f} GB"
         )
         if not self.model.embed_tokens:
             self.model.embed_tokens = VocabParallelEmbedding(
@@ -927,9 +833,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         torch.npu.empty_cache()
         torch.npu.synchronize()
         logger.info(
-            f"release mtp's embedding weight end. "
-            f"type={type(self.model).__name__}, "
-            f"avail mem={get_available_gpu_memory(device, gpu_id):.2f} GB"
+            f"release mtp's embedding weight end. type={type(self.model).__name__}, avail mem={get_available_gpu_memory(device, gpu_id):.2f} GB"
         )
 
     def set_oe_and_head(self, over_embedding, head):
@@ -938,7 +842,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.npu.empty_cache()
         torch.npu.synchronize()
-
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -952,7 +855,9 @@ class DeepseekV2ForCausalLM(nn.Module):
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
     pass
 
+
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     pass
+
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]

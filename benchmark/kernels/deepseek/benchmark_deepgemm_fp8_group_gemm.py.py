@@ -1,4 +1,3 @@
-from typing import Tuple
 
 import deep_gemm
 import torch
@@ -15,11 +14,11 @@ from sglang.benchmark.kernels.deepseek.benchmark_deepgemm_fp8_gemm import (
 
 def construct_grouped_and_flat_fp8(
     x: torch.Tensor, y: torch.Tensor, num_groups: int, is_masked: bool
-) -> Tuple[
-    Tuple[torch.Tensor, torch.Tensor],  # grouped x_fp8
-    Tuple[torch.Tensor, torch.Tensor],  # grouped y_fp8
-    Tuple[torch.Tensor, torch.Tensor],  # flat x_fp8
-    Tuple[torch.Tensor, torch.Tensor],  # flat y_fp8
+) -> tuple[
+    tuple[torch.Tensor, torch.Tensor],  # grouped x_fp8
+    tuple[torch.Tensor, torch.Tensor],  # grouped y_fp8
+    tuple[torch.Tensor, torch.Tensor],  # flat x_fp8
+    tuple[torch.Tensor, torch.Tensor],  # flat y_fp8
     torch.Tensor,  # output
     torch.Tensor,  # reference output
 ]:
@@ -138,7 +137,7 @@ def fp8_gemm_group_triton_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Main loop
-    for k_block in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k_block in range(tl.cdiv(K, BLOCK_SIZE_K)):
         k_offset = k_block * BLOCK_SIZE_K
 
         # Load the next block of A and B, with masks

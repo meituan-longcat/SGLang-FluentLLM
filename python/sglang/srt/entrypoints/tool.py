@@ -12,14 +12,12 @@ logger = logging.getLogger(__name__)
 
 
 class Tool(ABC):
-
     @abstractmethod
     async def get_result(self, context: "ConversationContext") -> Any:
         pass
 
 
 class HarmonyBrowserTool(Tool):
-
     def __init__(self):
         self.enabled = True
         exa_api_key = os.getenv("EXA_API_KEY")
@@ -56,7 +54,6 @@ class HarmonyBrowserTool(Tool):
 
 
 class HarmonyPythonTool(Tool):
-
     def __init__(self):
         self.enabled = True
 
@@ -64,9 +61,7 @@ class HarmonyPythonTool(Tool):
             from gpt_oss.tools.python_docker.docker_tool import PythonTool
         except ImportError:
             self.enabled = False
-            logger.warning_once(
-                "gpt_oss is not installed, code interpreter is disabled"
-            )
+            logger.warning_once("gpt_oss is not installed, code interpreter is disabled")
             return
 
         self.python_tool = PythonTool()

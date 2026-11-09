@@ -48,11 +48,7 @@ def use_rowwise_torch_scaled_mm():
 USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
 
 
-ENABLE_FLASHINFER_GEMM = (
-    get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM")
-    and is_sm100_supported()
-    and is_flashinfer_available()
-)
+ENABLE_FLASHINFER_GEMM = get_bool_env_var("SGLANG_ENABLE_FLASHINFER_GEMM") and is_sm100_supported() and is_flashinfer_available()
 if ENABLE_FLASHINFER_GEMM:
     from flashinfer.gemm import gemm_fp8_nt_groupwise
 
@@ -64,15 +60,15 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    *args,
+    **kwargs,
 ) -> torch.Tensor:
     assert input_scale is None
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=True
-    )
+    q_input, x_scale = sglang_per_token_group_quant_fp8(input_2d, block_size[1], column_major_scales=True)
     # TRTLLM requires column-major scaling factors
     output = gemm_fp8_nt_groupwise(
         q_input,
@@ -87,4 +83,3 @@ def flashinfer_gemm_w8a8_block_fp8_linear(
         output += bias
 
     return output.to(dtype=input_2d.dtype).view(*output_shape)
-

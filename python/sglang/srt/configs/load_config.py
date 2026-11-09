@@ -1,11 +1,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
 import enum
 import json
-from sglang.srt.utils import get_colorful_logger
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Optional, Union
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_colorful_logger, is_hip
 
 logger = get_colorful_logger(__name__)
 
@@ -50,7 +49,7 @@ class LoadConfig:
     load_format: Union[str, LoadFormat] = LoadFormat.AUTO
     download_dir: Optional[str] = None
     model_loader_extra_config: Optional[Union[str, dict]] = field(default_factory=dict)
-    ignore_patterns: Optional[Union[List[str], str]] = None
+    ignore_patterns: Optional[Union[list[str], str]] = None
     decryption_key_file: Optional[str] = None
 
     ext_yaml: str = None
@@ -79,15 +78,7 @@ class LoadConfig:
         load_format = self.load_format.lower()
         self.load_format = LoadFormat(load_format)
 
-        rocm_not_supported_load_format: List[str] = []
+        rocm_not_supported_load_format: list[str] = []
         if is_hip() and load_format in rocm_not_supported_load_format:
-            rocm_supported_load_format = [
-                f
-                for f in LoadFormat.__members__
-                if (f not in rocm_not_supported_load_format)
-            ]
-            raise ValueError(
-                f"load format '{load_format}' is not supported in ROCm. "
-                f"Supported load formats are "
-                f"{rocm_supported_load_format}"
-            )
+            rocm_supported_load_format = [f for f in LoadFormat.__members__ if (f not in rocm_not_supported_load_format)]
+            raise ValueError(f"load format '{load_format}' is not supported in ROCm. Supported load formats are {rocm_supported_load_format}")

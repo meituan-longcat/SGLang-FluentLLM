@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Set, Type
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.scheduling.schedule_batch import ScheduleBatch
 
 
 class BatchedPenalizerOrchestrator:
@@ -16,19 +16,13 @@ class BatchedPenalizerOrchestrator:
         batch: ScheduleBatch,
         penalizers: Set[Type["_BatchedPenalizer"]],
     ):
-        self.vocab_size = vocab_size
-        self.batch = batch
-        self.device = batch.device
-        self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
+        self.penalizers = {Penalizer: Penalizer(batch, batch.device, vocab_size) for Penalizer in penalizers}
 
         is_required = False
         for penalizer in self.penalizers.values():
             pen_is_required = penalizer.prepare_if_required()
             is_required |= pen_is_required
         self.is_required = is_required
-
-    def reqs(self):
-        return self.batch.reqs
 
     def cumulate_output_tokens(self, output_ids: torch.Tensor):
         """

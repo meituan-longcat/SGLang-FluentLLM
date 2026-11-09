@@ -13,6 +13,7 @@ from torch.nn import Module
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
+
 def get_scalar_types():
     """
     Returns:
@@ -35,6 +36,7 @@ def get_scalar_types():
                 return f"mock_{name}"
 
         return MockScalarType, MockScalarTypes()
+
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -59,17 +61,12 @@ def should_ignore_quant_layer(
         shard_proj_names = fused_mapping[proj_name]
 
         # Convert fused_name --> [shard_names]
-        shard_names = [
-            prefix.replace(proj_name, shard_proj_name)
-            for shard_proj_name in shard_proj_names
-        ]
+        shard_names = [prefix.replace(proj_name, shard_proj_name) for shard_proj_name in shard_proj_names]
 
         # Layer should be ignored if shards are ignored.
         should_ignore_layer = None
         for shard_name in shard_names:
-            should_ignore_shard = check_equal_or_regex_match(
-                layer_name=shard_name, targets=ignored_layers
-            )
+            should_ignore_shard = check_equal_or_regex_match(layer_name=shard_name, targets=ignored_layers)
 
             # If shard_idx=0, set layer ignore to match shard.
             if should_ignore_layer is None:
@@ -78,14 +75,10 @@ def should_ignore_quant_layer(
             # If shard_idx=1+ confirm scheme matches prior shards.
             elif should_ignore_shard != should_ignore_layer:
                 raise ValueError(
-                    f"Found a different quantization schemes for "
-                    f"{shard_proj_names} in {prefix}. vLLM "
-                    "requires all to use the same scheme."
+                    f"Found a different quantization schemes for {shard_proj_names} in {prefix}. vLLM requires all to use the same scheme."
                 )
     else:
-        should_ignore_layer = check_equal_or_regex_match(
-            layer_name=prefix, targets=ignored_layers
-        )
+        should_ignore_layer = check_equal_or_regex_match(layer_name=prefix, targets=ignored_layers)
         if not should_ignore_layer:
             if "gate_up_proj" in prefix:
                 prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
@@ -104,13 +97,7 @@ def should_ignore_quant_layer(
                 if prefix_q_proj in ignored_layers and prefix_k_proj in ignored_layers and prefix_v_proj in ignored_layers:
                     should_ignore_layer = True
             elif "experts" in prefix:
-                should_ignore_layer = any(
-                    [
-                        prefix in layer_name
-                        for layer_name in ignored_layers
-                        if "experts" in layer_name
-                    ]
-                )
+                should_ignore_layer = any([prefix in layer_name for layer_name in ignored_layers if "experts" in layer_name])
 
     assert should_ignore_layer is not None
     return should_ignore_layer
@@ -168,17 +155,12 @@ def find_matched_target(
     )
 
     if matched_target is None:
-        raise ValueError(
-            f"Unable to find matching target for {layer_name} in the "
-            "compressed-tensors config."
-        )
+        raise ValueError(f"Unable to find matching target for {layer_name} in the compressed-tensors config.")
 
     return matched_target
 
 
-def _find_first_match(
-    value: str, targets: Iterable[str], check_contains: bool = False
-) -> Optional[str]:
+def _find_first_match(value: str, targets: Iterable[str], check_contains: bool = False) -> Optional[str]:
     """
     Returns first element of target that matches value either
     exactly or as a regex after 're:'. If check_contains is set to True,
@@ -195,9 +177,7 @@ def _find_first_match(
     return None
 
 
-def _is_equal_or_regex_match(
-    value: str, target: str, check_contains: bool = False
-) -> bool:
+def _is_equal_or_regex_match(value: str, target: str, check_contains: bool = False) -> bool:
     """
     Checks whether a value is exactly equal or a regex match for target
     if target starts with 're:'. If check_contains is set to True,
@@ -244,9 +224,7 @@ def _match_fused_layer(
         return None
 
     # expand path of unfused components
-    unfused_paths = [
-        layer_name.replace(fused, unfused) for unfused in fused_mapping[fused]
-    ]
+    unfused_paths = [layer_name.replace(fused, unfused) for unfused in fused_mapping[fused]]
 
     # for each unfused component, find a match in targets
     unfused_matches: List[Optional[str]] = []
@@ -261,9 +239,7 @@ def _match_fused_layer(
     return unfused_matches[0] if all(unfused_matches) else None
 
 
-def per_tensor_dequantize(
-    tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]
-) -> torch.Tensor:
+def per_tensor_dequantize(tensor: torch.Tensor, inv_scale: Union[float, torch.Tensor]) -> torch.Tensor:
     fake_qweight = tensor.to(torch.float16)
     dq_weight = fake_qweight * inv_scale
     return dq_weight
@@ -274,13 +250,9 @@ def all_close_1d(x: torch.Tensor) -> bool:
     return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))
 
 
-def convert_to_channelwise(
-    weight_scale: torch.Tensor, logical_widths: List[int]
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def convert_to_channelwise(weight_scale: torch.Tensor, logical_widths: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
     # Create channelwise buffer
-    weight_scale_channel = torch.empty(
-        (sum(logical_widths), 1), dtype=torch.float32, device=weight_scale.device
-    )
+    weight_scale_channel = torch.empty((sum(logical_widths), 1), dtype=torch.float32, device=weight_scale.device)
 
     # Handle scalar tensor case: broadcast same scale to all channels
     if weight_scale.dim() == 0:
@@ -297,9 +269,7 @@ def convert_to_channelwise(
     return weight_scale_channel
 
 
-def requantize_with_max_scale(
-    weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: List[int]
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def requantize_with_max_scale(weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
     # Max scale to be used for requanitzation.
     max_w_scale = weight_scale.max()
 
@@ -309,9 +279,7 @@ def requantize_with_max_scale(
     # from disk in this case. Skip requantization in this case (since)
     # we already are quantized with the single scale.
     # * Sample Model: nm-testing/Phi-3-mini-128k-instruct-FP8
-    unfused_module_in_checkpoint = (
-        weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
-    )
+    unfused_module_in_checkpoint = weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
 
     # If unfused checkpoint, need requanize with the single scale.
     if unfused_module_in_checkpoint:
@@ -332,16 +300,10 @@ def update_tensor_inplace(old: torch.Tensor, new: torch.Tensor) -> None:
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/layer_utils.py
 # Newly generated tensors need to replace existing tensors that are
 # already registered as parameters by vLLM (and won't be freed)
-def replace_parameter(
-    mod: torch.nn.Module, name: str, new: Union[torch.Tensor, torch.nn.Parameter]
-) -> None:
+def replace_parameter(mod: torch.nn.Module, name: str, new: Union[torch.Tensor, torch.nn.Parameter]) -> None:
 
     old = getattr(mod, name)
-    if (
-        type(old) is type(new)
-        and old.dtype == new.dtype
-        and old.untyped_storage().nbytes() == new.untyped_storage().nbytes()
-    ):
+    if type(old) is type(new) and old.dtype == new.dtype and old.untyped_storage().nbytes() == new.untyped_storage().nbytes():
         # If we can just update in-place to avoid re-registering
         #   can be faster if the underlying storage is the same
         update_tensor_inplace(old, new)
@@ -369,11 +331,9 @@ def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
     count_tiny_diff = (diff_u8 >= 1).sum().item()
     count_large_diff = (diff_u8 >= 2).sum().item()
 
-    assert (
-        (count_diff_sign == 0)
-        and (count_tiny_diff / numel < 0.005)
-        and (count_large_diff == 0)
-    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
+    assert (count_diff_sign == 0) and (count_tiny_diff / numel < 0.005) and (count_large_diff == 0), (
+        f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
+    )
 
 
 # Match dynamic rules with module name (prefix) and override quantize
@@ -396,18 +356,12 @@ def override_config(config: QuantizationConfig, prefix: str):
             config.is_sym = is_sym
 
         if (config.weight_bits, config.is_sym) not in config.TYPE_MAP:
-            raise ValueError(
-                "Unsupported quantization config: "
-                f"bits={config.weight_bits}, sym={config.is_sym}"
-            )
+            raise ValueError(f"Unsupported quantization config: bits={config.weight_bits}, sym={config.is_sym}")
 
         config.quant_type = config.TYPE_MAP[(config.weight_bits, config.is_sym)]
     elif config.get_name() == "gptq":
         if config.weight_bits not in [2, 3, 4, 8]:
-            raise ValueError(
-                "Currently, only 2/3/4/8-bit weight quantization is "
-                f"supported for GPTQ, but got {config.weight_bits} bits."
-            )
+            raise ValueError(f"Currently, only 2/3/4/8-bit weight quantization is supported for GPTQ, but got {config.weight_bits} bits.")
 
 
 def get_dynamic_override(
@@ -527,9 +481,7 @@ def unpack_cols(
     assert packed_q_w.shape == (
         size_k,
         size_n // pack_factor,
-    ), "packed_q_w.shape = {} size_k = {}, size_n = {} pack_Factor = {}".format(
-        packed_q_w.shape, size_k, size_n, pack_factor
-    )
+    ), "packed_q_w.shape = {} size_k = {}, size_n = {} pack_Factor = {}".format(packed_q_w.shape, size_k, size_n, pack_factor)
 
     orig_device = packed_q_w.device
 
@@ -556,13 +508,8 @@ def quantize_weights(
     zero_points: bool = False,
     ref_zero_points_after_scales: bool = False,
 ):
-    assert (
-        quant_type.is_integer()
-    ), "Floating point quantization may work but has not been tested"
-    assert not zero_points or group_size is not None, (
-        "to have group zero points, group_size must be provided "
-        "(-1 group_size is channelwise)"
-    )
+    assert quant_type.is_integer(), "Floating point quantization may work but has not been tested"
+    assert not zero_points or group_size is not None, "to have group zero points, group_size must be provided (-1 group_size is channelwise)"
 
     orig_device = w.device
     orig_type = w.dtype
@@ -592,9 +539,7 @@ def quantize_weights(
         if zero_points:
             assert not quant_type.is_signed() and quant_type.max() > 0
             w_s = (max_val - min_val).clamp(min=1e-5) / quant_type.max()
-            maybe_w_zp = (
-                torch.round(torch.abs(min_val / w_s)).clamp(min_q_val, max_q_val).int()
-            )
+            maybe_w_zp = torch.round(torch.abs(min_val / w_s)).clamp(min_q_val, max_q_val).int()
         else:
             # If the bias is such that there are no possible negative/positive
             #  values, set the max value to inf to avoid divide by 0
@@ -658,12 +603,8 @@ def gptq_quantize_weights(
     size_k, _ = w.shape
 
     assert w.is_floating_point(), "w must be float"
-    assert (
-        quant_type in SUPPORTED_GPTQ_QUANT_TYPES
-    ), f"Unsupported gptq type = {quant_type}"
-    assert group_size in SUPPORTED_GROUP_SIZES + [
-        size_k
-    ], f"Unsupported groupsize = {group_size}"
+    assert quant_type in SUPPORTED_GPTQ_QUANT_TYPES, f"Unsupported gptq type = {quant_type}"
+    assert group_size in SUPPORTED_GROUP_SIZES + [size_k], f"Unsupported groupsize = {group_size}"
 
     w_ref, w_q, w_s, _ = quantize_weights(w, quant_type, group_size)
 
@@ -671,11 +612,7 @@ def gptq_quantize_weights(
     g_idx = torch.empty(0, dtype=torch.int, device=w.device)
     rand_perm = torch.empty(0, dtype=torch.int, device=w.device)
     if act_order:
-        assert (
-            group_size < size_k
-        ), "For act_order, groupsize = {} must be less than size_k = {}".format(
-            group_size, size_k
-        )
+        assert group_size < size_k, "For act_order, groupsize = {} must be less than size_k = {}".format(group_size, size_k)
 
         w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size, test_perm)
 

@@ -1,6 +1,7 @@
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Tuple
+from typing import Optional
 
 
 @dataclass
@@ -21,7 +22,7 @@ class Token:
     end: int
 
 
-def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
+def prefix_hold(text: str, tokens: list[str]) -> tuple[str, str]:
     """
     Holds back the longest suffix of `text` that could be a prefix of any token.
     Returns (emit_now, keep_for_later).
@@ -114,7 +115,7 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
     elif pos == len(text) and has_unknown_tokens:
         # Add an empty trailing TEXT token only when we encountered unknown tokens
         # and the text ends with a known structural token. This matches expected tests.
-        for literal in TOKENS.keys():
+        for literal in TOKENS:
             if text.endswith(literal):
                 yield Token("TEXT", pos, pos)
                 break
@@ -134,7 +135,7 @@ class CanonicalStrategy:
             "<|return|>",
         ]
 
-    def parse(self, text: str) -> Tuple[List[Event], str]:
+    def parse(self, text: str) -> tuple[list[Event], str]:
         events = []
         tokens = list(iter_tokens(text))
 
@@ -148,9 +149,7 @@ class CanonicalStrategy:
             if token.type == "TEXT":
                 # Check if this might be incomplete
                 if pos == len(tokens) - 1:  # Last token
-                    emit, hold = prefix_hold(
-                        text[token.start : token.end], self.guard_tokens
-                    )
+                    emit, hold = prefix_hold(text[token.start : token.end], self.guard_tokens)
                     if emit:
                         events.append(Event("normal", emit))
                     return events, hold
@@ -198,9 +197,7 @@ class CanonicalStrategy:
 
         return events, ""
 
-    def _parse_partial_analysis(
-        self, text: str, tokens: List[Token], start_pos: int
-    ) -> Optional[Tuple[Event, str]]:
+    def _parse_partial_analysis(self, text: str, tokens: list[Token], start_pos: int) -> Optional[tuple[Event, str]]:
         """Try to parse partial analysis content for incremental streaming."""
         pos = start_pos
 
@@ -223,11 +220,7 @@ class CanonicalStrategy:
             return None
 
         # Extract channel type
-        channel_start = (
-            tokens[channel_pos + 1].start
-            if channel_pos + 1 < len(tokens)
-            else tokens[channel_pos].end
-        )
+        channel_start = tokens[channel_pos + 1].start if channel_pos + 1 < len(tokens) else tokens[channel_pos].end
         channel_end = tokens[message_pos].start
         channel_header = text[channel_start:channel_end]
 
@@ -257,9 +250,7 @@ class CanonicalStrategy:
         else:
             return None  # Unknown channel type
 
-    def _parse_block(
-        self, text: str, tokens: List[Token], start_pos: int
-    ) -> Optional[Tuple[Optional[Event], int]]:
+    def _parse_block(self, text: str, tokens: list[Token], start_pos: int) -> Optional[tuple[Optional[Event], int]]:
         """Parse a channel block. Returns (event, next_pos) or None if incomplete."""
         pos = start_pos
 
@@ -361,9 +352,7 @@ class CanonicalStrategy:
 
         return None, end_pos + 1
 
-    def _is_commentary_filler_between_blocks(
-        self, text: str, tokens: List[Token], pos: int
-    ) -> bool:
+    def _is_commentary_filler_between_blocks(self, text: str, tokens: list[Token], pos: int) -> bool:
         """Check if this is commentary filler text or problematic structural tokens in malformed sequences."""
         current_token = tokens[pos]
         current_text = text[current_token.start : current_token.end].strip()
@@ -374,11 +363,7 @@ class CanonicalStrategy:
             next_token = tokens[pos + 1]
 
             # Check if we have CALL -> TEXT("commentary") -> CHANNEL pattern
-            if (
-                prev_token.type == "CALL"
-                and next_token.type == "CHANNEL"
-                and current_text.lower() == "commentary"
-            ):
+            if prev_token.type == "CALL" and next_token.type == "CHANNEL" and current_text.lower() == "commentary":
                 return True
 
         # Check for problematic patterns after CALL tokens (malformed sequences)
@@ -393,10 +378,7 @@ class CanonicalStrategy:
                     return True
 
                 # Filter standalone "commentary" text after CALL
-                if (
-                    current_token.type == "TEXT"
-                    and current_text.lower() == "commentary"
-                ):
+                if current_token.type == "TEXT" and current_text.lower() == "commentary":
                     return True
 
         return False
@@ -426,9 +408,7 @@ class TextStrategy:
                 r"^\s*(?:assistant)?\s*(analysis|commentary)(.*?)\s*assistantfinal\s*(.*)\s*$",
                 re.IGNORECASE | re.DOTALL,
             ),
-            "final_only": re.compile(
-                r"^\s*assistantfinal\s*(.*)\s*$", re.IGNORECASE | re.DOTALL
-            ),
+            "final_only": re.compile(r"^\s*assistantfinal\s*(.*)\s*$", re.IGNORECASE | re.DOTALL),
             "analysis_only": re.compile(
                 r"^\s*(?:assistant)?\s*(analysis|commentary)(.*)\s*$",
                 re.IGNORECASE | re.DOTALL,
@@ -438,7 +418,7 @@ class TextStrategy:
     def set_buffer_context(self, buffer: str):
         self.buffer_context = buffer
 
-    def parse(self, text: str) -> Tuple[List[Event], str]:
+    def parse(self, text: str) -> tuple[list[Event], str]:
         events = []
 
         m = self.patterns["analysis_then_final"].match(text)
@@ -453,9 +433,7 @@ class TextStrategy:
             return events, ""
 
         # If assistantfinal appears to be incomplete (e.g., 'assistantfin'), hold entire buffer
-        if re.search(
-            r"(?:^|\s)(?:assistant)?\s*(analysis|commentary)", text, re.IGNORECASE
-        ):
+        if re.search(r"(?:^|\s)(?:assistant)?\s*(analysis|commentary)", text, re.IGNORECASE):
             low = text.lower()
             if "assistantfin" in low and "assistantfinal" not in low:
                 return events, text
@@ -504,14 +482,10 @@ class HarmonyParser:
     def __init__(self):
         self.strategy = None
         self._buffer = ""
-        self._should_filter_commentary = (
-            False  # Track if we should filter commentary in next chunks
-        )
-        self._partial_commentary = (
-            ""  # Track partial commentary being built across chunks
-        )
+        self._should_filter_commentary = False  # Track if we should filter commentary in next chunks
+        self._partial_commentary = ""  # Track partial commentary being built across chunks
 
-    def parse(self, chunk: str) -> List[Event]:
+    def parse(self, chunk: str) -> list[Event]:
         self._buffer += chunk
 
         if self.strategy is None:
@@ -547,9 +521,7 @@ class HarmonyParser:
                 # Check if we're in a commentary filtering state
                 if self._should_filter_commentary or self._partial_commentary:
                     # Try to build partial commentary
-                    potential_commentary = (
-                        self._partial_commentary + event.content.strip().lower()
-                    )
+                    potential_commentary = self._partial_commentary + event.content.strip().lower()
 
                     if potential_commentary == "commentary":
                         # Complete commentary found - filter it
@@ -574,14 +546,10 @@ class HarmonyParser:
 
             # Update filtering state based on events and buffer state
             if event.event_type == "tool_call":
-                self._should_filter_commentary = (
-                    True  # Filter commentary after tool calls
-                )
+                self._should_filter_commentary = True  # Filter commentary after tool calls
                 self._partial_commentary = ""  # Reset on tool call
             elif buffer_has_call_token:
-                self._should_filter_commentary = (
-                    True  # Filter commentary after <|call|> token
-                )
+                self._should_filter_commentary = True  # Filter commentary after <|call|> token
 
             filtered_events.append(event)
 

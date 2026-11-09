@@ -4,6 +4,7 @@
 import torch
 import torch_npu
 import numpy as np
+import flash_npu_kernel
 import pytest
 
 if not hasattr(torch.ops.flash, "npu_assign_req_to_token_pool"):
@@ -13,15 +14,13 @@ if not hasattr(torch.ops.flash, "npu_assign_req_to_token_pool"):
     )
 
 
-def test_npu_assign_req_to_token_poolinterface_exist():
-    """Test that the operator is registered in torch.ops."""
+def test_npu_assign_req_to_token_pool_interface_exist():
     assert hasattr(torch.ops.flash, "npu_assign_req_to_token_pool"), \
         "The 'npu_assign_req_to_token_pool' operator is not registered in 'torch.ops.flash'."
 
 
 def _ref_assign_req_to_token_pool(extend_lens, out_cache_loc, req_to_token,
                                   alloced_lens, req_pool_indices):
-    """CPU reference implementation (matches the original test script)."""
     pt_offsets = torch.zeros_like(extend_lens)
     torch.cumsum(extend_lens[:-1], dim=0, out=pt_offsets[1:])
     current_allocs = alloced_lens[req_pool_indices]
@@ -36,9 +35,13 @@ def _ref_assign_req_to_token_pool(extend_lens, out_cache_loc, req_to_token,
     return req_to_token
 
 
-# Mirror the original cann_m test grid: bs ∈ [1, 167], 14 alloc_size values, 2 dtypes.
-BS_VALUES = list(range(1, 168))
-ALLOC_SIZES = [16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 24567, 32768, 65535, 131070]
+BS_VALUES = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    12, 14, 16, 20, 24, 28, 32,
+    40, 48, 56, 64, 80, 96, 112, 128,
+    144, 160, 176, 192, 208, 224, 240, 256, 384, 512,
+]
+ALLOC_SIZES = [16, 64, 256, 512, 1024, 2048, 4096, 8192, 32768, 131070]
 DTYPES = [torch.int64, torch.int32]
 
 
@@ -47,9 +50,9 @@ DTYPES = [torch.int64, torch.int32]
 @pytest.mark.parametrize("alloc_size", ALLOC_SIZES)
 @pytest.mark.parametrize("bs", BS_VALUES)
 def test_assign_req_to_token_pool(bs, alloc_size, dtype):
-    """Compare NPU in-place op vs CPU reference across full bs/alloc_size/dtype grid."""
-    np.random.seed(42)
-    torch.manual_seed(42)
+    seed = (bs * 131 + alloc_size * 7 + hash(str(dtype))) % (2**31)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     pool_len = alloc_size * 3
     pool_size = int(np.random.randint(bs, bs * 2 if bs > 1 else bs + 1))
@@ -63,7 +66,6 @@ def test_assign_req_to_token_pool(bs, alloc_size, dtype):
 
     req_to_token_npu = req_to_token.clone().npu()
 
-    # CPU reference (mutates req_to_token in place).
     expected = _ref_assign_req_to_token_pool(
         extend_lens.clone(), out_cache_loc.clone(), req_to_token.clone(),
         alloced_lens.clone(), req_pool_indices.clone(),

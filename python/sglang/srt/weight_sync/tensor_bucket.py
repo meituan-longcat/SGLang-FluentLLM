@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import List, Tuple
 
 import torch
 
@@ -24,9 +23,9 @@ class FlattenedTensorBucket:
 
     def __init__(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]] = None,
+        named_tensors: list[tuple[str, torch.Tensor]] = None,
         flattened_tensor: torch.Tensor = None,
-        metadata: List[FlattenedTensorMetadata] = None,
+        metadata: list[FlattenedTensorMetadata] = None,
     ):
         """
         Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
@@ -37,7 +36,7 @@ class FlattenedTensorBucket:
         """
         if named_tensors is not None:
             # Create bucket from named tensors
-            self.metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
+            self.metadata: list[FlattenedTensorMetadata] = [None] * len(named_tensors)
             self.flattened_tensor: torch.Tensor = None
 
             if not named_tensors:
@@ -45,7 +44,7 @@ class FlattenedTensorBucket:
 
             # Collect metadata and flatten tensors
             current_idx = 0
-            flattened_tensors: List[torch.Tensor] = [None] * len(named_tensors)
+            flattened_tensors: list[torch.Tensor] = [None] * len(named_tensors)
 
             for i, (name, tensor) in enumerate(named_tensors):
                 flattened = tensor.flatten()
@@ -70,9 +69,7 @@ class FlattenedTensorBucket:
         else:
             # Initialize from pre-flattened data
             if flattened_tensor is None or metadata is None:
-                raise ValueError(
-                    "Must provide either named_tensors or both flattened_tensor and metadata"
-                )
+                raise ValueError("Must provide either named_tensors or both flattened_tensor and metadata")
             self.flattened_tensor = flattened_tensor
             self.metadata = metadata
 
@@ -80,11 +77,11 @@ class FlattenedTensorBucket:
         """Get the flattened tensor containing all bucket tensors"""
         return self.flattened_tensor
 
-    def get_metadata(self) -> List[FlattenedTensorMetadata]:
+    def get_metadata(self) -> list[FlattenedTensorMetadata]:
         """Get metadata for all tensors in the bucket"""
         return self.metadata
 
-    def reconstruct_tensors(self) -> List[Tuple[str, torch.Tensor]]:
+    def reconstruct_tensors(self) -> list[tuple[str, torch.Tensor]]:
         """
         Reconstruct original tensors from flattened tensor with optimized performance.
         Uses memory-efficient operations to minimize allocations and copies.
@@ -93,9 +90,7 @@ class FlattenedTensorBucket:
         reconstructed = [None] * len(self.metadata)
 
         for i, meta in enumerate(self.metadata):
-            tensor = self.flattened_tensor[meta.start_idx : meta.end_idx].reshape(
-                meta.shape
-            )
+            tensor = self.flattened_tensor[meta.start_idx : meta.end_idx].reshape(meta.shape)
 
             # batch dtype conversion (if needed)
             if tensor.dtype != meta.dtype:

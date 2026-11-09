@@ -2,47 +2,45 @@
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Optional
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.distributed import (
-    get_ep_group,
-    get_attn_tp_group,
-    get_attn_tp_world_size,
-    GroupCoordinator
+from sglang.srt.distributed import GroupCoordinator, get_attn_tp_group, get_attn_tp_world_size, get_ep_group
+from sglang.srt.layers.attention.dp_attention import (
+    get_draft_attention_tp_group,
+    get_mlp_tp_group,
 )
 from sglang.srt.layers.dense.mlp import ParallelMLP
-from sglang.srt.layers.dp_attention import (
-    get_mlp_tp_group,
-    get_draft_attention_tp_group,
-)
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.npu_moe.ep_metadata import EPMetadata
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import (
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.linear import QKVParallelLinear
+from sglang.srt.layers.moe.npu_moe.ep_metadata import EPMetadata
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
+from sglang.srt.managers.scheduling.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-
 from sglang.srt.models.llama import LlamaAttention, LlamaDecoderLayer, LlamaForCausalLM
+from sglang.srt.ops.layernorm import RMSNorm
 from sglang.srt.utils import add_prefix, get_colorful_logger
-
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 
 logger = get_colorful_logger(__name__)
 
 
 @torch.inference_mode()
-def mlp_tp_recuce_scatter(hidden_states: torch.Tensor,
-                          ep_metadata: EPMetadata, ep_group: GroupCoordinator, mlp_tp_group: GroupCoordinator, attn_tp_group: Optional[GroupCoordinator] = None
-                          ) ->torch.Tensor:
+def mlp_tp_recuce_scatter(
+    hidden_states: torch.Tensor,
+    ep_metadata: EPMetadata,
+    ep_group: GroupCoordinator,
+    mlp_tp_group: GroupCoordinator,
+    attn_tp_group: Optional[GroupCoordinator] = None,
+) -> torch.Tensor:
     if attn_tp_group is None:
         attn_tp_group = get_attn_tp_group()
 
@@ -57,22 +55,20 @@ def mlp_tp_recuce_scatter(hidden_states: torch.Tensor,
 
     ep_world_query_lens = ep_metadata.ep_world_query_lens
     mlp_tp_in_ep_start = ep_group.rank_in_group // mlp_tp_group.world_size * mlp_tp_group.world_size
-    mlp_tp_in_ep_end = (ep_group.rank_in_group // mlp_tp_group.world_size + 1) *  mlp_tp_group.world_size
-    mlp_tp_world_query_lens = ep_world_query_lens[mlp_tp_in_ep_start: mlp_tp_in_ep_end]
-    padded_hs, partial_hs, \
-        partial_global_padded_hs, global_padded_hs_trans, \
-        global_padded_hs = ep_metadata.get_all_gather_buffer()
+    mlp_tp_in_ep_end = (ep_group.rank_in_group // mlp_tp_group.world_size + 1) * mlp_tp_group.world_size
+    mlp_tp_world_query_lens = ep_world_query_lens[mlp_tp_in_ep_start:mlp_tp_in_ep_end]
+    padded_hs, partial_hs, partial_global_padded_hs, global_padded_hs_trans, global_padded_hs = ep_metadata.get_all_gather_buffer()
 
-    mlp_tp_global_padded_hs = global_padded_hs.view(-1, *global_padded_hs.shape[-2:])[:mlp_tp_group.world_size]
+    mlp_tp_global_padded_hs = global_padded_hs.view(-1, *global_padded_hs.shape[-2:])[: mlp_tp_group.world_size]
     # test mlp_tp_recuce_scatter,
     # mlp_tp_world_query_lens=[6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 1, 1, 1, 1, 1, 1],
     # hidden_states.shape=torch.Size([66, 6144]),
     # mlp_tp_global_padded_hs.shape=torch.Size([16, 6, 6144])
     if not ep_metadata.no_padding:
         pos_start = 0
-        for i, l in enumerate(mlp_tp_world_query_lens):
-            mlp_tp_global_padded_hs[i, :l, :] = hidden_states[pos_start : pos_start + l, :]
-            pos_start += l
+        for i, query_len in enumerate(mlp_tp_world_query_lens):
+            mlp_tp_global_padded_hs[i, :query_len, :] = hidden_states[pos_start : pos_start + query_len, :]
+            pos_start += query_len
     else:
         # need copy?
         mlp_tp_global_padded_hs.copy_(hidden_states.view(mlp_tp_group.world_size, -1, h))
@@ -85,7 +81,7 @@ def mlp_tp_recuce_scatter(hidden_states: torch.Tensor,
         padded_hs = padded_hs.view(padded_hs.shape[-2], padded_hs.shape[-1])
 
     if not ep_metadata.no_padding:
-        hidden_states = padded_hs[:ep_world_query_lens[ep_group.rank_in_group]]
+        hidden_states = padded_hs[: ep_world_query_lens[ep_group.rank_in_group]]
     else:
         # need clone?
         hidden_states = padded_hs.clone()
@@ -93,14 +89,14 @@ def mlp_tp_recuce_scatter(hidden_states: torch.Tensor,
     return hidden_states
 
 
-def mlp_tp_recuce_scatter_in_graph_mode(hidden_states: torch.Tensor, mlp_tp_group: GroupCoordinator) ->torch.Tensor:
+def mlp_tp_recuce_scatter_in_graph_mode(hidden_states: torch.Tensor, mlp_tp_group: GroupCoordinator) -> torch.Tensor:
     if get_attn_tp_world_size() == mlp_tp_group.world_size:
         return mlp_tp_group.all_reduce(hidden_states)
     hidden_states = hidden_states.view(-1, hidden_states.size(-1))
     return mlp_tp_group.reduce_scatter(hidden_states)
 
 
-def mlp_tp_allgather_in_graph_mode(hidden_states: torch.Tensor, mlp_tp_group: GroupCoordinator) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def mlp_tp_allgather_in_graph_mode(hidden_states: torch.Tensor, mlp_tp_group: GroupCoordinator) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if get_attn_tp_world_size() == mlp_tp_group.world_size:
         return hidden_states
     hidden_states = hidden_states.view(-1, hidden_states.size(-1))
@@ -111,17 +107,18 @@ def mlp_tp_allgather_in_graph_mode(hidden_states: torch.Tensor, mlp_tp_group: Gr
 
 # attn -> mlp, attn dp > mlp dp: allgather, attn dp < mlp dp: split
 @torch.inference_mode()
-def mlp_tp_allgather(hidden_states: torch.Tensor,
-                     forward_batch: ForwardBatch, ep_group: Optional[GroupCoordinator] = None, mlp_tp_group: Optional[GroupCoordinator] = None, attn_tp_group: Optional[GroupCoordinator] = None
-                     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def mlp_tp_allgather(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    ep_group: Optional[GroupCoordinator] = None,
+    mlp_tp_group: Optional[GroupCoordinator] = None,
+    attn_tp_group: Optional[GroupCoordinator] = None,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if ep_group is None:
         ep_group = get_ep_group()
     if forward_batch.can_run_with_graph:
         return mlp_tp_allgather_in_graph_mode(hidden_states, mlp_tp_group)
     ep_metadata = forward_batch.ep_metadata
-    attn_tp_word_size = get_attn_tp_world_size()
-    if attn_tp_group != None:
-        attn_tp_word_size = attn_tp_group.world_size
     if get_attn_tp_world_size() == mlp_tp_group.world_size or attn_tp_group.world_size == 1:
         return hidden_states
     # TODO: keep output shape the same with input
@@ -130,11 +127,9 @@ def mlp_tp_allgather(hidden_states: torch.Tensor,
 
     ep_world_query_lens = ep_metadata.ep_world_query_lens
     mlp_tp_in_ep_start = ep_group.rank_in_group // mlp_tp_group.world_size * mlp_tp_group.world_size
-    mlp_tp_in_ep_end = (ep_group.rank_in_group // mlp_tp_group.world_size + 1) *  mlp_tp_group.world_size
-    mlp_tp_world_query_lens = ep_world_query_lens[mlp_tp_in_ep_start: mlp_tp_in_ep_end]
-    padded_hs, partial_hs, \
-        partial_global_padded_hs, global_padded_hs_trans, \
-        global_padded_hs = ep_metadata.get_all_gather_buffer()
+    mlp_tp_in_ep_end = (ep_group.rank_in_group // mlp_tp_group.world_size + 1) * mlp_tp_group.world_size
+    mlp_tp_world_query_lens = ep_world_query_lens[mlp_tp_in_ep_start:mlp_tp_in_ep_end]
+    padded_hs, partial_hs, partial_global_padded_hs, global_padded_hs_trans, global_padded_hs = ep_metadata.get_all_gather_buffer()
 
     if not ep_metadata.no_padding:
         if bs != 0:
@@ -144,12 +139,12 @@ def mlp_tp_allgather(hidden_states: torch.Tensor,
         if bs != 0:
             padded_hs.copy_(hidden_states)
 
-    mlp_tp_global_padded_hs = global_padded_hs.view(-1, *global_padded_hs.shape[-2:])[:mlp_tp_group.world_size]
+    mlp_tp_global_padded_hs = global_padded_hs.view(-1, *global_padded_hs.shape[-2:])[: mlp_tp_group.world_size]
 
     mlp_tp_group.all_gather_into_tensor(mlp_tp_global_padded_hs, padded_hs)
 
     if not ep_metadata.no_padding:
-        hidden_states = torch.cat([mlp_tp_global_padded_hs[i, :l] for i, l in enumerate(mlp_tp_world_query_lens)], dim=0)
+        hidden_states = torch.cat([mlp_tp_global_padded_hs[i, :query_len] for i, query_len in enumerate(mlp_tp_world_query_lens)], dim=0)
     else:
         # need clone?
         hidden_states = mlp_tp_global_padded_hs.clone().view(-1, h)
@@ -173,9 +168,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         rope_scaling = getattr(config, "rope_scaling", None)
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        attention_bias = getattr(config, "attention_bias", False) or getattr(
-            config, "bias", False
-        )
+        attention_bias = getattr(config, "attention_bias", False) or getattr(config, "bias", False)
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,
@@ -204,13 +197,14 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             outside_tp_group=get_draft_attention_tp_group(),
         )
 
-        if config.model_type == "llama4_text":
-            inter_size = config.intermediate_size_mlp
-        else:
-            inter_size = config.intermediate_size
+        inter_size = config.intermediate_size_mlp if config.model_type == "llama4_text" else config.intermediate_size
 
         self.mlp = ParallelMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix=f"{prefix}.mlp",
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            quant_config,
+            prefix=f"{prefix}.mlp",
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -223,7 +217,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tp_num_tokens: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
@@ -283,10 +277,7 @@ class LlamaModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            embeds = self.embed_tokens(input_ids)
-        else:
-            embeds = input_embeds
+        embeds = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
@@ -298,18 +289,9 @@ class LlamaModel(nn.Module):
 
         residual = None
         tp_num_tokens = hidden_states.shape[0]
-        hidden_states, residual = self.midlayer(
-            positions,
-            embeds,
-            hidden_states,
-            forward_batch,
-            residual,
-            tp_num_tokens
-        )
+        hidden_states, residual = self.midlayer(positions, embeds, hidden_states, forward_batch, residual, tp_num_tokens)
 
-        hidden_states_to_logits, hidden_states_to_aux = self.norm(
-            hidden_states, residual
-        )
+        hidden_states_to_logits, hidden_states_to_aux = self.norm(hidden_states, residual)
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
@@ -329,9 +311,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
 
-        self.model = LlamaModel(
-            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
-        )
+        self.model = LlamaModel(config, quant_config=quant_config, prefix=add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
@@ -348,7 +328,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         # Define the parameter mapping for stacked parameters
         stacked_params_mapping = [
@@ -376,9 +356,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 param_name = f"model.{name}" if name not in params_dict else name
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -386,9 +364,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 param_name = name if name in params_dict else f"model.{name}"
                 if param_name in params_dict:
                     param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
 
     def get_hot_token_id(self):

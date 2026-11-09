@@ -5,85 +5,17 @@
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import dataclasses
-
-from sglang.srt.env import global_server_args_dict
-from sglang.srt.utils import get_colorful_logger, get_prefix_sum
-import os
 import pickle
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Optional
 
 import torch
 from torch.distributed import TCPStore
 
+from sglang.srt.utils import get_colorful_logger
+
 logger = get_colorful_logger(__name__)
-
-
-def ensure_divisibility(numerator, denominator):
-    """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, "{} is not divisible by {}".format(
-        numerator, denominator
-    )
-
-
-def divide(numerator, denominator):
-    """Ensure that numerator is divisible by the denominator and return
-    the division value."""
-    ensure_divisibility(numerator, denominator)
-    return numerator // denominator
-
-
-def split_tensor_along_last_dim(
-    tensor: torch.Tensor,
-    num_partitions: int,
-    contiguous_split_chunks: bool = False,
-) -> Sequence[torch.Tensor]:
-    """Split a tensor along its last dimension.
-
-    Arguments:
-        tensor: input tensor.
-        num_partitions: number of partitions to split the tensor
-        contiguous_split_chunks: If True, make each chunk contiguous
-                                 in memory.
-
-    Returns:
-        A list of Tensors
-    """
-    # Get the size and dimension.
-    last_dim = tensor.dim() - 1
-    last_dim_size = divide(tensor.size()[last_dim], num_partitions)
-    # Split.
-    tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
-    # NOTE: torch.split does not create contiguous tensors by default.
-    if contiguous_split_chunks:
-        return tuple(chunk.contiguous() for chunk in tensor_list)
-
-    return tensor_list
-
-
-def get_pp_indices(
-    num_hidden_layers: int, pp_rank: int, pp_size: int
-) -> Tuple[int, int]:
-    """Try to evenly distribute layers across partitions.
-    If the number of layers is not divisible by the number of partitions,
-    the last partition will have the remaining layers.
-    """
-    pp_layer_nums = global_server_args_dict["pp_layer_nums"]
-    if pp_layer_nums is not None:
-        pp_layer_nums_prefix_sum = get_prefix_sum(pp_layer_nums)
-        assert pp_layer_nums_prefix_sum[-1] == num_hidden_layers, f"{pp_layer_nums_prefix_sum=} not match {num_hidden_layers=}"
-        start_layer = pp_layer_nums_prefix_sum[pp_rank]
-        end_layer = pp_layer_nums_prefix_sum[pp_rank + 1]
-    else:
-        layers_per_partition = num_hidden_layers // pp_size
-        start_layer = pp_rank * layers_per_partition
-        end_layer = start_layer + layers_per_partition
-
-        if pp_rank == pp_size - 1:
-            end_layer = num_hidden_layers
-
-    return (start_layer, end_layer)
 
 
 @dataclasses.dataclass
@@ -99,14 +31,14 @@ class StatelessProcessGroup:
     data_expiration_seconds: int = 3600  # 1 hour
 
     # dst rank -> counter
-    send_dst_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
+    send_dst_counter: dict[int, int] = dataclasses.field(default_factory=dict)
     # src rank -> counter
-    recv_src_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
+    recv_src_counter: dict[int, int] = dataclasses.field(default_factory=dict)
     broadcast_send_counter: int = 0
-    broadcast_recv_src_counter: Dict[int, int] = dataclasses.field(default_factory=dict)
+    broadcast_recv_src_counter: dict[int, int] = dataclasses.field(default_factory=dict)
 
     # A deque to store the data entries, with key and timestamp.
-    entries: Deque[Tuple[str, float]] = dataclasses.field(default_factory=deque)
+    entries: deque[tuple[str, float]] = dataclasses.field(default_factory=deque)
 
     def __post_init__(self):
         assert self.rank < self.world_size
@@ -135,9 +67,7 @@ class StatelessProcessGroup:
 
     def recv_obj(self, src: int) -> Any:
         """Receive an object from a source rank."""
-        obj = pickle.loads(
-            self.store.get(f"send_to/{self.rank}/{self.recv_src_counter[src]}")
-        )
+        obj = pickle.loads(self.store.get(f"send_to/{self.rank}/{self.recv_src_counter[src]}"))  # noqa: S301
         self.recv_src_counter[src] += 1
         return obj
 
@@ -148,14 +78,14 @@ class StatelessProcessGroup:
         """
         if self.rank == src:
             self.expire_data()
-            key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
             self.entries.append((key, time.time()))
             return obj
         else:
-            key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
-            recv_obj = pickle.loads(self.store.get(key))
+            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
+            recv_obj = pickle.loads(self.store.get(key))  # noqa: S301
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj
 

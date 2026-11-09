@@ -1,53 +1,68 @@
 import gc
-
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.utils import get_colorful_logger, is_npu
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
-
+from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     get_available_gpu_memory,
+    get_colorful_logger,
     init_custom_process_group,
+    is_npu,
     set_cuda_arch,
 )
-from sglang.srt.constants import (
-    GPU_MEMORY_ALL_TYPES,
-    GPU_MEMORY_TYPE_CUDA_GRAPH,
-    GPU_MEMORY_TYPE_KV_CACHE,
-    GPU_MEMORY_TYPE_WEIGHTS
-)
+from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 logger = get_colorful_logger(__name__)
 
 
+def print_model_weights_memory(model):
+    """打印模型所有参数的权重占用"""
+    total_params = 0
+    total_memory = 0
+
+    print("=" * 80)
+    print(f"{'参数名':<60} {'参数量':>12} {'大小(MB)':>12}")
+    print("=" * 80)
+
+    for name, param in model.named_parameters():
+        param_count = param.numel()
+        param_memory = param.numel() * param.element_size()  # 字节数
+
+        total_params += param_count
+        total_memory += param_memory
+
+        print(f"{name:<60} {param_count:>12,} {param_memory / 1024**2:>12.2f}")
+
+    print("=" * 80)
+    print(f"{'总计':<60} {total_params:>12,} {total_memory / 1024**2:>12.2f}")
+    print(f"总参数量: {total_params:,}")
+    print(f"总显存占用: {total_memory / 1024**2:.2f} MB ({total_memory / 1024**3:.2f} GB)")
+    print("=" * 80)
+
+
 class WeightMixin:
     def load_model(self, draft_model_idx: int = None):
-        logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        avail_before_load = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(f"Load weight begin. avail mem={avail_before_load:.2f} GB")
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
             torch.set_num_threads(1)
-        if self.device == "cuda":
-            if torch.cuda.get_device_capability()[0] < 8:
-                logger.info(
-                    "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
-                )
-                self.server_args.dtype = "float16"
-                self.model_config.dtype = torch.float16
-                if torch.cuda.get_device_capability()[1] < 5:
-                    raise RuntimeError("SGLang only supports sm75 and above.")
+        if self.device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
+            logger.info("Compute capability below sm80. Use float16 due to lack of bfloat16 support.")
+            self.server_args.dtype = "float16"
+            self.model_config.dtype = torch.float16
+            if torch.cuda.get_device_capability()[1] < 5:
+                raise RuntimeError("SGLang only supports sm75 and above.")
 
         set_cuda_arch()
 
@@ -56,7 +71,7 @@ class WeightMixin:
             load_format=self.server_args.load_format,
             download_dir=self.server_args.download_dir,
             ext_yaml=self.server_args.ext_yaml,
-            draft_model_idx=draft_model_idx
+            draft_model_idx=draft_model_idx,
         )
 
         with self.memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_WEIGHTS):
@@ -69,17 +84,14 @@ class WeightMixin:
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
-                    self.model.load_kv_cache_scales(
-                        self.server_args.quantization_param_path
-                    )
+                    self.model.load_kv_cache_scales(self.server_args.quantization_param_path)
                     logger.info(
                         "Loaded KV cache scaling factors from %s",
                         self.server_args.quantization_param_path,
                     )
                 else:
                     raise RuntimeError(
-                        "Using FP8 KV cache and scaling factors provided but "
-                        "model %s does not support loading scaling factors.",
+                        "Using FP8 KV cache and scaling factors provided but model %s does not support loading scaling factors.",
                         self.model.__class__,
                     )
             else:
@@ -91,35 +103,33 @@ class WeightMixin:
 
         # Parse other args
         self.sliding_window_size = (
-            self.model.get_attention_sliding_window_size()
-            if hasattr(self.model, "get_attention_sliding_window_size")
-            else None
+            self.model.get_attention_sliding_window_size() if hasattr(self.model, "get_attention_sliding_window_size") else None
         )
         self.dtype = self.model_config.dtype
 
         def print_model_weights_memory(model):
             """打印模型所有参数的权重占用"""
-            total_params=0
-            total_memory=0
+            total_params = 0
+            total_memory = 0
 
-            print("="*80)
+            print("=" * 80)
             print(f"{'参数名':<60} {'参数量':>12} {'大小(MB)':>12}")
-            print("="*80)
+            print("=" * 80)
 
             for name, param in model.named_parameters():
-                param_count=param.numel()
-                param_memory=param.numel()*param.element_size()  # 字节数
+                param_count = param.numel()
+                param_memory = param.numel() * param.element_size()  # 字节数
 
-                total_params+=param_count
-                total_memory+=param_memory
+                total_params += param_count
+                total_memory += param_memory
 
-                print(f"{name:<60} {param_count:>12,} {param_memory/1024**2:>12.2f}")
+                print(f"{name:<60} {param_count:>12,} {param_memory / 1024**2:>12.2f}")
 
-            print("="*80)
-            print(f"{'总计':<60} {total_params:>12,} {total_memory/1024**2:>12.2f}")
+            print("=" * 80)
+            print(f"{'总计':<60} {total_params:>12,} {total_memory / 1024**2:>12.2f}")
             print(f"总参数量: {total_params:,}")
-            print(f"总显存占用: {total_memory/1024**2:.2f} MB ({total_memory/1024**3:.2f} GB)")
-            print("="*80)
+            print(f"总显存占用: {total_memory / 1024**2:.2f} MB ({total_memory / 1024**3:.2f} GB)")
+            print("=" * 80)
 
         if is_npu():
             torch.npu.empty_cache()
@@ -133,10 +143,12 @@ class WeightMixin:
             f"dtype={self.dtype}, "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        # DFLASH draft 权重实测: 与 profile 预扣对照, 偏差大时调 SGLANG_DFLASH_DRAFT_WEIGHT_FACTOR。
+        if self.is_draft_worker and self.spec_algorithm.is_dflash():
+            used = avail_before_load - get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(f"DFLASH draft 权重实测占用 {used:.2f} GB")
 
-    def update_weights_from_disk(
-        self, model_path: str, load_format: str
-    ) -> tuple[bool, str]:
+    def update_weights_from_disk(self, model_path: str, load_format: str) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         from sglang.srt.model_loader.loader import (
             DefaultModelLoader,
@@ -145,10 +157,7 @@ class WeightMixin:
         )
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
-        logger.info(
-            f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        logger.info(f"Update engine weights online from disk begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB")
 
         target_device = torch.device(self.device)
         self.model_config.model_path = model_path
@@ -165,9 +174,7 @@ class WeightMixin:
                 DefaultModelLoader.Source(
                     config.model_path,
                     revision=config.revision,
-                    fall_back_to_pt=getattr(
-                        self.model, "fall_back_to_pt_during_load", True
-                    ),
+                    fall_back_to_pt=getattr(self.model, "fall_back_to_pt_during_load", True),
                 )
             )
             return iter
@@ -194,9 +201,7 @@ class WeightMixin:
             try:
                 model = model_load_weights(self.model, iter)
             except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
+                message = f"Failed to update weights: {e}.\nRolling back to original weights."
                 del iter
                 gc.collect()
                 iter = get_weight_iter(self.model_config)
@@ -230,9 +235,7 @@ class WeightMixin:
         weights/parameters online, and broadcasts them to the inference
         engine through the `_model_update_group` process group.
         """
-        assert (
-            torch.distributed.is_initialized()
-        ), "Default torch process group must be initialized"
+        assert torch.distributed.is_initialized(), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
         rank = rank_offset + self.tp_rank
@@ -267,13 +270,9 @@ class WeightMixin:
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
         """
-        target_dtype = (
-            dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-        )
+        target_dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
 
-        assert (
-            self._model_update_group is not None
-        ), "model update group must be initialized"
+        assert self._model_update_group is not None, "model update group must be initialized"
 
         try:
             weights = torch.empty(shape, dtype=target_dtype, device=self.device)
@@ -292,7 +291,7 @@ class WeightMixin:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
+        named_tensors: list[tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
         load_format: Optional[str] = None,
     ):
         monkey_patch_torch_reductions()
@@ -300,10 +299,7 @@ class WeightMixin:
         self.device_module = torch.get_device_module(self.device)
         infered_device = self.device_module.current_device()
 
-        named_tensors = [
-            (name, _unwrap_tensor(tensor, tp_rank=self.global_rank, device=infered_device))
-            for name, tensor in named_tensors
-        ]
+        named_tensors = [(name, _unwrap_tensor(tensor, tp_rank=self.global_rank, device=infered_device)) for name, tensor in named_tensors]
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format is None:
@@ -312,9 +308,7 @@ class WeightMixin:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
 
-    def get_weights_by_name(
-        self, name: str, truncate_size: int = 100
-    ) -> Optional[torch.Tensor]:
+    def get_weights_by_name(self, name: str, truncate_size: int = 100) -> Optional[torch.Tensor]:
         """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
 
         Only used for unit test with an unoptimized performance.
@@ -322,14 +316,13 @@ class WeightMixin:
         """
         # TODO: (chenyang) Add support for Qwen models.
         try:
-            return self.model.get_weights_by_name(
-                name, truncate_size, tp_size=self.tp_size
-            )
+            return self.model.get_weights_by_name(name, truncate_size, tp_size=self.tp_size)
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
 
-def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+
+def _model_load_weights_direct(model, named_tensors: list[tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
         default_weight_loader(params_dict[name], tensor)
@@ -346,14 +339,13 @@ class LocalSerializedTensor:
     """torch.Tensor that gets serialized by MultiprocessingSerializer (which only serializes a pointer and not the data).
     The i-th element in the list corresponds to i-th rank's GPU."""
 
-    values: List[bytes]
+    values: list[bytes]
 
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
 
-def unwrap_ipc_tensors(
-    tensors: List[Tuple[str, torch.Tensor]], tp_rank: int, device: torch.device
-) -> List[Tuple[str, torch.Tensor]]:
+
+def unwrap_ipc_tensors(tensors: list[tuple[str, torch.Tensor]], tp_rank: int, device: torch.device) -> list[tuple[str, torch.Tensor]]:
     """Unwrap IPC (Inter-Process Communication) tensors and move them to the target device.
 
     This function handles tensors that may be serialized using IPC handles and converts them

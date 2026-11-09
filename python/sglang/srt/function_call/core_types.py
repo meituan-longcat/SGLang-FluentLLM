@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 from pydantic import BaseModel
 
@@ -16,7 +16,7 @@ class StreamingParseResult(BaseModel):
     """Result of streaming incremental parsing."""
 
     normal_text: str = ""
-    calls: List[ToolCallItem] = []
+    calls: list[ToolCallItem] = []
 
 
 @dataclass

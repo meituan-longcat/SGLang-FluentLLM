@@ -15,30 +15,31 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/qwen.py#L1
 
-from typing import Any, Dict, Iterable, Optional, Tuple
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.embedding.rotary_embedding import get_rope
+from sglang.srt.layers.embedding.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ops.activation import SiluAndMul
+from sglang.srt.ops.layernorm import RMSNorm
 
 
 class QWenMLP(nn.Module):
@@ -65,10 +66,7 @@ class QWenMLP(nn.Module):
             quant_config=quant_config,
         )
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -86,7 +84,7 @@ class QWenAttention(nn.Module):
         max_position_embeddings: int,
         layer_id: int = 0,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -211,12 +209,7 @@ class QWenModel(nn.Module):
             vocab_size,
             config.hidden_size,
         )
-        self.h = nn.ModuleList(
-            [
-                QWenBlock(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        self.h = nn.ModuleList([QWenBlock(config, i, quant_config=quant_config) for i in range(config.num_hidden_layers)])
         self.ln_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
     def forward(
@@ -258,11 +251,9 @@ class QWenLMHeadModel(nn.Module):
         forward_batch: ForwardBatch,
     ):
         hidden_states = self.transformer(input_ids, positions, forward_batch)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w2", 0),

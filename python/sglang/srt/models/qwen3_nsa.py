@@ -15,52 +15,49 @@
 # Adapted from llama2.py
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+
 import math
-from typing import Any, Dict, Iterable, Optional, Tuple, List
+from collections.abc import Iterable
+from typing import Any, Optional
 
 import torch
+from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
 from torch import nn
+
 # from torch.profiler import record_function
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.attention.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     WrapperDispatch,
-    create_flashinfer_kv_indices_triton,
-)
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.layers.attention.native_sparse_attention.select_attn import (
-    select_attention_torch,
-    select_attention_decode_splitk_triton
 )
 from sglang.srt.layers.attention.native_sparse_attention.compress_attn import (
-    compress_attention_torch,
     compress_attention_decode_triton,
+    compress_attention_torch,
 )
 from sglang.srt.layers.attention.native_sparse_attention.compress_kv import (
     cumsum_with_padding,
-    get_compressed_kv_indptr,
-    get_compressed_kv_indices,
-    gate_compress_torch,
     gate_compress_decode_triton,
+    gate_compress_torch,
+    get_compressed_kv_indices,
+    get_compressed_kv_indptr,
 )
-from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache
-
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.attention.native_sparse_attention.select_attn import select_attention_decode_splitk_triton, select_attention_torch
+from sglang.srt.layers.attention.radix_attention import RadixAttention
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.embedding.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
-from sglang.srt.layers.dp_attention import get_attention_tp_size, get_attention_tp_rank
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.sampler.logits_processor import LogitsProcessor
 from sglang.srt.mem_cache.memory_pool import NativeSparseMHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.qwen3 import Qwen3Attention
+from sglang.srt.ops.layernorm import RMSNorm
 from sglang.srt.utils import add_prefix
-
 
 Qwen3NsaConfig = None
 layer_id = -1
@@ -69,18 +66,14 @@ max_bs = -1
 max_total_num_tokens = -1
 max_context_len = 32768
 # tensor for cuda graph
-compress_kv_indices = \
-flat_com_score = flat_slc_score = \
-cuda_graph_kv_indices = None
+compress_kv_indices = flat_com_score = flat_slc_score = cuda_graph_kv_indices = None
+
 
 def load_cu_seqlens(
     forward_batch: ForwardBatch,
 ):
     seqlens_kv = forward_batch.seq_lens
-    if forward_batch.forward_mode.is_decode():
-        seqlens_q = seqlens_kv.new_ones(seqlens_kv.shape)
-    else:
-        seqlens_q = forward_batch.extend_seq_lens
+    seqlens_q = seqlens_kv.new_ones(seqlens_kv.shape) if forward_batch.forward_mode.is_decode() else forward_batch.extend_seq_lens
 
     cu_seqlens_q = seqlens_q.new_zeros(seqlens_q.shape[0] + 1)
     cu_seqlens_kv = seqlens_kv.new_zeros(seqlens_kv.shape[0] + 1)
@@ -88,22 +81,23 @@ def load_cu_seqlens(
     cu_seqlens_kv[1:] = torch.cumsum(seqlens_kv, dim=0)
     return cu_seqlens_q, cu_seqlens_kv
 
-def load_kv_cache(
-    forward_batch: ForwardBatch,
-    layer_id: int
-):
-    cached_kv_idx = torch.cat([
-        forward_batch.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[seq_idx],
-            :kv_len,
+
+def load_kv_cache(forward_batch: ForwardBatch, layer_id: int):
+    cached_kv_idx = torch.cat(
+        [
+            forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices[seq_idx],
+                :kv_len,
+            ]
+            for seq_idx, kv_len in enumerate(forward_batch.seq_lens)
         ]
-        for seq_idx, kv_len in enumerate(forward_batch.seq_lens)
-    ])
+    )
 
     cached_k = forward_batch.token_to_kv_pool.get_key_buffer(layer_id)[cached_kv_idx]
     cached_v = forward_batch.token_to_kv_pool.get_value_buffer(layer_id)[cached_kv_idx]
 
     return cached_k, cached_v
+
 
 # ref: https://github.com/mdy666/Qwen-Native-Sparse-Attention/tree/master
 class Compress(torch.nn.Module):
@@ -113,7 +107,7 @@ class Compress(torch.nn.Module):
         kernel_size: int,
         stride: int,
         quant_config: Optional[QuantizationConfig] = None,
-        cmp_gate_rescale:bool = False,
+        cmp_gate_rescale: bool = False,
         prefix: str = "",
     ):
         super().__init__()
@@ -133,11 +127,11 @@ class Compress(torch.nn.Module):
             self.cmp_rescale_factor = (kernel_size * head_dim) ** -0.5
 
     def forward(
-            self,
-            forward_batch: ForwardBatch,
-            buffer: torch.Tensor,
-            compressed_buffer: torch.Tensor,
-        ):
+        self,
+        forward_batch: ForwardBatch,
+        buffer: torch.Tensor,
+        compressed_buffer: torch.Tensor,
+    ):
         """
         Pepare the compressed blocks from buffer into compressed buffer.
 
@@ -160,11 +154,11 @@ class Compress(torch.nn.Module):
             )
 
     def forward_extend(
-            self,
-            forward_batch: ForwardBatch,
-            buffer: torch.Tensor,
-            compressed_buffer: torch.Tensor,
-        ):
+        self,
+        forward_batch: ForwardBatch,
+        buffer: torch.Tensor,
+        compressed_buffer: torch.Tensor,
+    ):
         """
         Pepare the compressed blocks from buffer into compressed buffer.
 
@@ -180,13 +174,13 @@ class Compress(torch.nn.Module):
         bs = forward_batch.batch_size
 
         create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token_ptr = req_to_token,
-            req_pool_indices_ptr = forward_batch.req_pool_indices,
-            page_kernel_lens_ptr  = forward_batch.seq_lens,
-            kv_indptr = kv_indptr,
-            kv_start_idx = None,
-            kv_indices_ptr = kv_indices,
-            req_to_token_ptr_stride = req_to_token.stride(0),
+            req_to_token_ptr=req_to_token,
+            req_pool_indices_ptr=forward_batch.req_pool_indices,
+            page_kernel_lens_ptr=forward_batch.seq_lens,
+            kv_indptr=kv_indptr,
+            kv_start_idx=None,
+            kv_indices_ptr=kv_indices,
+            req_to_token_ptr_stride=req_to_token.stride(0),
         )
 
         compressed_kv_indptr = get_compressed_kv_indptr(
@@ -215,11 +209,11 @@ class Compress(torch.nn.Module):
         )
 
     def forward_decode(
-            self,
-            forward_batch: ForwardBatch,
-            buffer: torch.Tensor,
-            compressed_buffer: torch.Tensor,
-        ):
+        self,
+        forward_batch: ForwardBatch,
+        buffer: torch.Tensor,
+        compressed_buffer: torch.Tensor,
+    ):
         """
         Pepare the compressed blocks from buffer into compressed buffer.
 
@@ -232,7 +226,7 @@ class Compress(torch.nn.Module):
             kv_cache=buffer,
             compressed_kv_cache=compressed_buffer,
             gate_weight=self.gate_proj.weight,
-            kv_lens =forward_batch.seq_lens,
+            kv_lens=forward_batch.seq_lens,
             req_pool_indices=forward_batch.req_pool_indices,
             req_to_token=forward_batch.req_to_token_pool.req_to_token,
             kernel_size=self.kernel_size,
@@ -293,10 +287,10 @@ class CompressAttn(torch.nn.Module):
         )
 
     def forward(
-            self,
-            q: torch.Tensor,
-            forward_batch: ForwardBatch,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Compress Attention module.
 
@@ -310,12 +304,12 @@ class CompressAttn(torch.nn.Module):
         self.compress_key(
             forward_batch=forward_batch,
             buffer=forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id),
-            compressed_buffer=forward_batch.token_to_kv_pool.get_compressed_key_buffer(self.layer_id)
+            compressed_buffer=forward_batch.token_to_kv_pool.get_compressed_key_buffer(self.layer_id),
         )
         self.compress_value(
             forward_batch=forward_batch,
             buffer=forward_batch.token_to_kv_pool.get_value_buffer(self.layer_id),
-            compressed_buffer=forward_batch.token_to_kv_pool.get_compressed_value_buffer(self.layer_id)
+            compressed_buffer=forward_batch.token_to_kv_pool.get_compressed_value_buffer(self.layer_id),
         )
 
         o, topk_idx = self.compress_attention(
@@ -326,10 +320,10 @@ class CompressAttn(torch.nn.Module):
         return o, topk_idx
 
     def compress_attention(
-            self,
-            q: torch.Tensor,
-            forward_batch: ForwardBatch,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Compress Attention module.
 
@@ -339,7 +333,7 @@ class CompressAttn(torch.nn.Module):
         Returns:
             o (torch.Tensor): [total_q_len, num_q_heads, v_head_dim]
             topk_idx (torch.Tensor): [total_q_len, num_slc_score_heads, top_k]
-        """ 
+        """
         q = q.view(-1, self.num_q_heads, self.qk_head_dim)
 
         if forward_batch.forward_mode.is_decode():
@@ -352,14 +346,14 @@ class CompressAttn(torch.nn.Module):
                 q=q,
                 forward_batch=forward_batch,
             )
-        
+
         return o, topk_idx
 
     def compress_attention_extend(
-            self,
-            q: torch.Tensor,
-            forward_batch: ForwardBatch,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Compress Attention module.
 
@@ -369,7 +363,7 @@ class CompressAttn(torch.nn.Module):
         Returns:
             o (torch.Tensor): [total_q_len, num_q_heads, v_head_dim]
             topk_idx (torch.Tensor): [total_q_len, num_slc_score_heads, top_k]
-        """ 
+        """
         kv_lens = forward_batch.seq_lens
         kv_indptr = cumsum_with_padding(kv_lens)
         req_to_token = forward_batch.req_to_token_pool.req_to_token
@@ -377,13 +371,13 @@ class CompressAttn(torch.nn.Module):
         bs = forward_batch.batch_size
 
         create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token_ptr = req_to_token,
-            req_pool_indices_ptr = forward_batch.req_pool_indices,
-            page_kernel_lens_ptr  = forward_batch.seq_lens,
-            kv_indptr = kv_indptr,
-            kv_start_idx = None,
-            kv_indices_ptr = kv_indices,
-            req_to_token_ptr_stride = req_to_token.stride(0),
+            req_to_token_ptr=req_to_token,
+            req_pool_indices_ptr=forward_batch.req_pool_indices,
+            page_kernel_lens_ptr=forward_batch.seq_lens,
+            kv_indptr=kv_indptr,
+            kv_start_idx=None,
+            kv_indices_ptr=kv_indices,
+            req_to_token_ptr_stride=req_to_token.stride(0),
         )
 
         compressed_kv_indptr = get_compressed_kv_indptr(
@@ -398,12 +392,9 @@ class CompressAttn(torch.nn.Module):
             stride=self.stride,
         )
 
-        if forward_batch.forward_mode.is_decode():
-            q_lens = kv_lens.new_ones(kv_lens.shape)
-        else:
-            q_lens = forward_batch.extend_seq_lens
+        q_lens = kv_lens.new_ones(kv_lens.shape) if forward_batch.forward_mode.is_decode() else forward_batch.extend_seq_lens
         q_indptr = cumsum_with_padding(q_lens)
-        
+
         compressed_kv_lens = compressed_kv_indptr[1:] - compressed_kv_indptr[:-1]
         compress_score_lens = q_lens * compressed_kv_lens
         compress_score_indptr = cumsum_with_padding(compress_score_lens)
@@ -425,17 +416,17 @@ class CompressAttn(torch.nn.Module):
             slc_att_num_init_blocks=self.slc_att_num_init_blocks,
             slc_att_num_local_blocks=self.slc_att_num_local_blocks,
             num_slc_score_heads=self.num_slc_score_heads,
-            virtual_k_group_agg_type=self.virtual_k_group_agg_type
+            virtual_k_group_agg_type=self.virtual_k_group_agg_type,
         )
-        
+
         o = o.view(-1, self.num_q_heads * self.v_head_dim)
         return o, topk_idx
 
     def compress_attention_decode(
-            self,
-            q: torch.Tensor,
-            forward_batch: ForwardBatch,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        q: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the Compress Attention module.
 
@@ -460,24 +451,24 @@ class CompressAttn(torch.nn.Module):
 
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         req_to_compressed_token = req_to_token.new_zeros((req_to_token.shape[0], req_to_token.shape[1] // self.stride))
-        req_to_compressed_token[forward_batch.req_pool_indices] = req_to_token[
-            forward_batch.req_pool_indices,
-            ::self.stride,
-        ] // self.stride # [batch_size, block_size]
+        req_to_compressed_token[forward_batch.req_pool_indices] = (
+            req_to_token[
+                forward_batch.req_pool_indices,
+                :: self.stride,
+            ]
+            // self.stride
+        )  # [batch_size, block_size]
 
-        if compress_kv_indices is None:
-            compressed_kv_indices = req_to_compressed_token.new_zeros(compressed_kv_indptr[-1])
-        else:
-            compressed_kv_indices = compress_kv_indices
+        compressed_kv_indices = req_to_compressed_token.new_zeros(compressed_kv_indptr[-1]) if compress_kv_indices is None else compress_kv_indices
 
         create_flashinfer_kv_indices_triton[(forward_batch.batch_size,)](
-            req_to_token_ptr = req_to_compressed_token,
-            req_pool_indices_ptr = forward_batch.req_pool_indices,
-            page_kernel_lens_ptr  = compressed_kv_lens,
-            kv_indptr = compressed_kv_indptr,
-            kv_start_idx = None,
-            kv_indices_ptr = compressed_kv_indices,
-            req_to_token_ptr_stride = req_to_compressed_token.stride(0),
+            req_to_token_ptr=req_to_compressed_token,
+            req_pool_indices_ptr=forward_batch.req_pool_indices,
+            page_kernel_lens_ptr=compressed_kv_lens,
+            kv_indptr=compressed_kv_indptr,
+            kv_start_idx=None,
+            kv_indices_ptr=compressed_kv_indices,
+            req_to_token_ptr_stride=req_to_compressed_token.stride(0),
         )
 
         if flat_com_score is None:
@@ -531,7 +522,7 @@ class SelectiveAttn(nn.Module):
         layer_id: int,
     ) -> None:
         super().__init__()
-        
+
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.qk_head_dim = qk_head_dim
@@ -591,19 +582,16 @@ class SelectiveAttn(nn.Module):
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         kv_indices = req_to_token.new_zeros((forward_batch.seq_lens_sum,))
         create_flashinfer_kv_indices_triton[(forward_batch.batch_size,)](
-            req_to_token_ptr = req_to_token,
-            req_pool_indices_ptr = forward_batch.req_pool_indices,
-            page_kernel_lens_ptr  = kv_lens,
-            kv_indptr = kv_indptr,
-            kv_start_idx = None,
-            kv_indices_ptr = kv_indices,
-            req_to_token_ptr_stride = req_to_token.stride(0),
+            req_to_token_ptr=req_to_token,
+            req_pool_indices_ptr=forward_batch.req_pool_indices,
+            page_kernel_lens_ptr=kv_lens,
+            kv_indptr=kv_indptr,
+            kv_start_idx=None,
+            kv_indices_ptr=kv_indices,
+            req_to_token_ptr_stride=req_to_token.stride(0),
         )
 
-        if forward_batch.forward_mode.is_decode():
-            q_lens = kv_lens.new_ones(kv_lens.shape)
-        else:
-            q_lens = forward_batch.extend_seq_lens
+        q_lens = kv_lens.new_ones(kv_lens.shape) if forward_batch.forward_mode.is_decode() else forward_batch.extend_seq_lens
         q_indptr = cumsum_with_padding(q_lens)
 
         q = q.view(-1, self.num_q_heads, self.qk_head_dim)
@@ -642,20 +630,18 @@ class SelectiveAttn(nn.Module):
         bs = len(forward_batch.req_pool_indices)
         kv_indptr = cumsum_with_padding(forward_batch.seq_lens)
         if cuda_graph_kv_indices is None:
-            kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int32, device=q.device
-            )
+            kv_indices = torch.empty(forward_batch.seq_lens_sum, dtype=torch.int32, device=q.device)
         else:
             kv_indices = cuda_graph_kv_indices
 
         create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token_ptr =  forward_batch.req_to_token_pool.req_to_token,
-            req_pool_indices_ptr = forward_batch.req_pool_indices,
-            page_kernel_lens_ptr  = forward_batch.seq_lens,
-            kv_indptr = kv_indptr,
-            kv_start_idx = None,
-            kv_indices_ptr = kv_indices,
-            req_to_token_ptr_stride = forward_batch.req_to_token_pool.req_to_token.stride(0),
+            req_to_token_ptr=forward_batch.req_to_token_pool.req_to_token,
+            req_pool_indices_ptr=forward_batch.req_pool_indices,
+            page_kernel_lens_ptr=forward_batch.seq_lens,
+            kv_indptr=kv_indptr,
+            kv_start_idx=None,
+            kv_indices_ptr=kv_indices,
+            req_to_token_ptr_stride=forward_batch.req_to_token_pool.req_to_token.stride(0),
         )
 
         o = select_attention_decode_splitk_triton(
@@ -663,11 +649,11 @@ class SelectiveAttn(nn.Module):
             k_cache=forward_batch.token_to_kv_pool.get_key_buffer(self.layer_id),
             v_cache=forward_batch.token_to_kv_pool.get_value_buffer(self.layer_id),
             select_indices=select_indices,
-            kv_indptr=kv_indptr, 
+            kv_indptr=kv_indptr,
             kv_indices=kv_indices,
             sm_scale=self.sm_scale,
             select_size=self.select_size,
-            num_kv_splits=8
+            num_kv_splits=8,
         )
         o = o.view(-1, self.num_q_heads * self.v_head_dim)
         return o
@@ -702,30 +688,26 @@ class SlidingWindowAttn(nn.Module):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
-        
+
         q = q.view(-1, self.num_q_heads, self.qk_head_dim)
         k = k.view(-1, self.num_kv_heads, self.qk_head_dim)
         v = v.view(-1, self.num_kv_heads, self.v_head_dim)
 
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                self, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(self, forward_batch.out_cache_loc, k, v)
 
-        seq_num, = forward_batch.seq_lens.shape
+        (seq_num,) = forward_batch.seq_lens.shape
 
         cache_seqlens = forward_batch.seq_lens.to(torch.int32)
         cache_batch_idx = forward_batch.req_pool_indices.to(torch.int32)
         if forward_batch.forward_mode.is_decode():
             causal = False
-            max_seqlen_q=1
+            max_seqlen_q = 1
             cu_seqlens_q = torch.arange(0, seq_num + 1, dtype=torch.int32, device=cache_seqlens.device)
         else:
             causal = True
             max_seqlen_q = max(forward_batch.extend_seq_lens_cpu)
-            cu_seqlens_q = torch.nn.functional.pad(
-                torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
-            )
+            cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32), (1, 0))
 
         o = flash_attn_with_kvcache(
             q=q,
@@ -751,13 +733,16 @@ class AttentionGateFusion(nn.Module):
         num_q_heads: int,
         v_head_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
-        nsa_gate_mask: List = [1,1,1],
+        nsa_gate_mask: list | None = None,
         nsa_gate_type: str = "softmax",
         gate_weight_head_not_share: bool = False,
         fusion_gate_rescale: bool = False,
-        prefix: str = '',
+        prefix: str = "",
     ):
         super().__init__()
+
+        if nsa_gate_mask is None:
+            nsa_gate_mask = [1, 1, 1]
 
         self.num_q_heads = num_q_heads
         self.v_head_dim = v_head_dim
@@ -777,7 +762,7 @@ class AttentionGateFusion(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("gate_weight", prefix),
                 tp_rank=self.tp_rank,
-                tp_size=self.tp_size
+                tp_size=self.tp_size,
             )
             # self.gate_weight = torch.nn.Parameter(
             #     torch.empty(num_q_heads, gate_num, v_head_dim * gate_num),
@@ -807,23 +792,20 @@ class AttentionGateFusion(nn.Module):
         b = o_slc_att
         c = o_sw_att
         # [S, H, 3, D]
-        gate_input = torch.stack(
-            [x for i, x in enumerate([a, b, c]) if self.nsa_gate_mask[i] == 1],
-            dim=-2
-        )
+        gate_input = torch.stack([x for i, x in enumerate([a, b, c]) if self.nsa_gate_mask[i] == 1], dim=-2)
         # [S, H, 3, D] -> [S, H, 3*D] -> [S, H, 1, 3*D]
         gate_feature = gate_input.flatten(start_dim=-2, end_dim=-1)[:, :, None, :]
         gate_weight = self.gate_weight.weight
         gate_weight = gate_weight.transpose(0, 1).reshape(self.num_q_heads, self.gate_num, -1)
         # hack for no swa
-        gate_weight = gate_weight[:, :gate_input.shape[-2], :gate_feature.shape[-1]]
+        gate_weight = gate_weight[:, : gate_input.shape[-2], : gate_feature.shape[-1]]
         # [S, H, 1, 3*D] @ [H, 3*D, 3] -> [S,H,1,3] -> [S,H,3]
         gate_score = torch.matmul(gate_feature, gate_weight.transpose(-1, -2)).squeeze(-2)
         if self.fusion_gate_rescale_factor > 0:
             gate_score *= self.fusion_gate_rescale_factor
-        if self.nsa_gate_type == 'softmax':
+        if self.nsa_gate_type == "softmax":
             gate_score = gate_score.softmax(dim=-1, dtype=torch.float32).to(gate_input.dtype)
-        elif self.nsa_gate_type == 'sigmoid':
+        elif self.nsa_gate_type == "sigmoid":
             gate_score = gate_score.sigmoid().to(gate_input.dtype)
         else:
             raise ValueError(f"nsa_gate_type {self.nsa_gate_type} not supported")
@@ -835,7 +817,6 @@ class AttentionGateFusion(nn.Module):
 
 
 class NativeSparseAttention(nn.Module):
-
     def __init__(
         self,
         num_q_heads: int,
@@ -930,10 +911,11 @@ class NativeSparseAttention(nn.Module):
             o (torch.Tensor): [num_batch_tokens, num_q_heads * v_head_dim]
         """
 
-        assert type(forward_batch.attn_backend) in [ FlashInferAttnBackend ], \
+        assert type(forward_batch.attn_backend) in [FlashInferAttnBackend], (
             f"only flashinfer support window attn, but got {forward_batch.attn_backend}"
+        )
         assert forward_batch.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
-        assert type(forward_batch.token_to_kv_pool) in [ NativeSparseMHATokenToKVPool ]
+        assert type(forward_batch.token_to_kv_pool) in [NativeSparseMHATokenToKVPool]
 
         window_o = self.window_attn(q, k, v, forward_batch, save_kv_cache=True)
 
@@ -948,32 +930,22 @@ class NativeSparseAttention(nn.Module):
         in_max_bs: int,
         in_max_total_num_tokens: int,
         in_max_context_len: int,
-        stride, num_q_heads, select_size, 
+        stride,
+        num_q_heads,
+        select_size,
     ):
-        global max_bs, max_total_num_tokens, max_context_len,\
-            compress_kv_indices, \
-            flat_com_score, flat_slc_score, \
-            cuda_graph_kv_indices
-        if max_bs != -1: return
+        global max_bs, max_total_num_tokens, max_context_len, compress_kv_indices, flat_com_score, flat_slc_score, cuda_graph_kv_indices
+        if max_bs != -1:
+            return
         max_bs = in_max_bs
         max_total_num_tokens = in_max_total_num_tokens
         max_context_len = in_max_context_len
         print(f"NSA init_cuda_graph_state_nsa {max_total_num_tokens=} {max_bs=}")
         with torch.device("cuda"):
-            compress_kv_indices = torch.zeros(
-                max_total_num_tokens // stride, dtype=torch.int32
-            )
-            flat_com_score = torch.zeros(
-                max_total_num_tokens // stride, num_q_heads,
-                dtype=torch.float32
-            )
-            flat_slc_score = torch.zeros(
-                max_total_num_tokens // select_size + max_bs, num_q_heads,
-                dtype=torch.float32
-            )
-            cuda_graph_kv_indices = torch.zeros(
-                max_total_num_tokens, dtype=torch.int32
-            )
+            compress_kv_indices = torch.zeros(max_total_num_tokens // stride, dtype=torch.int32)
+            flat_com_score = torch.zeros(max_total_num_tokens // stride, num_q_heads, dtype=torch.float32)
+            flat_slc_score = torch.zeros(max_total_num_tokens // select_size + max_bs, num_q_heads, dtype=torch.float32)
+            cuda_graph_kv_indices = torch.zeros(max_total_num_tokens, dtype=torch.int32)
 
 
 class Qwen3NSA(Qwen3Attention):
@@ -985,7 +957,7 @@ class Qwen3NSA(Qwen3Attention):
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 1000000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         head_dim: Optional[int] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
@@ -1010,14 +982,14 @@ class Qwen3NSA(Qwen3Attention):
 
         kernel_size = config.kernel_size
         stride = config.stride
-        post_compress_key_rope = getattr(config, 'post_compress_key_rope', False)
+        post_compress_key_rope = getattr(config, "post_compress_key_rope", False)
         assert not post_compress_key_rope
         apply_additive_intra_block_position_emb = config.apply_additive_intra_block_position_emb
         assert not apply_additive_intra_block_position_emb
         head_share_cmp_att_weight = config.head_share_cmp_att_weight
         assert head_share_cmp_att_weight
-        compress_type = getattr(config, 'compress_type', 'weighted')
-        assert compress_type == 'gated'
+        compress_type = getattr(config, "compress_type", "weighted")
+        assert compress_type == "gated"
         select_size = config.select_size
         top_n = config.top_n
         slc_att_num_init_blocks = config.slc_att_num_init_blocks
@@ -1025,12 +997,12 @@ class Qwen3NSA(Qwen3Attention):
         sliding_window_size = config.window_size
         head_share_att_gate_weight = config.head_share_att_gate_weight
         assert head_share_att_gate_weight
-        gate_type = getattr(config, 'gate_type', 'sigmoid')
-        assert gate_type == 'sigmoid'
-        gate_feature = getattr(config, 'gate_feature', 'query')
-        assert gate_feature == 'attention'
-        gate_mask = getattr(config, 'gate_mask', '111')
-        assert gate_mask == '111'
+        gate_type = getattr(config, "gate_type", "sigmoid")
+        assert gate_type == "sigmoid"
+        gate_feature = getattr(config, "gate_feature", "query")
+        assert gate_feature == "attention"
+        gate_mask = getattr(config, "gate_mask", "111")
+        assert gate_mask == "111"
 
         self.attn = NativeSparseAttention(
             num_q_heads=self.num_heads,
@@ -1088,9 +1060,7 @@ class Qwen3NsaDecoderLayer(nn.Module):
             # prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -1098,7 +1068,7 @@ class Qwen3NsaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -1116,6 +1086,7 @@ class Qwen3NsaDecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+
 class Qwen3NsaModel(Qwen2Model):
     def __init__(
         self,
@@ -1129,6 +1100,7 @@ class Qwen3NsaModel(Qwen2Model):
             # prefix=prefix,
             decoder_layer_type=Qwen3NsaDecoderLayer,
         )
+
 
 class Qwen3NsaForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -1162,9 +1134,7 @@ class Qwen3NsaForCausalLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1180,14 +1150,12 @@ class Qwen3NsaForCausalLM(nn.Module):
         get_embedding: bool = False,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def get_attention_sliding_window_size(self):
-        return getattr(self.config, 'window_size', None)
+        return getattr(self.config, "window_size", None)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1202,7 +1170,7 @@ class Qwen3NsaForCausalLM(nn.Module):
             "gate_fusion.gate_weight": "attn.gate_fusion.gate_proj.weight",
         }
 
-        '''
+        """
         'model.layers.0.self_attn.q_norm.weight',
         'model.layers.0.self_attn.k_norm.weight',
         'model.layers.0.self_attn.qkv_proj.weight',
@@ -1214,7 +1182,7 @@ class Qwen3NsaForCausalLM(nn.Module):
         'model.layers.0.mlp.down_proj.weight',
         'model.layers.0.input_layernorm.weight',
         'model.layers.0.post_attention_layernorm.weight',
-        '''
+        """
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -1272,5 +1240,3 @@ class Qwen3NsaForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3NsaForCausalLM
-
-

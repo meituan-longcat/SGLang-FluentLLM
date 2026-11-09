@@ -1,14 +1,13 @@
 import itertools
 import math
 import os
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
+from torch import nn
 
 
 # Adapted from https://github.com/OpenNLPLab/lightning-attention/blob/main/lightning_attn/ops/triton/lightning_attn2.py
@@ -267,7 +266,7 @@ def get_activation_fn(activation):
 
 # Copied from https://huggingface.co/MiniMaxAI/MiniMax-Text-01/blob/main/modeling_minimax_text_01.py
 class MiniMaxText01LightningAttention(nn.Module):
-    def __init__(self, config=None, layer_idx: Optional[int] = None, **kwargs):
+    def __init__(self, config=None, layer_idx: int | None = None, **kwargs):
         super().__init__()
         if config is None:
             config = type("Config", (), kwargs)
@@ -297,11 +296,11 @@ class MiniMaxText01LightningAttention(nn.Module):
     def forward(
         self,
         hidden_states,
-        attn_mask: Optional[torch.Tensor] = None,  # (b, h, n, m)
+        attn_mask: torch.Tensor | None = None,  # (b, h, n, m)
         output_attentions: bool = False,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: tuple[torch.Tensor] | None = None,
         use_cache: bool = False,
-        slope_rate: Optional[torch.Tensor] = None,
+        slope_rate: torch.Tensor | None = None,
         **kwargs,
     ):
         if (not self.training) and (not do_eval):
@@ -317,11 +316,11 @@ class MiniMaxText01LightningAttention(nn.Module):
     def inference(
         self,
         x,
-        attn_mask: Optional[torch.Tensor] = None,  # (b, n)
+        attn_mask: torch.Tensor | None = None,  # (b, n)
         output_attentions: bool = False,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        past_key_value: tuple[torch.Tensor] | None = None,
         use_cache: bool = False,
-        slope_rate: Optional[torch.Tensor] = None,  # (h, 1, 1)
+        slope_rate: torch.Tensor | None = None,  # (h, 1, 1)
     ):
         # x: b n d
         b, n, d = x.shape
@@ -497,7 +496,7 @@ def test_lightning_attention_implementations(model_params):
 
 
 def get_benchmark():
-    batch_size_range = [2**i for i in range(0, 7)]  # max 64
+    batch_size_range = [2**i for i in range(7)]  # max 64
     seq_length_range = [256, 512, 1024, 2048, 4096]  # max 4096
     configs = list(itertools.product(batch_size_range, seq_length_range))
 

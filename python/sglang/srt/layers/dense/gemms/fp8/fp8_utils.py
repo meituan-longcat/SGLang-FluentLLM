@@ -2,7 +2,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt import offloader
+from sglang.srt.model_executor import offloader
 
 VLLM_AVAILABLE = False
 
@@ -36,6 +36,7 @@ if _is_cuda:
         from flashinfer import fp8_scaled_mm
     except ImportError as e:
         import logging
+
         logger = logging.getLogger(__name__)
         logger.error(f"Failed to import from flashinfer: {e}")
         raise
@@ -104,6 +105,7 @@ def normalize_e4m3fn_to_e4m3fnuz(
 
 # TODO(ch-wan): define these backends in --moe-runner-backend
 
+
 def dequant_mxfp4(
     w_block: torch.Tensor,
     w_scale: torch.Tensor,
@@ -125,15 +127,11 @@ def dequant_mxfp4(
     assert n == n_
     assert k == k_
 
-    out_raw = MXFP4QuantizeUtil.dequantize(
-        quantized_data=w_block, scale=w_scale, dtype=out_dtype, block_sizes=[32]
-    )
+    out_raw = MXFP4QuantizeUtil.dequantize(quantized_data=w_block, scale=w_scale, dtype=out_dtype, block_sizes=[32])
     return out_raw.reshape(batch, n, k * 32)
 
 
-def input_to_float8(
-    x: torch.Tensor, dtype: torch.dtype = fp8_dtype
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def input_to_float8(x: torch.Tensor, dtype: torch.dtype = fp8_dtype) -> Tuple[torch.Tensor, torch.Tensor]:
     """This function quantizes input values to float8 values with tensor-wise quantization."""
     min_val, max_val = x.aminmax()
     amax = torch.maximum(min_val.abs(), max_val.abs()).float().clamp(min=1e-12)
@@ -185,11 +183,7 @@ def block_quant_to_tensor_quant(
         for j in range(n_tiles):
             x_dq_block_tiles[j][i][:, :] = x_dq_block_tiles[j][i] * x_s[j][i]
 
-    x_q_tensor, scale = (
-        scaled_fp8_quant(x_dq_block)
-        if _is_cuda
-        else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
-    )
+    x_q_tensor, scale = scaled_fp8_quant(x_dq_block) if _is_cuda else input_to_float8(x_dq_block, dtype=x_q_block.dtype)
     return x_q_tensor, scale
 
 
@@ -208,9 +202,7 @@ def block_quant_dequant(
     *_, n, k = x_q_block.shape
 
     # ... n_scale k_scale -> ... (n_scale block_n) (k_scale block_k)
-    x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(
-        block_k, dim=-1
-    )
+    x_scale_repeat = x_s.repeat_interleave(block_n, dim=-2).repeat_interleave(block_k, dim=-1)
     x_scale_repeat = x_scale_repeat[..., :n, :k]
 
     return (x_q_block.to(torch.float32) * x_scale_repeat).to(dtype)
@@ -252,9 +244,7 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
 
-    new_weight, new_weight_scale_inv = _requant_weight_ue8m0(
-        weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
-    )
+    new_weight, new_weight_scale_inv = _requant_weight_ue8m0(weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size)
 
     offloader.update_param(weight, new_weight)
     weight_scale_inv.data = new_weight_scale_inv
@@ -299,17 +289,13 @@ def _requant_weight_ue8m0(
 def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
     m, n = x.shape
-    x_padded = torch.zeros(
-        (align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device
-    )
+    x_padded = torch.zeros((align(m, 128), align(n, 128)), dtype=x.dtype, device=x.device)
     x_padded[:m, :n] = x
     x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     sf = ceil_to_ue8m0(x_amax / 448.0)
     x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
-        x_view.size(0), x_view.size(2)
-    )
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
 
 
 # COPIED FROM DeepGEMM
@@ -322,11 +308,7 @@ def channel_quant_to_tensor_quant(
     x_s: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x_dq_channel = x_q_channel.to(torch.float32) * x_s
-    x_q_tensor, scale = (
-        scaled_fp8_quant(x_dq_channel)
-        if _is_cuda
-        else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
-    )
+    x_q_tensor, scale = scaled_fp8_quant(x_dq_channel) if _is_cuda else input_to_float8(x_dq_channel, dtype=x_q_channel.dtype)
     return x_q_tensor, scale
 
 
@@ -385,10 +367,7 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = (
-            not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
-            and not cutlass_fp8_supported
-        )
+        pad_output = not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE") and not cutlass_fp8_supported
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods
@@ -417,19 +396,13 @@ def apply_fp8_linear(
                     bias=bias,
                 )
             else:
-                assert (
-                    weight_scale.numel() == weight.shape[1]
-                ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                assert weight_scale.numel() == weight.shape[1], "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
 
-                cutlass_compatible_b = (
-                    weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-                )
+                cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
                 if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
                     # Massage the input to be 2D
                     qinput = qinput.view(-1, qinput.shape[-1])
-                    output = triton_scaled_mm(
-                        qinput, weight, x_scale, weight_scale, input.dtype, bias
-                    )
+                    output = triton_scaled_mm(qinput, weight, x_scale, weight_scale, input.dtype, bias)
                 else:
                     output = fp8_scaled_mm(
                         qinput,
@@ -476,12 +449,7 @@ def apply_fp8_linear(
                 )
                 return _process_scaled_mm_output(output, input_2d.shape, output_shape)
 
-            elif (
-                use_per_token_if_dynamic
-                and not per_tensor_weights
-                and not per_tensor_activations
-                and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
-            ):
+            elif use_per_token_if_dynamic and not per_tensor_weights and not per_tensor_activations and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter):
                 # into this sector means use dynamic per-token-per-channel quant
                 # per-token scale quant for input matrix, every row(one token) have one scale factor
                 # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
@@ -501,9 +469,7 @@ def apply_fp8_linear(
                     )
                     if bias is not None:
                         output += bias
-                    return _process_scaled_mm_output(
-                        output, input_2d.shape, [*input.shape[:-1], weight.shape[0]]
-                    )
+                    return _process_scaled_mm_output(output, input_2d.shape, [*input.shape[:-1], weight.shape[0]])
                 else:
                     # For now validated on ROCm platform
                     # fp8 rowwise scaling in torch._scaled_mm is introduced in
@@ -520,9 +486,7 @@ def apply_fp8_linear(
                         scale_b=weight_scale.t(),
                         bias=bias,
                     )
-                    return _process_scaled_mm_output(
-                        output, input_2d.shape, output_shape
-                    )
+                    return _process_scaled_mm_output(output, input_2d.shape, output_shape)
             else:
                 # Fallback for channelwise case, where we use unfused DQ
                 # due to limitations with scaled_mm
@@ -553,9 +517,7 @@ def apply_fp8_linear(
         if input_scale is not None:
             assert input_scale.numel() == 1
             # broadcast per-tensor scale to per-token scale when supporting cutlass
-            qinput, x_scale = static_quant_fp8(
-                input_2d, input_scale, repeat_scale=cutlass_fp8_supported
-            )
+            qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=cutlass_fp8_supported)
         else:
             # default use per-token quantization if dynamic
             if _is_cuda:
@@ -571,9 +533,7 @@ def apply_fp8_linear(
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
                     )
                 else:
-                    qinput, x_scale = per_token_group_quant_fp8(
-                        input_2d, group_size=input_2d.shape[1]
-                    )
+                    qinput, x_scale = per_token_group_quant_fp8(input_2d, group_size=input_2d.shape[1])
 
         if cutlass_fp8_supported:
             try:
@@ -588,19 +548,13 @@ def apply_fp8_linear(
                         bias=bias,
                     )
                 else:
-                    assert (
-                        weight_scale.numel() == weight.shape[1]
-                    ), "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
+                    assert weight_scale.numel() == weight.shape[1], "cutlass w8a8 fp8 sgl-kernel only supports per-channel scale"
 
-                    cutlass_compatible_b = (
-                        weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
-                    )
+                    cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
                     if not cutlass_compatible_b or use_triton_w8a8_fp8_kernel:
                         # Massage the input to be 2D
                         qinput = qinput.view(-1, qinput.shape[-1])
-                        output = triton_scaled_mm(
-                            qinput, weight, x_scale, weight_scale, input.dtype, bias
-                        )
+                        output = triton_scaled_mm(qinput, weight, x_scale, weight_scale, input.dtype, bias)
                     else:
                         output = fp8_scaled_mm(
                             qinput,

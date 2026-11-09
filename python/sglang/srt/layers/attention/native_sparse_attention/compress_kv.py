@@ -1,30 +1,35 @@
-import torch
 import math
+
+import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.layers.linear import LinearBase
 
+
 def cumsum_with_padding(
-    lens: torch.Tensor, # [batch_size]
-)-> torch.Tensor: # [batch_size + 1]
-    bs, = lens.shape
+    lens: torch.Tensor,  # [batch_size]
+) -> torch.Tensor:  # [batch_size + 1]
+    (bs,) = lens.shape
     indptr = lens.new_zeros(bs + 1)
     torch.cumsum(lens, 0, out=indptr[1:])
     return indptr
 
+
 def get_compressed_kv_indptr(
-    kv_indptr: torch.Tensor, # [batch_size + 1]
+    kv_indptr: torch.Tensor,  # [batch_size + 1]
     kernel_size: int,
     stride: int,
-) -> torch.Tensor: # [batch_size + 1]
+) -> torch.Tensor:  # [batch_size + 1]
     kv_lens = kv_indptr[1:] - kv_indptr[:-1]
     compressed_kv_lens = torch.clamp_min((kv_lens - kernel_size) // stride + 1, 0)
     compressed_kv_indptr = cumsum_with_padding(compressed_kv_lens)
     return compressed_kv_indptr
 
+
 def get_compressed_kv_indices(
-    kv_indptr: torch.Tensor, # [batch_size + 1]
-    compressed_kv_indptr: torch.Tensor, # [batch_size + 1]
+    kv_indptr: torch.Tensor,  # [batch_size + 1]
+    compressed_kv_indptr: torch.Tensor,  # [batch_size + 1]
     kv_indices: torch.Tensor,
     stride: int,
 ) -> torch.Tensor:
@@ -42,10 +47,10 @@ def get_compressed_kv_indices(
 
 
 def _gate_compress_kernel_torch(
-    block: torch.Tensor, # [..., kernel_size, D]
-    gate_proj: LinearBase, # kernel_size * D -> kernel_size
+    block: torch.Tensor,  # [..., kernel_size, D]
+    gate_proj: LinearBase,  # kernel_size * D -> kernel_size
     cmp_rescale_factor: float = 0,
-) -> torch.Tensor: # [..., D]
+) -> torch.Tensor:  # [..., D]
     gate_o, _ = gate_proj(block.flatten(-2, -1))
     if cmp_rescale_factor > 0:
         gate_o *= cmp_rescale_factor
@@ -55,12 +60,12 @@ def _gate_compress_kernel_torch(
 
 
 def _gate_compress_torch_aligned(
-    x: torch.Tensor, # [bs, seq_len, num_heads, head_dim]
-    gate_proj: LinearBase, # kernel_size * head_dim -> kernel_size
-    kernel_size: int, 
+    x: torch.Tensor,  # [bs, seq_len, num_heads, head_dim]
+    gate_proj: LinearBase,  # kernel_size * head_dim -> kernel_size
+    kernel_size: int,
     stride: int,
-    cmp_rescale_factor: float=0,
-)-> torch.Tensor: # [bs, num_blocks, num_heads, head_dim]
+    cmp_rescale_factor: float = 0,
+) -> torch.Tensor:  # [bs, num_blocks, num_heads, head_dim]
     x = x.transpose(1, 2)
     B, H, N, D = x.shape
     num_blocks = (N - kernel_size) // stride + 1
@@ -71,18 +76,13 @@ def _gate_compress_torch_aligned(
     # [bs, h, num_blocks, kernel_size, D]
     block_x = torch.cat(
         [
-            torch.roll(x, shifts=-1 * idx * stride, dims=-2)[:, :, :num_blocks * stride]
-            .reshape(B, H, num_blocks, stride, -1)[:, :, :, :min(stride, kernel_size - idx * stride)]
+            torch.roll(x, shifts=-1 * idx * stride, dims=-2)[:, :, : num_blocks * stride].reshape(B, H, num_blocks, stride, -1)[
+                :, :, :, : min(stride, kernel_size - idx * stride)
+            ]
             for idx in range(math.ceil(kernel_size / stride))
         ],
-        axis=-2
+        axis=-2,
     )
-    # import os
-    # ptdata = []
-    # if os.path.exists("/home/wuguanyu02/tensors/fl_tmp.pt"):
-    #     ptdata = torch.load("/home/wuguanyu02/tensors/fl_tmp.pt")
-    # ptdata.append(block_x)
-    # torch.save(ptdata, "/home/wuguanyu02/tensors/fl_tmp.pt")
 
     compress_x = _gate_compress_kernel_torch(
         block=block_x,
@@ -92,18 +92,19 @@ def _gate_compress_torch_aligned(
 
     return compress_x.transpose(1, 2)
 
+
 def gate_compress_torch(
-        kv_buffer: torch.Tensor,  # [kv_size, num_heads, head_dim]
-        compressed_kv_buffer: torch.Tensor, # [compressed_kv_size, num_heads, head_dim]
-        gate_proj: LinearBase, # kernel_size * head_dim -> head_dim
-        kv_indptr: torch.Tensor, # [batch_size + 1]
-        compressed_kv_indptr: torch.Tensor, # [batch_size + 1]
-        kv_indices: torch.Tensor, 
-        compressed_kv_indices: torch.Tensor,
-        kernel_size: int,
-        stride: int,
-        cmp_rescale_factor: float = 0,
-    ):
+    kv_buffer: torch.Tensor,  # [kv_size, num_heads, head_dim]
+    compressed_kv_buffer: torch.Tensor,  # [compressed_kv_size, num_heads, head_dim]
+    gate_proj: LinearBase,  # kernel_size * head_dim -> head_dim
+    kv_indptr: torch.Tensor,  # [batch_size + 1]
+    compressed_kv_indptr: torch.Tensor,  # [batch_size + 1]
+    kv_indices: torch.Tensor,
+    compressed_kv_indices: torch.Tensor,
+    kernel_size: int,
+    stride: int,
+    cmp_rescale_factor: float = 0,
+):
     """
     Pepare the compressed blocks from buffer into compressed buffer.
 
@@ -128,42 +129,44 @@ def gate_compress_torch(
         )
         compressed_kv_buffer[per_seq_compressed_kv_indices] = per_seq_compressed_kv.squeeze(0)
 
+
 def gate_compress_decode_torch(
-    kv_buffer: torch.Tensor, # [kv_size, num_heads, head_dim]
-    compressed_kv_buffer: torch.Tensor, # [compressed_kv_size, num_heads, head_dim]
-    gate_proj: LinearBase, # kernel_size * head_dim -> head_dim
-    kv_lens: torch.Tensor, # [batch_size]
-    req_pool_indices: torch.Tensor, # [batch_size]
-    req_to_token: torch.Tensor, # [pool_size, max_kv_len]
+    kv_buffer: torch.Tensor,  # [kv_size, num_heads, head_dim]
+    compressed_kv_buffer: torch.Tensor,  # [compressed_kv_size, num_heads, head_dim]
+    gate_proj: LinearBase,  # kernel_size * head_dim -> head_dim
+    kv_lens: torch.Tensor,  # [batch_size]
+    req_pool_indices: torch.Tensor,  # [batch_size]
+    req_to_token: torch.Tensor,  # [pool_size, max_kv_len]
     kernel_size: int,
     stride: int,
 ):
     start_positions = kv_lens - kernel_size  # [batch_size]
     kernel_range = torch.arange(kernel_size, device=kv_lens.device)  # [kernel_size]
-    buffer_indices = start_positions[:, None] + kernel_range[None, :] # [batch_size, kernel_size]
+    buffer_indices = start_positions[:, None] + kernel_range[None, :]  # [batch_size, kernel_size]
 
     token_positions = torch.gather(
         input=req_to_token[req_pool_indices],
         dim=1,
         index=buffer_indices.clamp_min(0),
-    ) # [batch_size, kernel_size]
+    )  # [batch_size, kernel_size]
 
-    blocks = kv_buffer[token_positions] # [batch_size, kernel_size, num_heads, head_dim]
-    blocks = blocks.transpose(1, 2) # [batch_size, num_heads, kernel_size, head_dim]
+    blocks = kv_buffer[token_positions]  # [batch_size, kernel_size, num_heads, head_dim]
+    blocks = blocks.transpose(1, 2)  # [batch_size, num_heads, kernel_size, head_dim]
 
     compressed = _gate_compress_kernel_torch(
         block=blocks,
         gate_proj=gate_proj,
     )  # [batch_size, num_heads, head_dim]
 
-    valid_mask = (kv_lens >= kernel_size) & ((kv_lens - kernel_size) % stride == 0) # [batch_size]
+    valid_mask = (kv_lens >= kernel_size) & ((kv_lens - kernel_size) % stride == 0)  # [batch_size]
     compressed_positions = token_positions[:, 0] // stride  # [batch_size]
 
     compressed_kv_buffer[compressed_positions] = torch.where(
         valid_mask[:, None, None],  # broadcasted to [batch_size, num_heads, head_dim]
         compressed,
-        compressed_kv_buffer[compressed_positions]
+        compressed_kv_buffer[compressed_positions],
     )
+
 
 # TODO: softmax of triton 3.3 have not dim param, following are the code from triton 3.4
 @triton.jit
@@ -176,6 +179,7 @@ def _softmax_kernel(x, dim=None, keep_dims=False, ieee_rounding=False):
     num = tl.exp(z)
     den = tl.sum(num, _dim, keep_dims=keep_dims)
     return tl.fdiv(num, den, ieee_rounding)
+
 
 @triton.jit
 def _gate_compress_decode_kernel(
@@ -212,14 +216,14 @@ def _gate_compress_decode_kernel(
 
     kv_len = tl.load(kv_lens_ptr + batch_id)
     kernel_start_pos = kv_len - KERNEL_SIZE
-    
+
     # Early exit if compression is not applicable
-    # Need: 
+    # Need:
     #   1) enough tokens (>=kernel_size)
     #   2) aligned position for stride
     if not ((kernel_start_pos >= 0) & (kernel_start_pos % kernel_stride == 0)):
         return
-    
+
     req_pool_index = tl.load(req_pool_indices_ptr + batch_id)
 
     # Current head block range: [h_start, h_start + BLOCK_H)
@@ -242,11 +246,9 @@ def _gate_compress_decode_kernel(
 
         # Get token indices for current kernel-block
         k_block_kv_indices = tl.load(
-            req_to_token_ptr 
-                + req_pool_index * req_to_token_stride_b 
-                + (kernel_start_pos + k_block_offsets) * req_to_token_stride_t,
-            mask = k_block_mask,
-        ) # [BLOCK_K]
+            req_to_token_ptr + req_pool_index * req_to_token_stride_b + (kernel_start_pos + k_block_offsets) * req_to_token_stride_t,
+            mask=k_block_mask,
+        )  # [BLOCK_K]
         # Feeling this is a bit unnecessary, just split BLOCK_K, splitting headdim has no use case?
         for d_block_start in tl.range(0, head_dim, BLOCK_D):
             d_block_offsets = d_block_start + tl.arange(0, BLOCK_D)
@@ -254,42 +256,34 @@ def _gate_compress_decode_kernel(
 
             kv_k_d_block = tl.load(
                 kv_cache_ptr
-                    + h_offsets[:, None, None] * kv_buffer_stride_h
-                    + k_block_kv_indices[None, :, None] * kv_buffer_stride_s
-                    + d_block_offsets[None, None, :] * kv_buffer_stride_d,
+                + h_offsets[:, None, None] * kv_buffer_stride_h
+                + k_block_kv_indices[None, :, None] * kv_buffer_stride_s
+                + d_block_offsets[None, None, :] * kv_buffer_stride_d,
                 mask=h_mask[:, None, None] & k_block_mask[None, :, None] & d_block_mask[None, None, :],
             )  # [BLOCK_H, BLOCK_K, BLOCK_D]
             kv_k_d_block = tl.reshape(kv_k_d_block, (BLOCK_H, BLOCK_K * BLOCK_D))
 
             # Compute flat offsets for weight matrix addressing
-            w_kd_block_offsets = tl.ravel(k_block_offsets[:, None] * head_dim + d_block_offsets[None, :]) # [BLOCK_K * BLOCK_D]
-            w_kd_block_mask = tl.ravel(k_block_mask[:, None] & d_block_mask[None, :]) # [BLOCK_K * BLOCK_D]
-            
+            w_kd_block_offsets = tl.ravel(k_block_offsets[:, None] * head_dim + d_block_offsets[None, :])  # [BLOCK_K * BLOCK_D]
+            w_kd_block_mask = tl.ravel(k_block_mask[:, None] & d_block_mask[None, :])  # [BLOCK_K * BLOCK_D]
+
             w_k_d_block = tl.load(
-                gate_weight_ptr
-                    + w_kd_block_offsets[:, None] * gate_weight_stride_i
-                    + k_arange[None, :] * gate_weight_stride_o,
-                mask= w_kd_block_mask[:, None],
-            ) # [BLOCK_K * BLOCK_D, KERNEL_SIZE]
+                gate_weight_ptr + w_kd_block_offsets[:, None] * gate_weight_stride_i + k_arange[None, :] * gate_weight_stride_o,
+                mask=w_kd_block_mask[:, None],
+            )  # [BLOCK_K * BLOCK_D, KERNEL_SIZE]
 
             gate_scores = tl.dot(kv_k_d_block, w_k_d_block, acc=gate_scores)
     if cmp_rescale_factor > 0:
         gate_scores *= cmp_rescale_factor
-    gate_scores = _softmax_kernel(gate_scores, dim=1, keep_dims=True) # [BLOCK_H, KERNEL_SIZE]
+    gate_scores = _softmax_kernel(gate_scores, dim=1, keep_dims=True)  # [BLOCK_H, KERNEL_SIZE]
 
     k_offsets = kernel_start_pos + k_arange
     # Need to re-fetch kv cache and scores to do element-wise multiplication then reduce
     k_kv_indices = tl.load(
-        req_to_token_ptr 
-            + req_pool_index * req_to_token_stride_b 
-            + k_offsets * req_to_token_stride_t,
+        req_to_token_ptr + req_pool_index * req_to_token_stride_b + k_offsets * req_to_token_stride_t,
     )
 
-    kernel_start_pos_kv_index = tl.load(
-        req_to_token_ptr 
-            + req_pool_index * req_to_token_stride_b 
-            + kernel_start_pos * req_to_token_stride_t
-    )
+    kernel_start_pos_kv_index = tl.load(req_to_token_ptr + req_pool_index * req_to_token_stride_b + kernel_start_pos * req_to_token_stride_t)
     compressed_kv_cache_index = kernel_start_pos_kv_index // kernel_stride
 
     # Phase 2: Apply gate compression via weighted sum
@@ -303,21 +297,21 @@ def _gate_compress_decode_kernel(
 
         kv_k_d_block = tl.load(
             kv_cache_ptr
-                + h_offsets[:, None, None] * kv_buffer_stride_h
-                + k_kv_indices[None, :, None] * kv_buffer_stride_s
-                + d_block_offsets[None, None, :] * kv_buffer_stride_d,
+            + h_offsets[:, None, None] * kv_buffer_stride_h
+            + k_kv_indices[None, :, None] * kv_buffer_stride_s
+            + d_block_offsets[None, None, :] * kv_buffer_stride_d,
             mask=h_mask[:, None, None] & d_block_mask[None, None, :],
         )  # [BLOCK_H, KERNEL_SIZE, BLOCK_D]
-        
-        d_block_compressed_kv = tl.sum(kv_k_d_block * gate_scores[:, :, None], axis=1) # [BLOCK_H, BLOCK_D]
+
+        d_block_compressed_kv = tl.sum(kv_k_d_block * gate_scores[:, :, None], axis=1)  # [BLOCK_H, BLOCK_D]
 
         tl.store(
-            compressed_kv_cache_ptr 
-                + compressed_kv_cache_index * compressed_kv_buffer_stride_s
-                + h_offsets[:, None] * compressed_kv_buffer_stride_h
-                + d_block_offsets[None, :] * compressed_kv_buffer_stride_d,
+            compressed_kv_cache_ptr
+            + compressed_kv_cache_index * compressed_kv_buffer_stride_s
+            + h_offsets[:, None] * compressed_kv_buffer_stride_h
+            + d_block_offsets[None, :] * compressed_kv_buffer_stride_d,
             d_block_compressed_kv.to(compressed_kv_cache_ptr.dtype.element_ty),
-            mask = h_mask[:, None] & d_block_mask[None, :],
+            mask=h_mask[:, None] & d_block_mask[None, :],
         )
 
 
@@ -326,11 +320,11 @@ def gate_compress_decode_triton(
     compressed_kv_cache: torch.Tensor,  # [compressed_kv_size, num_heads, head_dim]
     gate_weight: torch.Tensor,  # [kernel_size, kernel_size * head_dim]
     kv_lens: torch.Tensor,  # [batch_size]
-    req_pool_indices: torch.Tensor, # [batch_size]
-    req_to_token: torch.Tensor, # [pool_size, max_kv_len]
+    req_pool_indices: torch.Tensor,  # [batch_size]
+    req_to_token: torch.Tensor,  # [pool_size, max_kv_len]
     kernel_size: int,
     stride: int,
-    cmp_rescale_factor: float = 0
+    cmp_rescale_factor: float = 0,
 ):
     """
     Equvalent to gate_compress_decode_torch
@@ -338,7 +332,7 @@ def gate_compress_decode_triton(
     kernel_size: compress block size
     stride: compress block stride
     """
-    batch_size, = kv_lens.shape
+    (batch_size,) = kv_lens.shape
     _, num_heads, head_dim = kv_cache.shape
 
     # TODO: resolve this assert
@@ -347,12 +341,12 @@ def gate_compress_decode_triton(
 
     BLOCK_H = 16
     BLOCK_K = 1
-    BLOCK_D = max(16, min(128,triton.next_power_of_2(head_dim)))
-    
+    BLOCK_D = max(16, min(128, triton.next_power_of_2(head_dim)))
+
     num_head_blocks = triton.cdiv(num_heads, BLOCK_H)
 
     grid = (
-        batch_size, 
+        batch_size,
         num_head_blocks,
     )
 
